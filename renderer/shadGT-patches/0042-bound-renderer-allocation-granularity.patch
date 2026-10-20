@@ -1,0 +1,84 @@
+diff --git a/src/video_core/renderer_vulkan/vk_instance.cpp b/src/video_core/renderer_vulkan/vk_instance.cpp
+--- a/src/video_core/renderer_vulkan/vk_instance.cpp
++++ b/src/video_core/renderer_vulkan/vk_instance.cpp
+@@ -677,6 +677,9 @@
+         .flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT,
+         .physicalDevice = physical_device,
+         .device = *device,
++        // Small persistent images must not pin mostly empty 256 MiB scene blocks.
++        // VMA still creates dedicated allocations for resources too large to pool.
++        .preferredLargeHeapBlockSize = 32_MB,
+         .pVulkanFunctions = &functions,
+         .instance = *instance,
+         .vulkanApiVersion = TargetVulkanApiVersion,
+diff --git a/src/video_core/buffer_cache/buffer_cache.cpp b/src/video_core/buffer_cache/buffer_cache.cpp
+--- a/src/video_core/buffer_cache/buffer_cache.cpp
++++ b/src/video_core/buffer_cache/buffer_cache.cpp
+@@ -2438,13 +2438,20 @@
+     // FIX-075: 64-bit counts. GT Sport's showroom makes a range of 4 GB + 64 KB resident at once;
+     // the 32-bit block loop below never reached its end and wrote past the staging buffer.
+     u64 resident_blocks{};
+-    IntervalList bind_ranges;
++    std::vector<Interval> bind_ranges;
++    const u64 max_allocation_blocks = std::max<u64>(1, 16_MB >> block_shift);
+     resident_ranges.ForEachGap(first_block, last_block + 1, [&](u64 start, u64 end) {
+         resident_blocks += end - start;
+-        bind_ranges.Add({start, end});
++        // Keep independently retired ranges in separate, bounded allocations.
++        // A small survivor must not pin hundreds of MiB from unrelated gaps.
++        while (start < end) {
++            const u64 chunk_end = std::min(end, start + max_allocation_blocks);
++            bind_ranges.push_back({start, chunk_end});
++            start = chunk_end;
++        }
+     });
+ 
+-    if (bind_ranges.Empty()) {
++    if (bind_ranges.empty()) {
+         return;
+     }
+     if ((resident_blocks << block_shift) >= (1ull << 30)) {
+@@ -2454,26 +2461,24 @@
+                     (last_block + 1) << block_shift, arena->CpuAddr(), arena->SizeBytes());
+     }
+ 
+-    const vk::MemoryAllocateInfo alloc_info = {
+-        .allocationSize = resident_blocks << block_shift,
+-        .memoryTypeIndex = arena_memory_type_index,
+-    };
+-    const auto device_memory = Vulkan::Check(instance.GetDevice().allocateMemory(alloc_info));
+-
+     boost::container::small_vector<vk::BufferCopy, 8> copies;
+     const auto staging =
+         staging_pool.Request(resident_blocks * sizeof(vk::DeviceAddress), MemoryType::HostUncached);
+ 
+-    u64 memory_offset{};
+     ArenaBinds* binds = BindsForArena(arena);
+     auto* bda_addrs = reinterpret_cast<vk::DeviceAddress*>(staging.mapped);
+     u64 offset = staging.offset;
+     for (const auto& range : bind_ranges) {
++        const vk::MemoryAllocateInfo alloc_info = {
++            .allocationSize = (range.end - range.start) << block_shift,
++            .memoryTypeIndex = arena_memory_type_index,
++        };
++        const auto device_memory = Vulkan::Check(instance.GetDevice().allocateMemory(alloc_info));
+         Backing backing;
+         backing.start = range.start;
+         backing.end = range.end;
+         backing.memory = device_memory;
+-        backing.offset = memory_offset >> block_shift;
++        backing.offset = 0;
+         resident_ranges.Add(backing);
+ 
+         LOG_INFO(Render, "Making range start={}, end={} resident", backing.start, backing.end);
+@@ -2482,9 +2487,8 @@
+             .resourceOffset = (range.start << block_shift) - arena->cpu_addr,
+             .size = (range.end - range.start) << block_shift,
+             .memory = device_memory,
+-            .memoryOffset = memory_offset,
++            .memoryOffset = 0,
+         });
+-        memory_offset += bind.size;
+ 
+         for (u64 block = 0; block < bind.size; block += block_size) {
+             *(bda_addrs++) = arena->BufferDeviceAddress() + bind.resourceOffset + block;

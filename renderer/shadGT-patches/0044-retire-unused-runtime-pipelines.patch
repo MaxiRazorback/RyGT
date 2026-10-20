@@ -1,0 +1,310 @@
+diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+index b7dc723..c1a2481 100644
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+@@ -2,6 +2,7 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include <atomic>
++#include <map>
+ #include <algorithm>
+ #include <filesystem>
+ #include <chrono>
+@@ -313,28 +314,32 @@ private:
+ // PERF-018: shader stage libraries (pre-rasterization and fragment shader) of runtime
+ // pipelines, shared by every pipeline whose stages, layout and stage state are the same. Many new
+ // pipelines differ from an earlier one only in blending, targets or vertex input, so they reuse
+-// both compiled shader libraries and only link. Libraries live until exit.
++// both compiled shader libraries and only link. Pipelines own their shared libraries.
+ class StageLibraryCache {
+ public:
+-    static StageLibraryCache& Instance() {
+-        static StageLibraryCache cache;
+-        return cache;
++    static StageLibraryCache& Instance() { static StageLibraryCache cache; return cache; }
++    std::shared_ptr<vk::UniquePipeline> Find(vk::Device device, u64 key) {
++        std::scoped_lock lock{mutex};
++        const auto it = libraries.find({device, key});
++        return it != libraries.end() ? it->second.lock() : nullptr;
+     }
+-
+-    vk::Pipeline Find(u64 key) {
+-        std::scoped_lock lk{mutex};
+-        const auto it = libraries.find(key);
+-        return it != libraries.end() ? it->second : vk::Pipeline{};
+-    }
+-
+-    void Insert(u64 key, vk::Pipeline library) {
+-        std::scoped_lock lk{mutex};
+-        libraries.emplace(key, library);
++    std::shared_ptr<vk::UniquePipeline> Insert(vk::Device device, u64 key, vk::Pipeline library, bool share) {
++        auto owned = std::make_shared<vk::UniquePipeline>(library, device);
++        if (!share) return owned;
++        std::scoped_lock lock{mutex};
++        auto& cached = libraries[{device, key}];
++        if (auto existing = cached.lock()) return existing;
++        cached = owned;
++        // Weak entries own no GPU resources; remove expired keys as scenes change.
++        if (++insertions % 128 == 0) {
++            std::erase_if(libraries, [](const auto& entry) { return entry.second.expired(); });
++        }
++        return owned;
+     }
+-
+ private:
+     std::mutex mutex;
+-    std::unordered_map<u64, vk::Pipeline> libraries;
++    std::map<std::pair<vk::Device, u64>, std::weak_ptr<vk::UniquePipeline>> libraries;
++    size_t insertions{};
+ };
+ 
+ class LibraryKey {
+@@ -928,10 +933,10 @@ GraphicsPipeline::GraphicsPipeline(
+         const u64 fragment_hash = fragment_key.Hash();
+         // -DisablePerf 18 compiles every library for every pipeline, one after another.
+         const bool share_libraries = Common::PerfFeatureEnabled(18);
+-        vk::Pipeline pre_raster_library =
+-            share_libraries ? library_cache.Find(pre_raster_hash) : vk::Pipeline{};
+-        vk::Pipeline fragment_library =
+-            share_libraries ? library_cache.Find(fragment_hash) : vk::Pipeline{};
++        auto pre_raster_owner = share_libraries ? library_cache.Find(device, pre_raster_hash) : nullptr;
++        auto fragment_owner = share_libraries ? library_cache.Find(device, fragment_hash) : nullptr;
++        vk::Pipeline pre_raster_library = pre_raster_owner ? **pre_raster_owner : vk::Pipeline{};
++        vk::Pipeline fragment_library = fragment_owner ? **fragment_owner : vk::Pipeline{};
+         const bool pre_raster_reused = bool(pre_raster_library);
+         const bool fragment_reused = bool(fragment_library);
+         // PERF-018: the two shader libraries are compiled at the same time, the fragment one
+@@ -944,7 +949,8 @@ GraphicsPipeline::GraphicsPipeline(
+         library_handles[0] = create_library(0);
+         if (!pre_raster_library) {
+             pre_raster_library = create_library(1);
+-            library_cache.Insert(pre_raster_hash, pre_raster_library);
++            pre_raster_owner = library_cache.Insert(device, pre_raster_hash, pre_raster_library, share_libraries);
++            pre_raster_library = **pre_raster_owner;
+         }
+         library_handles[3] = create_library(3);
+         if (fragment_future.valid()) {
+@@ -953,8 +959,10 @@ GraphicsPipeline::GraphicsPipeline(
+             fragment_library = create_library(2);
+         }
+         if (!fragment_reused) {
+-            library_cache.Insert(fragment_hash, fragment_library);
++            fragment_owner = library_cache.Insert(device, fragment_hash, fragment_library, share_libraries);
++            fragment_library = **fragment_owner;
+         }
++        library_link->shared_libraries = {pre_raster_owner, fragment_owner};
+         library_handles[1] = pre_raster_library;
+         library_handles[2] = fragment_library;
+         library_link->owned_libraries[0] = vk::UniquePipeline{library_handles[0], device};
+diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.h b/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
+index 5515213..9669f1d 100644
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
+@@ -126,6 +126,10 @@ public:
+     /// PERF-021: optimized relinks wait until no new pipeline has been needed for a while, so
+     /// they never take cores from pipelines a draw is waiting for.
+     static void NotePipelineMiss();
++    bool CanRetire() const {
++        return !library_link || !library_link->optimized.valid() ||
++               library_link->optimized.wait_for(std::chrono::seconds{0}) == std::future_status::ready;
++    }
+ 
+     /// PERF-019: a pipeline built on a worker from copies of the shader infos points at the
+     /// cached infos once it is used.
+@@ -139,6 +143,7 @@ private:
+     struct LibraryLink {
+         /// Vertex input and fragment output libraries; the shader libraries are shared (PERF-018).
+         std::array<vk::UniquePipeline, 2> owned_libraries;
++        std::array<std::shared_ptr<vk::UniquePipeline>, 2> shared_libraries;
+         std::future<void> optimized;
+     };
+     /// PERF-018 / SHD-002: hashes of the stage set layouts' bindings, so a shader library is
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index a72fe01..f97df06 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -2257,6 +2257,8 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
+                 if (!S().key_uses_legacy) {
+                     RegisterPipelineData(S().graphics_key, pipeline_hash, sdata);
+                 }
++                retention_now = std::chrono::steady_clock::now();
++                pipeline_last_use[it->second.get()] = retention_now;
+                 return it->second.get();
+             }
+             if ((stored->async || (CompileMode() == 2 && AsyncPipelines())) &&
+@@ -2390,6 +2392,8 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
+             }
+         }
+     }
++    if (is_new) retention_now = std::chrono::steady_clock::now();
++    pipeline_last_use[it->second.get()] = retention_now;
+     return it->second.get();
+ }
+ 
+@@ -2434,6 +2438,8 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
+             module_related_pipelines[m].emplace_back(compute_key);
+         }
+     }
++    if (is_new) retention_now = std::chrono::steady_clock::now();
++    pipeline_last_use[it->second.get()] = retention_now;
+     return it->second.get();
+ }
+ 
+@@ -4513,3 +4519,64 @@ std::optional<std::vector<u32>> PipelineCache::GetShaderPatch(u64 hash, Shader::
+     return code;
+ }
+ } // namespace Vulkan
++
++
++namespace Vulkan {
++std::shared_ptr<const void> PipelineCache::KeepAlive(const GraphicsPipeline* pipeline) const {
++    if (!pipeline) return {};
++    const auto it = graphics_pipelines.find(pipeline->GetGraphicsKey());
++    ASSERT(it != graphics_pipelines.end() && it->second.get() == pipeline);
++    return it->second;
++}
++std::shared_ptr<const void> PipelineCache::KeepAlive(const ComputePipeline* pipeline) const {
++    if (!pipeline) return {};
++    const auto it = compute_pipelines.find(compute_key);
++    ASSERT(it != compute_pipelines.end() && it->second.get() == pipeline);
++    return it->second;
++}
++void PipelineCache::TrimUnusedPipelines() {
++    using namespace std::chrono;
++    const auto now = steady_clock::now();
++    if (now - retention_last_scan < seconds{1}) return;
++    std::unique_lock lock{lookup_mutex, std::try_to_lock};
++    if (!lock.owns_lock()) return;
++    retention_last_scan = now;
++    retention_now = now;
++    // Keep the active working set even if a scene needs more than the soft limit.
++    // Queued selections hold a shared reference; retirement cannot invalidate them.
++    constexpr size_t soft_limit = 1024;
++    constexpr size_t retire_batch = 64;
++    const auto cutoff = now - seconds{60};
++    std::vector<std::shared_ptr<const void>> retired;
++    const auto trim = [&](auto& cache) {
++        using Entry = typename std::remove_reference_t<decltype(cache)>::value_type;
++        using Key = std::remove_const_t<typename Entry::first_type>;
++        std::vector<std::pair<steady_clock::time_point, Key>> candidates;
++        for (const auto& [key, pipeline] : cache) {
++            if (!pipeline || pipeline.use_count() != 1) continue;
++            if constexpr (std::is_same_v<Key, GraphicsPipelineKey>) {
++                if (!pipeline->CanRetire()) continue;
++            }
++            const auto found = pipeline_last_use.find(pipeline.get());
++            if (found != pipeline_last_use.end() && found->second < cutoff)
++                candidates.emplace_back(found->second, key);
++        }
++        std::sort(candidates.begin(), candidates.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
++        for (const auto& [used, key] : candidates) {
++            if (retired.size() >= retire_batch || graphics_pipelines.size() + compute_pipelines.size() <= soft_limit) break;
++            auto it = cache.find(key);
++            pipeline_last_use.erase(it->second.get());
++            retired.emplace_back(std::move(it.value()));
++            cache.erase(it);
++        }
++    };
++    trim(graphics_pipelines);
++    trim(compute_pipelines);
++    if (retired.empty()) return;
++    const auto count = retired.size();
++    // Includes commands already recorded in the current, not-yet-submitted batch.
++    scheduler.DeferOperation([retired = std::move(retired)] {});
++    LOG_DEBUG(Render_Vulkan, "Retired {} unused pipelines; {} cached", count,
++              graphics_pipelines.size() + compute_pipelines.size());
++}
++}
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.h b/src/video_core/renderer_vulkan/vk_pipeline_cache.h
+index 01f18bd..f00bc81 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.h
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.h
+@@ -127,6 +127,11 @@ public:
+ 
+     void Sync();
+ 
++    /// Recorder only, between draws. Retires unused pipelines after GPU completion.
++    void TrimUnusedPipelines();
++    std::shared_ptr<const void> KeepAlive(const GraphicsPipeline* pipeline) const;
++    std::shared_ptr<const void> KeepAlive(const ComputePipeline* pipeline) const;
++
+     const GraphicsPipeline* GetGraphicsPipeline(const DrawIndirectParams params = {});
+     /// The pipeline of the key RefreshGraphicsKey made (built if needed).
+     const GraphicsPipeline* PipelineForCurrentKey(const DrawIndirectParams params);
+@@ -334,8 +339,11 @@ private:
+         std::chrono::steady_clock::time_point since{};
+     } legacy_stats;
+     void ReportLegacy();
+-    tsl::robin_map<ComputePipelineKey, std::unique_ptr<ComputePipeline>> compute_pipelines;
+-    tsl::robin_map<GraphicsPipelineKey, std::unique_ptr<GraphicsPipeline>> graphics_pipelines;
++    tsl::robin_map<ComputePipelineKey, std::shared_ptr<ComputePipeline>> compute_pipelines;
++    tsl::robin_map<GraphicsPipelineKey, std::shared_ptr<GraphicsPipeline>> graphics_pipelines;
++    std::unordered_map<const Pipeline*, std::chrono::steady_clock::time_point> pipeline_last_use;
++    std::chrono::steady_clock::time_point retention_now{std::chrono::steady_clock::now()};
++    std::chrono::steady_clock::time_point retention_last_scan{};
+     /// NAT-031: what a key is computed in. The command and recorder threads use the cache's own
+     /// (scratch_, under the exclusive lock); a game job thread looking a pipeline up uses its
+     /// own (under the shared lock), so job threads look pipelines up at the same time.
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index 4975505..b2bb0df 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -238,6 +238,7 @@ std::optional<Rasterizer::SelectedPipeline> Rasterizer::SelectPipelineAhead() {
+         .instance_sgpr_offset = 0,
+         .tessellate_quads = false,
+     });
++    selected.keepalive[0] = pipeline_cache.KeepAlive(selected.pipeline);
+     if (selected.pipeline) {
+         CopySelectedStages(selected.stages);
+     }
+@@ -247,6 +248,7 @@ std::optional<Rasterizer::SelectedPipeline> Rasterizer::SelectPipelineAhead() {
+             .instance_sgpr_offset = 0,
+             .tessellate_quads = true,
+         });
++        selected.keepalive[2] = pipeline_cache.KeepAlive(selected.quad_tess_pipeline);
+         if (selected.quad_tess_pipeline) {
+             CopySelectedStages(selected.quad_tess_stages);
+         }
+@@ -344,6 +346,7 @@ std::optional<Rasterizer::SelectedPipeline> Rasterizer::SelectComputePipelineAhe
+     selected.is_compute = true;
+     std::scoped_lock lk{pipeline_cache.LookupMutex()};
+     selected.compute = pipeline_cache.GetComputePipeline();
++    selected.keepalive[1] = pipeline_cache.KeepAlive(selected.compute);
+     if (selected.compute) {
+         CopyComputeStage(selected.stages);
+     }
+@@ -2462,6 +2465,14 @@ void Rasterizer::OnSubmit() {
+     buffer_cache.TickFrame();
+     ProcessDownloadsTimed(DrainSource::Submit);
+     texture_cache.RunGarbageCollector();
++    // Native job threads also read this cache without queued-selection ownership.
++    // Retention applies to the recorder path whose CPU and GPU lifetimes are pinned.
++#ifdef RYTY_GPU
++    if (!native)
++#endif
++    {
++        pipeline_cache.TrimUnusedPipelines();
++    }
+     runtime.TickFrame();
+ }
+ 
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.h b/src/video_core/renderer_vulkan/vk_rasterizer.h
+index 382aa52..59c0e22 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.h
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.h
+@@ -72,6 +72,7 @@ public:
+         std::shared_ptr<const Shader::Info> seed;
+     };
+     struct SelectedPipeline {
++        std::array<std::shared_ptr<const void>, 3> keepalive;
+         const GraphicsPipeline* pipeline{};
+         /// PERF-055: a direct dispatch's compute pipeline (then `pipeline` is unused).
+         bool is_compute{};
+@@ -207,6 +208,7 @@ public:
+     }
+     /// PERF-056: a used selection goes back for reuse with its vectors' capacity.
+     void RecycleSelectedPipeline(SelectedPipeline&& selected) {
++        selected.keepalive = {};
+         selected_recycler.Give(std::move(selected));
+     }
+ 
