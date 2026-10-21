@@ -1,6 +1,9 @@
 #include "prx/libc/include/exceptions/Runtime.hpp"
 #include <cstdarg>
+#include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
 #ifdef _WIN32
 #include <windows.h>
@@ -210,6 +213,104 @@ bool Match(const std::type_info* caught, const std::type_info* thrown, void*& ob
     if (search.count == 1) { object = search.found; return true; }
     return false;
 }
+
+#ifdef _WIN32
+// DIAG-162: the game's own C++ exceptions are unwound here, not by Windows, so the crash reporter's
+// throw trace never sees them. GT Sport catches many of them and carries on, or quietly ends (a
+// failed boot script returns from the main loop and the game shuts down). The first 40 are
+// reported to stderr: type, any text the exception object leads to, and the executable's code
+// addresses on the stack. APS5_TRACE_GUEST_THROW=1 reports every one, =0 none.
+bool Readable(const void* address, std::size_t size) {
+    MEMORY_BASIC_INFORMATION memory{};
+    if (!address || VirtualQuery(address, &memory, sizeof(memory)) != sizeof(memory)) return false;
+    if (memory.State != MEM_COMMIT || (memory.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0) return false;
+    const auto end = reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize;
+    return reinterpret_cast<std::uintptr_t>(address) + size <= end;
+}
+
+// Printable text at `address` (at least 4 characters, cut at 160), or nothing.
+bool TextAt(std::uintptr_t address, char* out, std::size_t size) {
+    std::size_t length = 0;
+    for (; length + 1 < size && length < 160; ++length) {
+        const auto* at = reinterpret_cast<const unsigned char*>(address + length);
+        if (!Readable(at, 1)) break;
+        if (*at == 0) break;
+        if (*at < 0x20 || *at > 0x7e) { if (*at != '\n' && *at != '\t') return false; }
+        out[length] = *at == '\n' || *at == '\t' ? ' ' : static_cast<char>(*at);
+    }
+    out[length] = 0;
+    return length >= 4;
+}
+
+// Texts the exception object leads to: inline ones and those behind its first pointers, two levels
+// deep (the game's exceptions hold a string object or a pointer to an object holding one).
+void CollectTexts(std::uintptr_t object, int depth, char* out, std::size_t size, int& found) {
+    if (found >= 3 || !Readable(reinterpret_cast<const void*>(object), 8 * 8)) return;
+    char text[168];
+    if (depth > 0 && TextAt(object + 8, text, sizeof(text)) && found < 3) {
+        const auto used = std::strlen(out);
+        std::snprintf(out + used, size - used, " \"%s\"", text);
+        ++found;
+    }
+    for (int slot = 0; slot < 8 && found < 3; ++slot) {
+        const auto value = reinterpret_cast<const std::uintptr_t*>(object)[slot];
+        if (value < 0x10000 || (value & 7) != 0) continue;
+        if (TextAt(value, text, sizeof(text))) {
+            const auto used = std::strlen(out);
+            std::snprintf(out + used, size - used, " \"%s\"", text);
+            ++found;
+        } else if (depth < 2) {
+            CollectTexts(value, depth + 1, out, size, found);
+        }
+    }
+}
+
+void TraceGuestThrow(const void* object, const std::type_info* type, const void* thrower) {
+    static const char* setting = std::getenv("APS5_TRACE_GUEST_THROW");
+    static const bool all = setting != nullptr && setting[0] == '1';
+    static const bool none = setting != nullptr && setting[0] == '0';
+    static std::atomic<unsigned> reported{0};
+    if (none) return;
+    const unsigned number = reported.fetch_add(1);
+    if (!all && number >= 40) return;
+    char name[160] = "?";
+    if (type && Readable(type, 16)) {
+        const char* raw = reinterpret_cast<const char* const*>(type)[1];
+        if (raw && *raw == '*') ++raw;
+        if (!raw || !TextAt(reinterpret_cast<std::uintptr_t>(raw), name, sizeof(name))) std::strcpy(name, "?");
+    }
+    char texts[640] = "";
+    int found = 0;
+    auto start = reinterpret_cast<std::uintptr_t>(object);
+    // A thrown pointer: look at what it points to.
+    if (name[0] == 'P' && Readable(object, 8)) start = *static_cast<const std::uintptr_t*>(object);
+    CollectTexts(start, 0, texts, sizeof(texts), found);
+    const auto image = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
+    const auto* headers = reinterpret_cast<const IMAGE_NT_HEADERS64*>(
+        image + reinterpret_cast<const IMAGE_DOS_HEADER*>(image)->e_lfanew);
+    const auto imageEnd = image + headers->OptionalHeader.SizeOfImage;
+    auto inImage = [&](std::uintptr_t value) { return value >= image && value < imageEnd; };
+    char stack[400] = "";
+    int frames = 0;
+    const auto top = reinterpret_cast<std::uintptr_t>(__builtin_frame_address(0));
+    MEMORY_BASIC_INFORMATION region{};
+    if (VirtualQuery(reinterpret_cast<const void*>(top), &region, sizeof(region)) != sizeof(region)) region.RegionSize = 0;
+    const auto regionEnd = reinterpret_cast<std::uintptr_t>(region.BaseAddress) + region.RegionSize;
+    for (std::uintptr_t slot = top; frames < 20 && slot + 8 <= regionEnd && slot < top + 0x4000; slot += 8) {
+        const auto value = *reinterpret_cast<const std::uintptr_t*>(slot);
+        MEMORY_BASIC_INFORMATION memory{};
+        if (!inImage(value) || VirtualQuery(reinterpret_cast<const void*>(value), &memory, sizeof(memory)) != sizeof(memory) ||
+            (memory.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) == 0) continue;
+        const auto used = std::strlen(stack);
+        std::snprintf(stack + used, sizeof(stack) - used, " +0x%llx", static_cast<unsigned long long>(value - image));
+        ++frames;
+    }
+    const auto from = reinterpret_cast<std::uintptr_t>(thrower);
+    RawLog("[guest-throw] #%u thread %lu %s from %s+0x%llx;%s; stack:%s\n", number + 1, GetCurrentThreadId(), name,
+           inImage(from) ? "GTSport.exe" : "?", static_cast<unsigned long long>(inImage(from) ? from - image : from),
+           texts, stack);
+}
+#endif
 }
 
 extern "C" {
@@ -231,6 +332,9 @@ void APS5_VABI __cxa_free_exception_nid_postfix(void* object) {
 
 [[noreturn]] void APS5_VABI __cxa_throw_nid_postfix(void* object, std::type_info* type, void (*destructor)(void*)) {
     using namespace LibcException;
+#ifdef _WIN32
+    TraceGuestThrow(object, type, __builtin_return_address(0)); // DIAG-162
+#endif
     auto* header = FromObject(object);
     header->type = type;
     header->destructor = destructor;

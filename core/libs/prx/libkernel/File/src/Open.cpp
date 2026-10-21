@@ -200,6 +200,27 @@ std::int64_t APS5_VABI sceKernelLseek(int d, std::int64_t offset, int whence) {
     return result;
 }
 
+// DIAG-164 (RyGT): GT Sport checks for app0\gt.idx at start; without it the game runs without its data
+// and closes right after the splash screen with nothing else in the logs. The first 20 app0 files
+// a title looks for and can't find are reported, with the folder that was searched.
+static void ReportMissingAppFile(const char* path, const std::filesystem::path& native, const std::error_code& error) {
+    static std::atomic<unsigned> reported{0};
+    if (std::strncmp(path, "/app0/", 6) != 0 || reported.fetch_add(1) >= 20) return;
+#ifdef _WIN32
+    const auto wide = native.wstring();
+    std::string text;
+    const int size = WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    if (size > 1) {
+        text.resize(static_cast<std::size_t>(size - 1));
+        WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), -1, text.data(), size, nullptr, nullptr);
+    }
+#else
+    const std::string text = native.string();
+#endif
+    std::fprintf(stderr, "[file] %s is missing (looked for %s%s%s)\n", path, text.c_str(), error ? ": " : "",
+                 error ? error.message().c_str() : "");
+}
+
 int APS5_VABI sceKernelStat(const char* path, FileStat* sb) {
     if (path == nullptr) {
         throw std::invalid_argument(std::string(__func__) + ": path is null");
@@ -210,6 +231,7 @@ int APS5_VABI sceKernelStat(const char* path, FileStat* sb) {
     const auto native = ResolvePath_nid_no_patch(path);
     std::error_code error;
     if (!std::filesystem::exists(native, error)) {
+        ReportMissingAppFile(path, native, error);
         return SceErrorFromErrno(2);
     }
     File::FillFileStat(native, sb);

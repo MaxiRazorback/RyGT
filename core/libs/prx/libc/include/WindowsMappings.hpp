@@ -4,6 +4,7 @@
 #ifdef _WIN32
 #include <windows.h>
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstddef>
 #include <cstdint>
@@ -26,14 +27,14 @@ public:
     }
 
     bool Reserve(void* address, std::size_t bytes) {
-        std::lock_guard lock(mutex);
+        Lock lock(*this);
         return reserve(reinterpret_cast<std::uintptr_t>(address), bytes);
     }
 
     // Protect the free parts of a guest window before host drivers initialize.
     // Existing foreign mappings remain foreign and cannot be reset or replaced.
     bool ReserveAvailable(std::uintptr_t first, std::uintptr_t end) {
-        std::lock_guard lock(mutex);
+        Lock lock(*this);
         for (auto cursor = first; cursor < end;) {
             const auto memory = query(cursor);
             const auto stop = std::min(end, reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize);
@@ -45,7 +46,7 @@ public:
     // NVIDIA's Vulkan/CUDA interop needs low virtual addresses of its own.
     // Search both guest-owned placeholders and currently free host ranges.
     void* FindAndReserve(std::uintptr_t first, std::uintptr_t end, std::size_t bytes, std::size_t alignment) {
-        std::lock_guard lock(mutex);
+        Lock lock(*this);
         if (bytes == 0 || alignment == 0 || (alignment & (alignment - 1)) != 0) return nullptr;
         unsigned retries = 0;
         auto candidate = alignUp(first, alignment);
@@ -75,7 +76,7 @@ public:
     }
 
     void Commit(void* address, std::size_t bytes, DWORD protection, std::size_t granule, bool watched) {
-        std::lock_guard lock(mutex);
+        Lock lock(*this);
         requireOwned(reinterpret_cast<std::uintptr_t>(address), bytes);
         const auto end = reinterpret_cast<std::uintptr_t>(address) + bytes;
         for (auto cursor = reinterpret_cast<std::uintptr_t>(address); cursor < end;) {
@@ -110,12 +111,12 @@ public:
     }
 
     void Reset(void* address, std::size_t bytes) {
-        std::lock_guard lock(mutex);
+        Lock lock(*this);
         reset(reinterpret_cast<std::uintptr_t>(address), bytes);
     }
 
     void Map(void* address, std::size_t bytes, HANDLE section, std::uint64_t offset, DWORD protection) {
-        std::lock_guard lock(mutex);
+        Lock lock(*this);
         auto cursor = reinterpret_cast<std::uintptr_t>(address);
         reset(cursor, bytes);
         HANDLE duplicate = nullptr;
@@ -154,7 +155,7 @@ public:
     }
 
     void SetProtection(std::uintptr_t address, std::size_t bytes, DWORD protection) {
-        std::lock_guard lock(mutex);
+        Lock lock(*this);
         for (auto it = views.lower_bound(address); it != views.end() && it->first < address + bytes; ++it) {
             it->second.protection = protection;
             it->second.armed = false;
@@ -163,7 +164,7 @@ public:
     }
 
     bool HandleWrite(std::uintptr_t address) {
-        std::lock_guard lock(mutex);
+        Lock lock(*this);
         const auto base = address & ~(pageBytes - 1);
         const auto found = views.find(base);
         if (found == views.end() || !writable(found->second.protection)) return false;
@@ -175,8 +176,31 @@ public:
         return true;
     }
 
+    /// RyGT: a fault in guest memory while another thread remaps it. reset() and splitView() unmap
+    /// a view and map the parts that stay, so for a moment those pages are not there, and a thread
+    /// that reads one then (the renderer's shader translation reading shader code, for instance)
+    /// faults. Under Wine these moments last far longer than on Windows. This waits for the remap
+    /// to finish; true when the page is back and allows the access, so the access can be retried.
+    bool AwaitRemap(std::uintptr_t address, bool write) {
+        if (owner.load(std::memory_order_acquire) == GetCurrentThreadId()) return false;
+        const auto deadline = GetTickCount64() + 5000;
+        while (!mutex.try_lock()) {
+            if (GetTickCount64() > deadline) return false;
+            SwitchToThread();
+        }
+        std::lock_guard lock(mutex, std::adopt_lock);
+        if (reservationEnd(address) <= address) return false;
+        MEMORY_BASIC_INFORMATION memory{};
+        if (VirtualQuery(reinterpret_cast<void*>(address), &memory, sizeof(memory)) != sizeof(memory)) return false;
+        if (memory.State != MEM_COMMIT || (memory.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0) return false;
+        const DWORD protection = memory.Protect & 0xff;
+        if (!write) return true;
+        return protection == PAGE_READWRITE || protection == PAGE_EXECUTE_READWRITE ||
+               protection == PAGE_WRITECOPY || protection == PAGE_EXECUTE_WRITECOPY;
+    }
+
     void* MapAlias(std::uintptr_t address, std::size_t bytes) {
-        std::lock_guard lock(mutex);
+        Lock lock(*this);
         const auto refuse = [&](const char* reason) {
             char text[192];
             std::snprintf(text, sizeof(text), "read-write alias of shared guest memory 0x%llx+0x%llx: %s", static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes), reason);
@@ -212,7 +236,7 @@ public:
     }
 
     bool Protection(std::uintptr_t address, std::uint32_t* protection) {
-        std::lock_guard lock(mutex);
+        Lock lock(*this);
         const auto found = views.find(address & ~(pageBytes - 1));
         if (found == views.end()) return false;
         *protection = found->second.protection;
@@ -220,7 +244,7 @@ public:
     }
 
     bool Collect(std::uintptr_t address, std::size_t bytes, void** pages, std::size_t* count, bool clear) {
-        std::lock_guard lock(mutex);
+        Lock lock(*this);
         const auto capacity = *count;
         *count = 0;
         const auto end = address + bytes;
@@ -399,6 +423,21 @@ private:
         }
     }
 
+    // The mutex, remembering which thread holds it (AwaitRemap must not wait for itself).
+    struct Lock {
+        explicit Lock(WindowsMappings& mappings) : mappings(mappings) {
+            mappings.mutex.lock();
+            mappings.owner.store(GetCurrentThreadId(), std::memory_order_release);
+        }
+        ~Lock() {
+            mappings.owner.store(0, std::memory_order_release);
+            mappings.mutex.unlock();
+        }
+        Lock(const Lock&) = delete;
+        Lock& operator=(const Lock&) = delete;
+        WindowsMappings& mappings;
+    };
+
     [[noreturn]] static void fail(const char* operation) {
         throw std::system_error(static_cast<int>(GetLastError()), std::system_category(), operation);
     }
@@ -499,12 +538,22 @@ private:
             const auto runBytes = (j - i) * pageBytes;
             split(runBase, runBytes);
             if (!map(keep[i].second.section->handle, GetCurrentProcess(), reinterpret_cast<void*>(runBase), keep[i].second.offset, runBytes, MEM_REPLACE_PLACEHOLDER, PAGE_EXECUTE_READWRITE, nullptr, 0)) fail("map shared guest view again");
+            // One protection call per run of pages that end up alike: per page, a remap of a large
+            // view took thousands of calls, and the kept pages are missing until it is done.
+            const auto effective = [](const View& view) {
+                if (view.armed && writable(view.protection)) return view.protection == PAGE_EXECUTE_READWRITE ? DWORD{PAGE_EXECUTE_READ} : DWORD{PAGE_READONLY};
+                return view.protection;
+            };
+            for (std::size_t k = i; k < j;) {
+                const DWORD protection = effective(keep[k].second);
+                std::size_t l = k + 1;
+                while (l < j && effective(keep[l].second) == protection) ++l;
+                DWORD previous;
+                if (!VirtualProtect(reinterpret_cast<void*>(keep[k].first), (l - k) * pageBytes, protection, &previous)) fail("protect shared guest page again");
+                k = l;
+            }
             for (std::size_t k = i; k < j; ++k) {
                 auto& [page, view] = keep[k];
-                DWORD effective = view.protection;
-                if (view.armed && writable(view.protection)) effective = view.protection == PAGE_EXECUTE_READWRITE ? PAGE_EXECUTE_READ : PAGE_READONLY;
-                DWORD previous;
-                if (!VirtualProtect(reinterpret_cast<void*>(page), pageBytes, effective, &previous)) fail("protect shared guest page again");
                 view.page->aliases.push_back(page);
                 views.emplace(page, view);
             }
@@ -519,6 +568,7 @@ private:
     std::map<std::uintptr_t, View> views;
     std::map<std::pair<std::uintptr_t, std::uint64_t>, std::weak_ptr<SharedPage>> physical;
     std::mutex mutex;
+    std::atomic<DWORD> owner{0};
     AllocateFunction allocate = nullptr;
     MapFunction map = nullptr;
     UnmapFunction unmap = nullptr;

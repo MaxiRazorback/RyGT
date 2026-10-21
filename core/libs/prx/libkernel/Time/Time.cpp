@@ -50,13 +50,61 @@ bool WindowsSeconds(const SYSTEMTIME& calendar, std::int64_t& seconds) {
     return true;
 }
 
+// Wine and Proton's kernel32 export neither ...Ex conversion (kernelbase only has stubs), and a
+// static import of them keeps libkernel from loading there. Look them up at run time and fall back
+// to the plain conversions with the local year's rules of the same time zone, which gives the same
+// results (checked against the ...Ex functions for every Windows time zone, 2024-2027).
+using ZoneConversion = BOOL(WINAPI*)(const DYNAMIC_TIME_ZONE_INFORMATION*, const SYSTEMTIME*, LPSYSTEMTIME);
+
+ZoneConversion KernelZoneConversion(const char* name) {
+    const HMODULE kernel = GetModuleHandleW(L"kernel32.dll");
+    return kernel ? reinterpret_cast<ZoneConversion>(reinterpret_cast<void*>(GetProcAddress(kernel, name))) : nullptr;
+}
+
+// A year's rules of the zone, cached (GetTimeZoneInformationForYear reads the registry each time).
+bool ZoneRules(DYNAMIC_TIME_ZONE_INFORMATION& zone, int year, TIME_ZONE_INFORMATION& rules) {
+    static std::mutex lock;
+    static std::wstring cachedZone;
+    static std::unordered_map<int, TIME_ZONE_INFORMATION> cache;
+    const std::wstring key = std::wstring(zone.TimeZoneKeyName) + (zone.DynamicDaylightTimeDisabled ? L"|fixed" : L"");
+    std::lock_guard guard(lock);
+    if (key != cachedZone) {
+        cache.clear();
+        cachedZone = key;
+    }
+    if (const auto found = cache.find(year); found != cache.end()) {
+        rules = found->second;
+        return true;
+    }
+    if (!GetTimeZoneInformationForYear(static_cast<USHORT>(year), &zone, &rules)) return false;
+    cache.emplace(year, rules);
+    return true;
+}
+
+bool UtcToZoneTime(DYNAMIC_TIME_ZONE_INFORMATION& zone, const SYSTEMTIME& universal, SYSTEMTIME& local) {
+    static const auto convert = KernelZoneConversion("SystemTimeToTzSpecificLocalTimeEx");
+    if (convert) return convert(&zone, &universal, &local) != FALSE;
+    TIME_ZONE_INFORMATION rules{};
+    if (!ZoneRules(zone, universal.wYear, rules) || !SystemTimeToTzSpecificLocalTime(&rules, &universal, &local)) return false;
+    // Around New Year the local year differs from the UTC year, and its rules decide.
+    return local.wYear == universal.wYear ||
+           (ZoneRules(zone, local.wYear, rules) && SystemTimeToTzSpecificLocalTime(&rules, &universal, &local));
+}
+
+bool ZoneTimeToUtc(DYNAMIC_TIME_ZONE_INFORMATION& zone, const SYSTEMTIME& local, SYSTEMTIME& universal) {
+    static const auto convert = KernelZoneConversion("TzSpecificLocalTimeToSystemTimeEx");
+    if (convert) return convert(&zone, &local, &universal) != FALSE;
+    TIME_ZONE_INFORMATION rules{};
+    return ZoneRules(zone, local.wYear, rules) && TzSpecificLocalTimeToSystemTime(&rules, &local, &universal);
+}
+
 bool WindowsClockFromUtc(std::int64_t utc, WindowsLocalClock& result) {
     DYNAMIC_TIME_ZONE_INFORMATION zone{};
     if (GetDynamicTimeZoneInformation(&zone) == TIME_ZONE_ID_INVALID) return false;
     SYSTEMTIME universal{}, local{};
-    if (!WindowsCalendar(utc, universal) || !SystemTimeToTzSpecificLocalTimeEx(&zone, &universal, &local)) return false;
+    if (!WindowsCalendar(utc, universal) || !UtcToZoneTime(zone, universal, local)) return false;
     TIME_ZONE_INFORMATION rules{};
-    if (!GetTimeZoneInformationForYear(local.wYear, &zone, &rules)) return false;
+    if (!ZoneRules(zone, local.wYear, rules)) return false;
     std::int64_t localSeconds{};
     if (!WindowsSeconds(local, localSeconds)) return false;
     const auto standard = static_cast<std::int32_t>(-(rules.Bias + rules.StandardBias) * 60);
@@ -69,7 +117,7 @@ bool WindowsClockFromLocal(std::int64_t local, WindowsLocalClock& result) {
     if (GetDynamicTimeZoneInformation(&zone) == TIME_ZONE_ID_INVALID) return false;
     SYSTEMTIME calendar{}, universal{};
     std::int64_t utc{};
-    if (!WindowsCalendar(local, calendar) || !TzSpecificLocalTimeToSystemTimeEx(&zone, &calendar, &universal) ||
+    if (!WindowsCalendar(local, calendar) || !ZoneTimeToUtc(zone, calendar, universal) ||
         !WindowsSeconds(universal, utc)) return false;
     return WindowsClockFromUtc(utc, result);
 }

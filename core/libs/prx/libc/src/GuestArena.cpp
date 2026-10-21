@@ -185,6 +185,10 @@ bool GuestArenaHandleWrite_nid_postfix(std::uintptr_t address) {
     return WindowsMappings::Get().HandleWrite(address);
 }
 
+bool GuestArenaAwaitRemap_nid_postfix(std::uintptr_t address, bool write) {
+    return WindowsMappings::Get().AwaitRemap(address, write);
+}
+
 bool GuestArenaProtection_nid_postfix(std::uintptr_t address, std::uint32_t* protection) {
     return WindowsMappings::Get().Protection(address, protection);
 }

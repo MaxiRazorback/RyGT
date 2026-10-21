@@ -547,6 +547,23 @@ LONG WINAPI ReportCrash(EXCEPTION_POINTERS* info) {
         }
         return EXCEPTION_CONTINUE_EXECUTION;
     }
+    if (fault->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && fault->NumberParameters >= 2) {
+        // RyGT: guest memory another thread was remapping (its pages are missing for a moment;
+        // much longer under Wine). Retry once the remap is done, but not forever at one address.
+        thread_local std::uintptr_t lastAddress = 0;
+        thread_local unsigned retries = 0;
+        const auto address = static_cast<std::uintptr_t>(fault->ExceptionInformation[1]);
+        retries = address == lastAddress ? retries + 1 : 0;
+        lastAddress = address;
+        if (retries < 64 && GuestArena::GuestArenaAwaitRemap_nid_postfix(address, fault->ExceptionInformation[0] == 1)) {
+            static std::atomic<unsigned> logged{0};
+            if (logged.fetch_add(1) < 20) {
+                std::fprintf(stderr, "[fault] waited for a guest remap at %p (rip %p)\n",
+                             reinterpret_cast<void*>(address), fault->ExceptionAddress);
+            }
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+    }
     if (HandleBreak(info)) return EXCEPTION_CONTINUE_EXECUTION;
     if (HandleWatch(info)) return EXCEPTION_CONTINUE_EXECUTION;
     if (HandleSse4a(info)) return EXCEPTION_CONTINUE_EXECUTION;

@@ -1,0 +1,155 @@
+From cb57a2d4ecbd81ecf8ed8581910f79f4a94765c7 Mon Sep 17 00:00:00 2001
+From: mlgprorektm8 <67933lance@gmail.com>
+Date: Tue, 20 Oct 2026 13:33:35 -0500
+Subject: [PATCH] FIX-160: read guest memory safely where the game can release
+ it meanwhile
+
+A Linux tester's native-renderer run crashed on the recorder thread hashing a texture whose
+memory the game had just unmapped (ImageRegistry::RecordUploads -> XXH3 over 0x10227fa100+0x16800,
+fault at 0x1022800000, right after the game unmapped 50 MB there and mapped back 18 MB), and an
+earlier run crashed on a shader worker reading shader code (TranslateProgram, 0x1022c7d800).
+The caches can say memory is mapped while the game is releasing it, so:
+- the native renderer hashes guest memory with Core::HashGuestBytes (guarded, as the old
+  renderer does) in RecordUploads, MemoryUnchanged and the image dump, and copies it with
+  GuardedCopy (zeros where nothing is mapped any more) in RecordUploads and the read snapshot;
+- a background translation job (FIX-078) translates its own guarded copy of the code; when the
+  copy faults the job is not queued and a draw that needs it translates it as before.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ryty_gpu/native/image_registry.cpp            | 21 ++++++++++++-------
+ .../renderer_vulkan/vk_pipeline_cache.cpp     | 14 ++++++++++++-
+ .../renderer_vulkan/vk_pipeline_cache.h       |  3 ++-
+ .../renderer_vulkan/vk_rasterizer_native.cpp  | 10 ++++++---
+ 4 files changed, 36 insertions(+), 12 deletions(-)
+
+diff --git a/ryty_gpu/native/image_registry.cpp b/ryty_gpu/native/image_registry.cpp
+index 4d8c7735..e1c9acfc 100644
+--- a/ryty_gpu/native/image_registry.cpp
++++ b/ryty_gpu/native/image_registry.cpp
+@@ -8,6 +8,7 @@
+ #include <array>
+ #include <cstdlib>
+ #include "common/logging/log.h"
++#include "core/guest_hash.h"
+ #include "core/memory.h"
+ #include <xxhash.h>
+ #include "ryty_gpu/native/image_registry.h"
+@@ -803,8 +804,9 @@ bool ImageRegistry::MemoryUnchanged(const ImageEntry& entry) {
+         memory_clamp(entry.info.guest_address, size) != size) {
+         return false;
+     }
+-    const u64 hash =
+-        XXH3_64bits(reinterpret_cast<const void*>(entry.info.guest_address), size) | 1;
++    // FIX-160: read safely; the game can release the memory while the caches still say it is
++    // mapped (a GPU-thread fault under Proton).
++    const u64 hash = Core::HashGuestBytes(entry.info.guest_address, size) | 1;
+     return hash == entry.content_hash;
+ }
+ 
+@@ -1049,8 +1051,8 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list) {
+         // FIX-157: render targets of any size (what their memory held when made).
+         if ((size <= HashedSize || !entry->from_cpu) && memory_clamp &&
+             memory_clamp(info.guest_address, size) == size) {
+-            const u64 hash =
+-                XXH3_64bits(reinterpret_cast<const void*>(info.guest_address), size) | 1;
++            // FIX-160: a safe read (see MemoryUnchanged).
++            const u64 hash = Core::HashGuestBytes(info.guest_address, size) | 1;
+             if (!forced && hash == entry->content_hash) {
+                 ++upload_stats.unchanged;
+                 if (WatchedTexture(info.guest_address, info.guest_address + 1)) {
+@@ -1100,9 +1102,14 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list) {
+                                 info.resources.levels, readable);
+                 }
+             }
+-            if (readable != 0) {
+-                std::memcpy(source->Mapped(), reinterpret_cast<const void*>(info.guest_address),
+-                            readable);
++            // FIX-160: the game can release part of it meanwhile; then zeros where nothing is
++            // mapped any more.
++            if (readable != 0 &&
++                !Core::RytyMemory::GuardedCopy(source->Mapped(),
++                                               reinterpret_cast<const void*>(info.guest_address),
++                                               readable)) {
++                Core::Memory::Instance()->CopySparseMemory(info.guest_address, source->Mapped(),
++                                                           readable);
+             }
+             bytes = source.get();
+             bytes_offset = 0;
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index a72fe01c..e786a183 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -3802,7 +3802,19 @@ bool PipelineCache::QueueTranslation(HwStage hw_stage, SwStage sw_stage,
+     job->sw_stage = sw_stage;
+     job->hash = params.hash;
+     std::ranges::copy(params.user_data, job->user_data.begin());
+-    job->code = params.code;
++    // FIX-160: the worker translates its own copy of the code. The game can release that memory
++    // before a worker gets to it, and the read then crashed the worker (under Proton). Translation
++    // does not use the code's address (pgm_base is set again when the result is taken).
++    job->code_copy.resize(params.code.size());
++#ifdef RYTY_GPU
++    if (!Core::RytyMemory::GuardedCopy(job->code_copy.data(), params.code.data(),
++                                       params.code.size_bytes())) {
++        return false; // gone already; translated on the command thread if a draw needs it
++    }
++#else
++    std::ranges::copy(params.code, job->code_copy.begin());
++#endif
++    job->code = job->code_copy;
+     job->start = start;
+     jobs.push_back(job);
+     ++translate_stats.queued;
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.h b/src/video_core/renderer_vulkan/vk_pipeline_cache.h
+index 01f18bd2..9bd9edc9 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.h
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.h
+@@ -467,7 +467,8 @@ private:
+         Shader::SwStage sw_stage;
+         u64 hash;
+         std::array<u32, Shader::ShaderParams::NumShaderUserData> user_data;
+-        std::span<const u32> code;
++        std::span<const u32> code; // FIX-160: over code_copy, not guest memory
++        std::vector<u32> code_copy;
+         Shader::RuntimeInfo runtime_info;
+         Shader::Backend::Bindings start;
+         std::unique_ptr<Shader::Info> info;
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp b/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp
+index 76c8553b..053465f0 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp
+@@ -31,6 +31,7 @@
+ // (ryty_config.h brings in windows.h, whose `near` and `far` macros would rename variables here.)
+ #undef near
+ #undef far
++#include "core/guest_hash.h"
+ #include "core/memory.h"
+ #include "ryty_gpu/native/image_registry.h"
+ #include "ryty_gpu/native/job_walker.h"
+@@ -1433,7 +1434,11 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBufferLookup(VAdd
+     // can't read it: NAT-106).
+     const auto [buffer, offset, data] = Allocate(size, r.instance.StorageMinAlignment());
+     const u64 readable = Native::ReadablePrefix(reinterpret_cast<const void*>(address), size);
+-    std::memcpy(data, reinterpret_cast<const void*>(address), readable);
++    // FIX-160: the game can release part of the range meanwhile (zeros there then).
++    if (readable != 0 &&
++        !Core::RytyMemory::GuardedCopy(data, reinterpret_cast<const void*>(address), readable)) {
++        r.memory->CopySparseMemory(address, data, readable);
++    }
+     if (readable < size) {
+         std::memset(data + readable, 0, size - readable);
+     }
+@@ -4528,8 +4533,7 @@ void NativeRenderer::DumpFrame(const std::filesystem::path& dir) {
+                 r.memory->ClampRangeSize(info.guest_address, size) == size &&
+                 Native::ReadablePrefix(reinterpret_cast<const void*>(info.guest_address), size) ==
+                     size) {
+-                hash_now =
+-                    XXH3_64bits(reinterpret_cast<const void*>(info.guest_address), size) | 1;
++                hash_now = Core::HashGuestBytes(info.guest_address, size) | 1;
+             }
+             list += fmt::format("{} -> {} {:#x} {}x{} mips {} layers {} {}, {} sources, "
+                                 "version {}{}; memory {}; {}; uploads {}, stale {}; "
+-- 
+2.56.0.windows.1
+

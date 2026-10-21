@@ -20,7 +20,9 @@ namespace RyGT
         [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
         public static extern bool CreateHardLink(string newFile, string existingFile, IntPtr security);
 
+        // Returns a one-byte BOOLEAN, not a BOOL.
         [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        [return: MarshalAs(UnmanagedType.I1)]
         public static extern bool CreateSymbolicLink(string link, string target, int flags);
 
         [DllImport("dwmapi.dll")]
@@ -33,6 +35,144 @@ namespace RyGT
         public static extern int D3D11CreateDevice(IntPtr adapter, int driverType, IntPtr software,
             uint flags, IntPtr featureLevels, uint featureLevelsCount, uint sdkVersion,
             out IntPtr device, out int featureLevel, out IntPtr immediateContext);
+    }
+
+    /// Wine (Linux, Steam Proton): its kernel32 has wine_get_unix_file_name. Wine before 11 cannot
+    /// make Windows links (CreateSymbolicLink does nothing there and mklink /J fails), so under Wine
+    /// the game's files and folders are linked with Unix symbolic links, which Wine follows like the
+    /// files themselves (and reports as reparse points when they are folders).
+    static class Wine
+    {
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+        static extern IntPtr GetModuleHandle(string name);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Ansi, BestFitMapping = false)]
+        static extern IntPtr GetProcAddress(IntPtr module, string name);
+
+        [DllImport("kernel32.dll", CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Unicode, ExactSpelling = true)]
+        static extern IntPtr wine_get_unix_file_name(string dosPath);
+
+        [DllImport("kernel32.dll", CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi, ExactSpelling = true,
+                   BestFitMapping = false)]
+        static extern IntPtr wine_get_dos_file_name(string unixPath);
+
+        [DllImport("kernel32.dll")]
+        static extern IntPtr GetProcessHeap();
+
+        [DllImport("kernel32.dll")]
+        static extern bool HeapFree(IntPtr heap, uint flags, IntPtr memory);
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        struct StartupInfo
+        {
+            public int cb;
+            public string reserved, desktop, title;
+            public int x, y, width, height, columns, rows, fill, flags;
+            public short show, reserved2;
+            public IntPtr reserved3, input, output, error;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct ProcessInformation
+        {
+            public IntPtr process, thread;
+            public int processId, threadId;
+        }
+
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        static extern bool CreateProcess(string application, StringBuilder commandLine, IntPtr processAttributes,
+            IntPtr threadAttributes, bool inheritHandles, uint flags, IntPtr environment, string directory,
+            ref StartupInfo startup, out ProcessInformation information);
+
+        [DllImport("kernel32.dll")]
+        static extern bool CloseHandle(IntPtr handle);
+
+        static readonly bool detected = DetectWine();
+
+        public static bool Detected { get { return detected; } }
+
+        static bool DetectWine()
+        {
+            try
+            {
+                IntPtr kernel = GetModuleHandle("kernel32.dll");
+                return kernel != IntPtr.Zero && GetProcAddress(kernel, "wine_get_unix_file_name") != IntPtr.Zero;
+            }
+            catch { return false; }
+        }
+
+        /// The Unix path of a Windows path (whose last part need not exist yet).
+        public static string UnixPath(string path)
+        {
+            IntPtr unix = wine_get_unix_file_name(Path.GetFullPath(path));
+            if (unix == IntPtr.Zero) throw new Exception("Wine has no Unix path for " + path + ".");
+            try
+            {
+                int length = 0;
+                while (Marshal.ReadByte(unix, length) != 0) length++;
+                var bytes = new byte[length];
+                Marshal.Copy(unix, bytes, 0, length);
+                return Encoding.UTF8.GetString(bytes);
+            }
+            finally { HeapFree(GetProcessHeap(), 0, unix); }
+        }
+
+        static string DosPath(string unixPath)
+        {
+            IntPtr dos = wine_get_dos_file_name(unixPath);
+            if (dos == IntPtr.Zero) throw new Exception("Wine has no Windows path for " + unixPath + ".");
+            try { return Marshal.PtrToStringUni(dos); }
+            finally { HeapFree(GetProcessHeap(), 0, dos); }
+        }
+
+        static string Quote(string unixPath)
+        {
+            return "'" + unixPath.Replace("'", "'\\''") + "'";
+        }
+
+        /// Makes each link (key) a Unix symbolic link to its target (value), replacing an earlier
+        /// symbolic link but never a real file or folder, with one /bin/sh script. Wine starts Unix
+        /// programs detached, so the script's last line writes a file to wait for.
+        public static void Link(IEnumerable<KeyValuePair<string, string>> links)
+        {
+            string name = "rygt-link-" + Guid.NewGuid().ToString("N");
+            string script = Path.Combine(Path.GetTempPath(), name + ".sh");
+            string done = Path.Combine(Path.GetTempPath(), name + ".done");
+            var text = new StringBuilder();
+            text.Append("#!/bin/sh\n# Written by RyGT.exe: links the game's files under Wine.\n");
+            text.Append("PATH=/usr/local/bin:/usr/bin:/bin\n");
+            text.Append("link() { if [ -L \"$2\" ] || [ ! -e \"$2\" ]; then ln -sfn \"$1\" \"$2\"; fi; }\n");
+            foreach (var pair in links)
+            {
+                // The link's folder exists; its last part may not (Wine still gives the Unix path).
+                string folder = UnixPath(Path.GetDirectoryName(Path.GetFullPath(pair.Key)));
+                text.Append("link " + Quote(UnixPath(pair.Value)) + " " +
+                            Quote(folder.TrimEnd('/') + "/" + Path.GetFileName(pair.Key)) + "\n");
+            }
+            text.Append("echo done > " + Quote(UnixPath(done)) + "\n");
+            File.WriteAllText(script, text.ToString(), new UTF8Encoding(false));
+            try
+            {
+                var startup = new StartupInfo { cb = Marshal.SizeOf(typeof(StartupInfo)) };
+                ProcessInformation information;
+                var command = new StringBuilder("\"" + DosPath("/bin/sh") + "\" \"" + UnixPath(script) + "\"");
+                const uint CreateNoWindow = 0x08000000;
+                if (!CreateProcess(null, command, IntPtr.Zero, IntPtr.Zero, false, CreateNoWindow, IntPtr.Zero, null,
+                                   ref startup, out information))
+                    throw new Exception("Could not start /bin/sh to link the game's files (error " +
+                                        Marshal.GetLastWin32Error() + ").");
+                if (information.thread != IntPtr.Zero) CloseHandle(information.thread);
+                if (information.process != IntPtr.Zero) CloseHandle(information.process);
+                var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(60);
+                while (!File.Exists(done) && DateTime.UtcNow < deadline) Thread.Sleep(50);
+                if (!File.Exists(done)) throw new Exception("Linking the game's files with /bin/sh did not finish.");
+            }
+            finally
+            {
+                try { File.Delete(script); } catch { }
+                try { File.Delete(done); } catch { }
+            }
+        }
     }
 
     /// Dark colors for the loader window.
@@ -285,12 +425,14 @@ namespace RyGT
 
         public static bool IsPrepared(string exe)
         {
-            return HasIcon(exe) && ReadSubsystem(exe) == GuiSubsystem;
+            return (Wine.Detected || HasIcon(exe)) && ReadSubsystem(exe) == GuiSubsystem;
         }
 
         public static void Prepare(string exe)
         {
-            if (!HasIcon(exe)) ApplyIcon(exe);
+            // (Not the icon under Wine: it is only for Windows' Explorer, and this keeps Set up from
+            // depending on Wine rewriting the resources of a 100 MB program.)
+            if (!Wine.Detected && !HasIcon(exe)) ApplyIcon(exe);
             if (ReadSubsystem(exe) != GuiSubsystem) WriteSubsystem(exe, GuiSubsystem);
         }
 
@@ -594,7 +736,8 @@ namespace RyGT
                                    "mirror_half_rate", false);
             // Controls: which controller is which player (splitscreen) with a live preview, and the
             // controller and keyboard bindings.
-            var controls = Section(right, "Controls");
+            // Under Shaders (moved there below), so the columns end at about the same height.
+            var controls = Section(third, "Controls");
             controls.Controls.Add(new Label
             {
                 Text = "2 players for Arcade's Split Screen: pick each player's name and controller, " +
@@ -710,7 +853,7 @@ namespace RyGT
                 catch (Exception e) { MessageBox.Show(this, "Could not save the setting: " + e.Message); }
             };
 
-            var logging = Section(third, "Logging");
+            var logging = Section(left, "Logging"); // under Display, where there is room
             logging.Controls.Add(new Label { Text = "stdout.log minimum level", AutoSize = true,
                 BackColor = Color.Transparent, Margin = new Padding(0, 0, 0, 4) });
             var logLevel = new ComboBox { Width = 170, DropDownStyle = ComboBoxStyle.DropDownList,
@@ -727,10 +870,13 @@ namespace RyGT
             logging.Controls.Add(logLevel);
             logging.Controls.Add(new Label { Text = "Selected level and below, on the next launch.\nAll logs are in the logs folder; previous logs are timestamped.",
                 AutoSize = true, MaximumSize = new Size(360, 0), BackColor = Color.Transparent, Margin = new Padding(0, 4, 0, 0) });
+            third.Controls.SetChildIndex(controls, third.Controls.Count - 1);
             column.Controls.Add(grid);
 
-            // Actions on the left; the status line and the log to their right.
-            var bottom = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 2, BackColor = Color.Transparent, Margin = new Padding(0, 10, 0, 0) };
+            // Actions on the left; the status line and the log to their right. Pinned under the
+            // settings (not scrolled with them), so Play is always in view and focusing it at start
+            // does not scroll the window's top out of view.
+            var bottom = new TableLayoutPanel { Dock = DockStyle.Bottom, Height = 128, ColumnCount = 2, RowCount = 2, BackColor = Color.Transparent, Padding = new Padding(24, 6, 26, 12) };
             bottom.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
             bottom.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
             bottom.RowStyles.Add(new RowStyle(SizeType.AutoSize));
@@ -751,18 +897,28 @@ namespace RyGT
 
             log = new TextBox { Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Vertical, Height = 110, Dock = DockStyle.Fill, Font = new Font("Consolas", 8.5f) };
             bottom.Controls.Add(log, 1, 1);
-            column.Controls.Add(bottom);
-            foreach (Control control in column.Controls)
+            Controls.Add(bottom);
+            scroll.BringToFront(); // fills what the pinned bar leaves
+            foreach (Control control in column.Controls) column.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            // As tall as the settings need, as far as the screen allows.
+            Load += delegate
             {
-                if (control != bottom) column.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-            }
-            column.RowStyles.Add(new RowStyle(SizeType.Absolute, 140));
+                column.PerformLayout();
+                int want = column.Height + scroll.AutoScrollMargin.Height + bottom.Height + 2;
+                int room = Screen.FromControl(this).WorkingArea.Height - (Height - ClientSize.Height) - 16;
+                ClientSize = new Size(ClientSize.Width, Math.Max(MinimumSize.Height - (Height - ClientSize.Height), Math.Min(want, room)));
+                CenterToScreen();
+            };
 
             Dark.Apply(this);
             subtitle.ForeColor = Dark.DimText;
             title.ForeColor = Color.White;
             HandleCreated += delegate { Dark.TitleBar(this); };
-            Shown += delegate { ActiveControl = play.Enabled ? (Control)play : setup; };
+            Shown += delegate
+            {
+                ActiveControl = play.Enabled ? (Control)play : setup;
+                scroll.AutoScrollPosition = new Point(0, 0);
+            };
             RefreshState();
         }
 
@@ -1287,7 +1443,7 @@ namespace RyGT
                 Path.Combine(work, "port-report.json") + "\" \"" + Path.Combine(work, "eboot.elf") + "\" \"" + Exe + "\"", work);
             if (code != 0 || !File.Exists(Exe)) throw new Exception("The converter failed (exit code " + code + ").");
             GameExe.Prepare(Exe);
-            Log("Gave GTSport.exe the ryGT icon and made it a Windows program.");
+            Log(Wine.Detected ? "Made GTSport.exe a Windows program." : "Gave GTSport.exe the ryGT icon and made it a Windows program.");
 
             // 3. app0: the game's files, the update's over the base game's, linked rather than copied.
             SetStatus("Linking the game files...");
@@ -1305,7 +1461,7 @@ namespace RyGT
 
             // 6. Shaders other players have met, prepared from this game's own files, into the
             // shader folder every RyGT folder shares.
-            UseSharedShaderCache();
+            UsePortableShaderCache();
             if (File.Exists(ShaderPack))
             {
                 SetStatus("Preparing shaders from your game files (a few minutes)...");
@@ -1395,7 +1551,7 @@ namespace RyGT
         // translates them on the splash screen and builds the pipelines there, so they don't
         // pause the game the first time a car or track shows up.
         string ShaderPack { get { return Path.Combine(root, "tools", "adcpatch", "shaders.pack"); } }
-        string ShaderPackStamp { get { return Path.Combine(root, "user", "cache", "shaders-pack.txt"); } }
+        string ShaderPackStamp { get { return Path.Combine(ShaderFolder, "shaders-pack.txt"); } }
 
         bool ShadersOutdated()
         {
@@ -1408,7 +1564,7 @@ namespace RyGT
         {
             string tool = Path.Combine(root, "tools", "adcpatch", "adcpatch.exe");
             if (!File.Exists(tool) || !File.Exists(ShaderPack)) return false;
-            string cache = Path.Combine(root, "user", "cache");
+            string cache = ShaderFolder;
             Directory.CreateDirectory(cache);
             Func<string, string> arg = d => "\"" + (d ?? "").TrimEnd('\\') + "\"";
             string arguments = "shaderprep " + arg(baseDir) + " " + arg(updateDir) + " " + arg(ShaderPack) + " " + arg(cache);
@@ -1554,15 +1710,35 @@ namespace RyGT
                     if (!name.Equals("sce_module", StringComparison.OrdinalIgnoreCase)) dirs[name] = dir;
                 }
             }
-            int linked = 0;
+            // GT Sport only uses its data archives when gt.idx is there; without it the game closes
+            // right after its splash screen.
+            if (!files.ContainsKey("gt.idx"))
+                throw new Exception("Neither game folder has gt.idx. Pick the GT Sport folder (CUSA03220) and its update, " +
+                                    "the folders with gt.idx and the gt*.vol files.");
+            int linked = 0, hard = 0, symbolic = 0;
+            var unixLinks = new Dictionary<string, string>(); // under Wine: link -> target
             foreach (var pair in files)
             {
                 string target = Path.Combine(app0, pair.Key);
                 if (File.Exists(target)) File.Delete(target);
-                if (Native.CreateHardLink(target, pair.Value, IntPtr.Zero)) { linked++; continue; }
-                if (Native.CreateSymbolicLink(target, pair.Value, 2)) { linked++; continue; } // needs Developer Mode
+                if (Native.CreateHardLink(target, pair.Value, IntPtr.Zero)) { linked++; hard++; continue; }
+                if (Wine.Detected) { unixLinks[target] = pair.Value; continue; }
+                if (Native.CreateSymbolicLink(target, pair.Value, 2)) { linked++; symbolic++; continue; } // needs Developer Mode
                 throw new Exception("Could not link " + pair.Value + ". Put the RyGT folder on the same drive as the game, " +
                                     "or turn on Developer Mode in Windows settings.");
+            }
+            if (Wine.Detected)
+            {
+                foreach (var pair in dirs) unixLinks[Path.Combine(app0, pair.Key)] = pair.Value;
+                Wine.Link(unixLinks);
+                foreach (var pair in unixLinks)
+                {
+                    if (dirs.ContainsKey(Path.GetFileName(pair.Key)) ? !Directory.Exists(pair.Key) : !File.Exists(pair.Key))
+                        throw new Exception("Could not link " + pair.Value + " into app0.");
+                    if (!dirs.ContainsKey(Path.GetFileName(pair.Key))) linked++;
+                }
+                Log("Linked " + linked + " game files and " + dirs.Count + " folders into app0.");
+                return;
             }
             foreach (var pair in dirs)
             {
@@ -1573,7 +1749,32 @@ namespace RyGT
                 using (var process = Process.Start(info)) process.WaitForExit();
                 if (!Directory.Exists(target)) throw new Exception("Could not link the folder " + pair.Value + ".");
             }
-            Log("Linked " + linked + " game files and " + dirs.Count + " folders into app0.");
+            foreach (var pair in files)
+            {
+                string problem = ReadProblem(Path.Combine(app0, pair.Key), new FileInfo(pair.Value).Length);
+                if (problem != null)
+                    throw new Exception("app0\\" + pair.Key + " " + problem + " after linking it to " + pair.Value +
+                                        ". Put the RyGT folder on the same drive as the game and press Set up again.");
+            }
+            Log("Linked " + linked + " game files (" + hard + " hard links, " + symbolic + " symbolic links) and " +
+                dirs.Count + " folders into app0.");
+        }
+
+        /// Why a linked game file can't be used (missing, unreadable or a different size), or null.
+        /// Opening it follows a symbolic link, unlike FileInfo.
+        static string ReadProblem(string path, long expectedLength)
+        {
+            try
+            {
+                using (var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+                {
+                    if (expectedLength >= 0 && stream.Length != expectedLength)
+                        return "has " + stream.Length + " bytes instead of " + expectedLength;
+                }
+                return null;
+            }
+            catch (FileNotFoundException) { return "is missing"; }
+            catch (Exception e) { return "can't be read (" + e.Message.TrimEnd('.') + ")"; }
         }
 
         static void CopyDirectory(string source, string destination)
@@ -1585,12 +1786,12 @@ namespace RyGT
                 CopyDirectory(dir, Path.Combine(destination, Path.GetFileName(dir)));
         }
 
-        // Shaders compiled on this PC are kept in one folder that every RyGT folder shares, so a new
-        // release unzipped into a new folder keeps them: user\cache becomes a junction to it. A folder's
-        // own shaders are moved there first (what the shared folder already has stays; of the driver's
-        // pipeline cache file the bigger one stays). A file named "local" in user\cache keeps that
-        // folder's shaders to itself.
-        static string SharedShaderCache
+        // Everything RyGT makes stays in the RyGT folder (portable), and the shaders are in plain sight
+        // in <RyGT>\shaders (the renderer's cache folder), never in AppData. Older folders kept them in
+        // user\cache: a real folder there is moved to shaders once. Builds from 2026-10-18 to 10-20
+        // made user\cache a link to one AppData folder shared by every RyGT folder; its shaders are
+        // copied instead (the AppData folder stays for other RyGT folders still linked to it).
+        static string OldSharedShaderCache
         {
             get
             {
@@ -1599,45 +1800,43 @@ namespace RyGT
             }
         }
 
-        void UseSharedShaderCache()
+        string ShaderFolder { get { return Path.Combine(root, "shaders"); } }
+
+        bool OldShaderCacheExists()
         {
-            string local = Path.Combine(root, "user", "cache");
+            return Directory.Exists(Path.Combine(root, "user", "cache"));
+        }
+
+        void UsePortableShaderCache()
+        {
+            string old = Path.Combine(root, "user", "cache");
             try
             {
-                // (Again each time: a link to a shared folder someone deleted leaves the renderer
-                // nowhere to keep its shaders.)
-                Directory.CreateDirectory(SharedShaderCache);
-                var info = new DirectoryInfo(local);
-                if (info.Exists && (info.Attributes & FileAttributes.ReparsePoint) != 0) return;
-                if (File.Exists(Path.Combine(local, "local"))) return;
-                if (info.Exists)
+                var info = new DirectoryInfo(old);
+                if (info.Exists && (info.Attributes & FileAttributes.ReparsePoint) != 0)
                 {
-                    Log("Moving this folder's shaders to the shared shader folder...");
-                    MergeShaderCache(local, SharedShaderCache);
-                    Directory.Delete(local, true);
+                    Log("Copying the shaders from the shared AppData folder into the shaders folder (once)...");
+                    MergeShaderCache(old, ShaderFolder, false);
+                    Directory.Delete(old, false); // the link only, not the shared folder
+                    Log("Shaders are kept in the shaders folder now. " + OldSharedShaderCache +
+                        " can be deleted once no other RyGT folder uses it.");
                 }
-                Directory.CreateDirectory(Path.GetDirectoryName(local));
-                var link = Process.Start(new ProcessStartInfo("cmd.exe", "/c mklink /J \"" + local + "\" \"" + SharedShaderCache + "\"")
+                else if (info.Exists)
                 {
-                    CreateNoWindow = true, UseShellExecute = false
-                });
-                link.WaitForExit();
-                if (link.ExitCode == 0 && Directory.Exists(local))
-                {
-                    Log("Shaders are kept in " + SharedShaderCache + ", shared by every RyGT folder.");
-                    return;
+                    Log("Moving the shaders from user\\cache to the shaders folder (once)...");
+                    if (!Directory.Exists(ShaderFolder)) Directory.Move(old, ShaderFolder);
+                    else { MergeShaderCache(old, ShaderFolder, true); Directory.Delete(old, true); }
                 }
-                Directory.CreateDirectory(local);
-                Log("Note: the shared shader folder could not be linked; shaders stay in this folder.");
+                Directory.CreateDirectory(ShaderFolder);
             }
             catch (Exception e)
             {
-                Log("Note: shared shader folder: " + e.Message);
-                try { Directory.CreateDirectory(local); } catch { }
+                Log("Note: shader folder: " + e.Message);
+                try { Directory.CreateDirectory(ShaderFolder); } catch { }
             }
         }
 
-        static void MergeShaderCache(string source, string target)
+        static void MergeShaderCache(string source, string target, bool move = true)
         {
             Directory.CreateDirectory(target);
             foreach (var file in Directory.GetFiles(source))
@@ -1646,25 +1845,35 @@ namespace RyGT
                 if (name.EndsWith(".tmp", StringComparison.OrdinalIgnoreCase)) continue;
                 string destination = Path.Combine(target, name);
                 if (!File.Exists(destination))
-                    File.Move(file, destination);
+                {
+                    if (move) File.Move(file, destination); else File.Copy(file, destination);
+                }
                 else if (name.EndsWith(".vkpipelinecache", StringComparison.OrdinalIgnoreCase) &&
                          new FileInfo(file).Length > new FileInfo(destination).Length)
                     File.Copy(file, destination, true);
             }
             foreach (var dir in Directory.GetDirectories(source))
-                MergeShaderCache(dir, Path.Combine(target, Path.GetFileName(dir)));
+                MergeShaderCache(dir, Path.Combine(target, Path.GetFileName(dir)), move);
         }
 
         void Play()
         {
             if (!File.Exists(Exe)) { MessageBox.Show(this, "Press Set up first."); return; }
-            var cacheDir = new DirectoryInfo(Path.Combine(root, "user", "cache"));
-            if (cacheDir.Exists && (cacheDir.Attributes & FileAttributes.ReparsePoint) == 0)
+            // Without its data index GT Sport closes right after the splash screen.
+            string dataProblem = ReadProblem(Path.Combine(root, "app0", "gt.idx"), -1);
+            if (dataProblem != null)
             {
-                status.Text = "Moving your shaders to the shared shader folder (once)...";
+                MessageBox.Show(this, "GT Sport's data index app0\\gt.idx " + dataProblem + ", so the game can't start.\n\n" +
+                                "Press Set up again. If the RyGT folder is on a different drive than the game, move it " +
+                                "to the game's drive first.");
+                return;
+            }
+            if (OldShaderCacheExists())
+            {
+                status.Text = "Moving your shaders to the shaders folder (once)...";
                 Refresh();
             }
-            UseSharedShaderCache();
+            UsePortableShaderCache();
             // Folders set up by an earlier RyGT.exe or adcpatch get the offline livery scripts (again)
             // now (a few seconds).
             if (GameScriptsOutdated() && Directory.Exists(settings.Game))
@@ -1807,6 +2016,16 @@ namespace RyGT
         {
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
+            // Portable: the tools' work folders (and anything else asking for a temporary folder) go
+            // into the RyGT folder instead of AppData\Local\Temp; the tools delete theirs when done.
+            try
+            {
+                string temp = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "temp");
+                Directory.CreateDirectory(temp);
+                Environment.SetEnvironmentVariable("TMP", temp);
+                Environment.SetEnvironmentVariable("TEMP", temp);
+            }
+            catch { }
             if (args.Contains("--setup")) return new LoaderForm().SetupWithoutWindow();
             if (args.Length == 2 && args[0] == "--prepare")
             {
@@ -1824,10 +2043,10 @@ namespace RyGT
                     form.ShowInTaskbar = false;
                     form.Show();
                     Application.DoEvents();
-                    var content = form.Controls[0];
-                    using (var image = new Bitmap(content.Width, content.Height))
+                    // The scrolled settings and the pinned bar under them.
+                    using (var image = new Bitmap(form.ClientSize.Width, form.ClientSize.Height))
                     {
-                        content.DrawToBitmap(image, new Rectangle(Point.Empty, content.Size));
+                        foreach (Control control in form.Controls) control.DrawToBitmap(image, control.Bounds);
                         image.Save(args[1], System.Drawing.Imaging.ImageFormat.Png);
                     }
                     form.Close();

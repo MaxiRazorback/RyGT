@@ -190,6 +190,7 @@ Join our server for more updates: https://discord.gg/8dz4U9Nd8d
 ## Documentation
 
 - [GT Sport setup](docs/gt-sport/README.md)
+- [Linux (Steam Proton)](docs/user/LINUX.md)
 - Ryty's general documentation: [index](docs/README.md), [building](docs/user/BUILDING.md),
   [usage](docs/user/USAGE.md), [input mapping](docs/user/INPUT_MAPPING.md),
   [porting pipeline](docs/dev/PORTING_PIPELINE.md)

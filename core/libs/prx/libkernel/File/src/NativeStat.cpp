@@ -5,11 +5,33 @@
 #include <string>
 
 #ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <fcntl.h>
+#include <io.h>
+#include <share.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <windows.h>
 using NativeStat = struct __stat64;
 static int DoStat(const std::filesystem::path& p, NativeStat* st) {
-    return _wstat64(p.wstring().c_str(), st);
+    const auto wide = p.wstring();
+    const int result = _wstat64(wide.c_str(), st);
+    // RyGT: Set up links the game's files into app0 with symbolic links when the game is on another
+    // drive. _wstat64 describes such a link itself (size 0); the opened file describes its target.
+    if (result == 0 && (st->st_mode & _S_IFMT) == _S_IFREG) {
+        const DWORD attributes = GetFileAttributesW(wide.c_str());
+        if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+            int fd = -1;
+            if (_wsopen_s(&fd, wide.c_str(), _O_RDONLY | _O_BINARY, _SH_DENYNO, 0) == 0) {
+                NativeStat target{};
+                if (_fstat64(fd, &target) == 0) *st = target;
+                _close(fd);
+            }
+        }
+    }
+    return result;
 }
 static int DoFstat(int fd, NativeStat* st) {
     if (const auto directory = File::DirectoryDescriptorPath(fd)) return DoStat(*directory, st);

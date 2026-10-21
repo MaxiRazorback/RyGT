@@ -1,0 +1,34 @@
+From 8680f963ae7dc8fb63d358e6a9d7dfe8b680708e Mon Sep 17 00:00:00 2001
+From: mlgprorektm8 <67933lance@gmail.com>
+Date: Tue, 20 Oct 2026 18:35:41 -0500
+Subject: [PATCH] RyGT: the launcher's Info log level includes the renderer's
+ Info lines
+
+stdout.log at Info had no renderer lines (only Trace/Debug opted in), so frame-time windows were
+missing from a player's Info log. The level now means that level and above, as the launcher says.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/common/logging/log.cpp | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/src/common/logging/log.cpp b/src/common/logging/log.cpp
+index 12eec36a..2e104231 100644
+--- a/src/common/logging/log.cpp
++++ b/src/common/logging/log.cpp
+@@ -172,9 +172,10 @@ void Setup(std::string_view shadps4_filename) {
+ #ifdef RYTY_GPU
+     const auto root = std::filesystem::current_path();
+     g_stdout_logger = std::make_unique<spdlog::logger>("stdout", g_console_sink);
+-    // ShadGT output is diagnostic data: opt in with Trace or Debug.
++    // ShadGT output is diagnostic data: opt in with Trace, Debug or Info (the launcher's level and
++    // everything above it; Info carries the frame-time windows).
+     const auto stdout_level = StdoutLevel::Read(root / "RyGT.ini");
+-    g_stdout_logger->set_level(stdout_level <= static_cast<unsigned>(Level::Debug)
++    g_stdout_logger->set_level(stdout_level <= static_cast<unsigned>(Level::Info)
+         ? static_cast<spdlog::level>(stdout_level) : spdlog::level::off);
+     g_stdout_logger->flush_on(spdlog::level::trace);
+ #endif
+-- 
+2.56.0.windows.1
+

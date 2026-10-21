@@ -1,0 +1,32 @@
+From cc1243c5a905c8e339219a4528e973ffc047084b Mon Sep 17 00:00:00 2001
+From: mlgprorektm8 <67933lance@gmail.com>
+Date: Tue, 20 Oct 2026 17:38:55 -0500
+Subject: [PATCH] RyGT: shaders in <RyGT folder>\shaders instead of user\cache
+
+Lance wants the shader cache in plain sight in the RyGT folder.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/common/path_util.cpp | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/src/common/path_util.cpp b/src/common/path_util.cpp
+index 3dd1f94a..7734f865 100644
+--- a/src/common/path_util.cpp
++++ b/src/common/path_util.cpp
+@@ -153,7 +153,12 @@ static auto UserPaths = [] {
+     create_path(PathType::MetaDataDir, user_dir / METADATA_DIR);
+     create_path(PathType::CustomTrophy, user_dir / CUSTOM_TROPHY);
+     create_path(PathType::CustomConfigs, user_dir / CUSTOM_CONFIGS);
++#ifdef RYTY_GPU
++    // RyGT keeps the shaders in plain sight: <RyGT folder>\shaders, beside user.
++    create_path(PathType::CacheDir, user_dir.parent_path() / "shaders");
++#else
+     create_path(PathType::CacheDir, user_dir / CACHE_DIR);
++#endif
+     create_path(PathType::FontsDir, user_dir / FONTS_DIR);
+     create_path(PathType::TrophyDir, user_dir / TROPHY_DIR);
+     create_path(PathType::HomeDir, user_dir / HOME_DIR);
+-- 
+2.56.0.windows.1
+

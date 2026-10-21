@@ -1,0 +1,31 @@
+From 4d4822bdb1d28c78ff895649d7c048c90bb47ded Mon Sep 17 00:00:00 2001
+From: mlgprorektm8 <67933lance@gmail.com>
+Date: Tue, 20 Oct 2026 12:02:10 -0500
+Subject: [PATCH 42/43] Non-renderer host libraries link again: stub the
+ Controllers window toggle
+
+ryty_stubs.cpp (in every host library) calls Ryty::ToggleControllerOverlay for the settings
+hotkey since the in-game Controllers window (86aafa5c), but only libSceVideoOut defines it, so
+libSceAjm, Audio3d, DiscMap, Ngs2, NpAuth, ScreenShot and Zlib no longer linked. They get a no-op.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ryty_gpu/ryty_hle_precompile.cpp | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/ryty_gpu/ryty_hle_precompile.cpp b/ryty_gpu/ryty_hle_precompile.cpp
+index 8df29c2c..881a4f70 100644
+--- a/ryty_gpu/ryty_hle_precompile.cpp
++++ b/ryty_gpu/ryty_hle_precompile.cpp
+@@ -5,3 +5,8 @@ bool PrecompileHoldsGame() {
+     return false;
+ }
+ }
++
++// The in-game Controllers window lives in libSceVideoOut; here the settings hotkey has nothing to open.
++namespace Ryty {
++void ToggleControllerOverlay() {}
++}
+-- 
+2.56.0.windows.1
+
