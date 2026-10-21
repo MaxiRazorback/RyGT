@@ -53,13 +53,22 @@ itself ("[game] fatal error at <file>(<line>): <message>"). Patch 0046 (DIAG-163
 scripts the game loads at start-up ("[boot] script <n> (+<ms> ms): <unit>"; `RYGT_LOG_BOOT=0` turns it
 off), to show how far a boot that ends early got.
 
+Patch 0042 (Gabarsolon) fixes Intel Arc rendering, compute barrier deadlocks, and DirectMemory performance
+on the native renderer:
+- Replaces `OpControlBarrier` with `OpMemoryBarrier` in compute shaders when `subgroup_size < 64`, avoiding
+  hardware EU arrival counter hangs in wave64-uniform branches.
+- Removes Intel from `needs_lds_barriers` to match AMD.
+- Unconditionally binds compute pipelines in `DispatchDirect` and `DispatchIndirect` on the primary command stream.
+- Selects `HOST_CACHED` (Type 2) memory for host-imported buffers in `DirectMemory` and `ImportHostMemory`.
+
 `0019-ghost-quad-sample-mask` (Gabarsolon) is applied in shadGT after the native renderer, merged
 with its larger push block (the quad sample mask follows the four buffer-offset vectors).
 
-shadGT's branch `ryty-gpu` has every patch applied (commit `9f31fa32`; `84cf50ce` added skipping
+shadGT's branch `ryty-gpu` has every patch applied (commit `0522545b`; `84cf50ce` added skipping
 screenshots of an empty picture); building from it is the simplest way to get the current renderer.
-Patches 0042-0049 are included there too (`ryty-gpu` and `linux-proton` are both at `9f31fa32`). Patch 0047
+Patches 0042-0050 are included there too (`ryty-gpu` and `linux-proton` are both at `0522545b`). Patch 0047
 puts the shader cache in `<RyGT folder>\shaders` instead of `user\cache`; 0048 makes the launcher's Info
 log level include the renderer's Info lines (frame-time windows). 0049 (FIX-165) stops using the driver's
 pipeline cache file (`RYGT_DRIVER_CACHE=1` turns it back on, saved only at exit): at 3.7 GB, its
-saves every 30 s made native races drop to 10 fps and back.
+saves every 30 s made native races drop to 10 fps and back. 0050 (DIAG-166) attaches RenderDoc when its
+layer is on: F12 or a `capture.now` file in the RyGT folder captures a frame into `captures`.

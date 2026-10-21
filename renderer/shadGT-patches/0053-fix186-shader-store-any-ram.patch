@@ -1,0 +1,38 @@
+From 191bb583c63f35a796fbe1d8006945df67903e0c Mon Sep 17 00:00:00 2001
+From: mlgprorektm8 <67933lance@gmail.com>
+Date: Wed, 21 Oct 2026 06:18:51 -0500
+Subject: [PATCH] FIX-186: the shader store opens at any RAM setting
+
+The launcher's 16 GB setting turns Vulkan.pipeline_cache_enabled off for the
+driver's cache file, and that also closed the shader translation store, so
+nothing was written to or read from <RyGT>\shaders with 16 GB.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ src/video_core/renderer_vulkan/vk_pipeline_cache.cpp | 10 +++++++++-
+ 1 file changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index bb36a111..8d996a61 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -744,7 +744,15 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
+     // PERF-032: the shader store is used again, without the startup precompile Lance had removed:
+     // a program's stored translations are read when a draw first uses it, and new translations
+     // are stored. -DisablePerf 47 leaves the store closed.
+-    if (EmulatorSettings.IsPipelineCacheEnabled() && Common::PerfFeatureEnabled(47)) {
++    // FIX-186 (RyGT): at any RAM setting. The launcher's 16 GB setting turns
++    // pipeline_cache_enabled off for the driver's cache file, and that closed the store too, so
++    // with 16 GB nothing was written to or read from the shaders folder (Lance, 2026-10-21).
++#ifdef RYTY_GPU
++    const bool store_wanted = true;
++#else
++    const bool store_wanted = EmulatorSettings.IsPipelineCacheEnabled();
++#endif
++    if (store_wanted && Common::PerfFeatureEnabled(47)) {
+         if (EmulatorSettings.IsPipelineCacheArchived()) {
+             LOG_WARNING(Render_Vulkan, "PERF-032: the shader store is not used with an archived "
+                                        "pipeline cache (pipeline_cache_archived)");
+-- 
+2.56.0.windows.1
+

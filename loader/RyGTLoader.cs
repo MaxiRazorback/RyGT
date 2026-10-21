@@ -1815,8 +1815,16 @@ namespace RyGT
                 var info = new DirectoryInfo(old);
                 if (info.Exists && (info.Attributes & FileAttributes.ReparsePoint) != 0)
                 {
-                    Log("Copying the shaders from the shared AppData folder into the shaders folder (once)...");
-                    MergeShaderCache(old, ShaderFolder, false);
+                    // File by file, skipping what an earlier run (perhaps closed halfway) already
+                    // copied, so a second start picks up where the first stopped. A link to a
+                    // shared folder that is gone is just removed.
+                    if (Directory.Exists(old))
+                    {
+                        Log("Copying the shaders from the shared AppData folder into the shaders folder (once)...");
+                        int copied = 0;
+                        CopyShaders(old, ShaderFolder, ref copied);
+                        Log("Copied " + copied + " shader files.");
+                    }
                     Directory.Delete(old, false); // the link only, not the shared folder
                     Log("Shaders are kept in the shaders folder now. " + OldSharedShaderCache +
                         " can be deleted once no other RyGT folder uses it.");
@@ -1834,6 +1842,26 @@ namespace RyGT
                 Log("Note: shader folder: " + e.Message);
                 try { Directory.CreateDirectory(ShaderFolder); } catch { }
             }
+        }
+
+        // Copies a shader folder's files that the target doesn't have yet, with progress in the status
+        // line. The driver's pipeline cache file (several GB, unused since FIX-165) stays behind.
+        void CopyShaders(string source, string target, ref int copied)
+        {
+            Directory.CreateDirectory(target);
+            foreach (var file in Directory.GetFiles(source))
+            {
+                string name = Path.GetFileName(file);
+                if (name.EndsWith(".tmp", StringComparison.OrdinalIgnoreCase) ||
+                    name.IndexOf(".vkpipelinecache", StringComparison.OrdinalIgnoreCase) >= 0) continue;
+                string destination = Path.Combine(target, name);
+                if (File.Exists(destination)) continue;
+                File.Copy(file, destination + ".part", true);
+                File.Move(destination + ".part", destination);
+                if (++copied % 2000 == 0) SetStatus("Copying your shaders into the shaders folder (once): " + copied + " files...");
+            }
+            foreach (var dir in Directory.GetDirectories(source))
+                CopyShaders(dir, Path.Combine(target, Path.GetFileName(dir)), ref copied);
         }
 
         static void MergeShaderCache(string source, string target, bool move = true)
@@ -1868,37 +1896,45 @@ namespace RyGT
                                 "to the game's drive first.");
                 return;
             }
-            if (OldShaderCacheExists())
+            // The one-time steps below can take minutes (copying shaders, preparing them), so they run
+            // beside the window, which keeps showing their progress.
+            string gameDir = settings.Game;
+            string updateDir = settings.Update.Length > 0 && Directory.Exists(settings.Update) ? settings.Update : null;
+            busy = true;
+            RefreshState();
+            var thread = new Thread(delegate ()
             {
-                status.Text = "Moving your shaders to the shaders folder (once)...";
-                Refresh();
-            }
-            UsePortableShaderCache();
-            // Folders set up by an earlier RyGT.exe or adcpatch get the offline livery scripts (again)
-            // now (a few seconds).
-            if (GameScriptsOutdated() && Directory.Exists(settings.Game))
-            {
-                status.Text = "Making the offline livery scripts from your game files...";
-                Refresh();
                 try
                 {
-                    BuildGameScripts(settings.Game, settings.Update.Length > 0 && Directory.Exists(settings.Update) ? settings.Update : null);
+                    if (OldShaderCacheExists()) SetStatus("Moving your shaders to the shaders folder (once)...");
+                    UsePortableShaderCache();
+                    // Folders set up by an earlier RyGT.exe or adcpatch get the offline livery scripts
+                    // (again) now (a few seconds).
+                    if (GameScriptsOutdated() && Directory.Exists(gameDir))
+                    {
+                        SetStatus("Making the offline livery scripts from your game files...");
+                        try { BuildGameScripts(gameDir, updateDir); }
+                        catch (Exception e) { Log("Offline livery scripts: " + e.Message); }
+                    }
+                    // A newer shaders.pack (or a folder set up before it existed): prepared once now.
+                    if (ShadersOutdated() && Directory.Exists(gameDir))
+                    {
+                        SetStatus("Preparing shaders from your game files (a few minutes, once)...");
+                        try { PrepareShaders(gameDir, updateDir); }
+                        catch (Exception e) { Log("Shaders: " + e.Message); }
+                    }
                 }
-                catch (Exception e) { Log("Offline livery scripts: " + e.Message); }
-            }
-            // A newer shaders.pack (or a folder set up before it existed): prepared once now.
-            if (ShadersOutdated() && Directory.Exists(settings.Game))
-            {
-                status.Text = "Preparing shaders from your game files (a few minutes, once)...";
-                Refresh();
-                try
+                catch (Exception e) { Log("ERROR: " + e.Message); }
+                BeginInvoke(new Action(delegate
                 {
-                    PrepareShaders(settings.Game, settings.Update.Length > 0 && Directory.Exists(settings.Update) ? settings.Update : null);
-                }
-                catch (Exception e) { Log("Shaders: " + e.Message); }
-            }
-            StartGame(root);
-            status.Text = "GT Sport is starting. Logs: logs\\stdout.log and logs\\stderr.log.";
+                    busy = false;
+                    RefreshState();
+                    StartGame(root);
+                    status.Text = "GT Sport is starting. Logs: logs\\stdout.log and logs\\stderr.log.";
+                }));
+            });
+            thread.IsBackground = true;
+            thread.Start();
         }
 
         /// Starts GTSport.exe with session log rotation and waits for GPU recovery if Vulkan loses

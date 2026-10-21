@@ -317,7 +317,8 @@ if (mode == "shaderpack")
 if (mode == "shaderprep")
 {
     // shaderprep <game> <update or ""> <shaders.pack> <cache dir>: what Set up does. Writes the
-    // pack's shader settings into <cache dir>\CUSA03220-direct (files already there are kept)
+    // pack's shader settings into <cache dir>\CUSA03220-direct-sets, the renderer's store since
+    // its stage descriptor sets (SHD-002; files already there are kept)
     // and copies each listed program out of the player's own game files into
     // <cache dir>\CUSA03220-programs; the renderer translates them on the splash screen.
     string game = args[1], update = args[2], cache = args[4];
@@ -330,7 +331,7 @@ if (mode == "shaderprep")
     int count = r.ReadInt32();
     var programs = new List<(ulong hash, string path, long footer)>();
     for (int i = 0; i < count; i++) programs.Add((r.ReadUInt64(), r.ReadString(), r.ReadInt64()));
-    string store = Path.Combine(cache, "CUSA03220-direct");
+    string store = Path.Combine(cache, "CUSA03220-direct-sets");
     Directory.CreateDirectory(store);
     int files = r.ReadInt32(), written = 0;
     for (int i = 0; i < files; i++)
