@@ -137,3 +137,38 @@ with an empty shader store), and it also turned direct memory off and undid Sani
 every GPU. 0058 reverts it; 0059 (FIX-188) brings its Intel Arc changes back behind
 `Instance::IsIntel()` (vendor 0x8086), so every other GPU runs what it ran before 0042-intel-arc.
 `ryty-gpu` and `linux-proton` have every patch through 0059 (commit `1d13c88d`).
+
+## Temporal FSR 3.1 and Intel XeSS (0063-0064)
+
+Patches 0063 and 0064 apply after 0062 (shadGT `ryty-gpu` at `1d13c88d` plus 0020, 0062 and
+0058-0061). Tested on an RX 7600 (Windows 11, driver 26.8.1) at Dragon Trail.
+- 0063 (FIX-211): AMD's driver refuses storage use for some block-compressed images (BC5, BC6H)
+  even with extended usage. The default renderer made them anyway and the textures came out
+  garbled (broken colours on car dashboards). They are now made without storage use when
+  `getImageFormatProperties2` refuses it; shaders only sample them.
+- 0064 (FSR-201..209): temporal upscaling with the scene inputs from 0020 (colour, depth, motion
+  vectors and jitter), default renderer only. It replaces the game's anti-aliasing.
+  - `GPU.fsr_temporal` turns it on (with `fsr_enabled` and `fsr3_enabled`; DLSS temporal wins
+    when it is on). `SHADGT_FSR_TEMPORAL` overrides it.
+  - `GPU.fsr_upscaler` picks the backend: `fsr3` (FSR 3.1 through `amd_fidelityfx_vk.dll`),
+    `fsr4` (newest 4.x the DLL offers; AMD ships FSR 4 for D3D12 only, so this is a placeholder)
+    or `xess` (Intel XeSS-SR, needs `libxess.dll` from the XeSS SDK next to `GTSport.exe`).
+    `SHADGT_FSR_UPSCALER` overrides it.
+  - `GPU.upscale_ratio` (string) sets the render size below the output: `1` (native, AA only),
+    `1.3`, `1.5`, `1.7`, `2`, `2.3`, `3`; `0` renders at the window size. XeSS picks the quality
+    mode whose ratio is nearest. `SHADGT_UPSCALE_RATIO` overrides it.
+  - The window title names the upscaler in use, e.g. `ryGT - Gran Turismo Sport | FSR 3.1.4
+    temporal 1280x720 -> 1920x1080`.
+  - Depth reaches FSR/XeSS through an R32 copy and the reconstruction is blitted to the native
+    image: on AMD, a D32S8 depth view and the view-copy draw faulted the GPU (device lost).
+  - DIAG-206 logs a `VK_EXT_device_fault` report when the device is lost.
+
+The launcher's Graphics tab has the matching options: "Temporal upscaling", "Upscaler" (AMD FSR
+3.1, AMD FSR 4 (D3D12, WIP), Intel XeSS) and "Output resolution" (render size, from native 1080p
+down to 360p for 1080p output).
+
+Known issue (AMD, default renderer): scattered green and red dots on car dashboards (seen on the
+R92CP in the garage and in races). They are older than these patches and do not show in a
+RenderDoc replay of the same frame. Ruled out so far: FIX-191, image recycling, MSAA, draw-to-draw
+barriers, finishing the GPU after every draw, the staging ring, zero-filled new images, present
+FSR and zeroed undefined shader registers.
