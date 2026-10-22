@@ -55,7 +55,19 @@ jobs:
 
       - name: Get pinned FFmpeg revision
         id: ffmpeg
-        run: echo "sha=$(git -C 3rdparty/ffmpeg-core rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
+        run: |
+          set -euo pipefail
+          expected="$(git ls-tree HEAD 3rdparty/ffmpeg-core | awk '{print $3}')"
+          actual="$(git -C 3rdparty/ffmpeg-core rev-parse HEAD)"
+          if [ ! -f 3rdparty/ffmpeg-core/CMakeLists.txt ]; then
+            echo "FFmpeg submodule is missing; check recursive checkout."
+            exit 1
+          fi
+          if [ "$actual" != "$expected" ]; then
+            echo "FFmpeg submodule HEAD ($actual) does not match pinned commit ($expected)."
+            exit 1
+          fi
+          echo "sha=${expected:0:12}" >> "$GITHUB_OUTPUT"
 
       - name: Cache FFmpeg prebuilt libraries
         uses: actions/cache@v4
