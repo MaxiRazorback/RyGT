@@ -1,0 +1,74 @@
+From dca9911c282e000a8fe862570554c9c843a4436f Mon Sep 17 00:00:00 2001
+From: MaxiRazorback <344630105+MaxiRazorback@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 00:32:38 -0300
+Subject: [PATCH 59/61] FIX-189: native images without storage use when the
+ driver refuses it
+
+AMD's driver refuses storage use for some formats even with extended usage
+(BC6H, GT Sport's HDR sky and reflection maps), where NVIDIA's accepts it.
+The native renderer then made no image at all (NAT-100: no image of format
+Bc6HSfloatBlock; 32,104 NAT-020 misses in one Dragon Trail race): black sky,
+flat car paint. The image is now made without storage use; shaders only
+sample these.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../renderer_vulkan/vk_rasterizer_native.cpp  | 40 ++++++++++++++-----
+ 1 file changed, 30 insertions(+), 10 deletions(-)
+
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp b/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp
+index 48d51d98..31cdfd43 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp
+@@ -418,18 +418,38 @@ Native::MadeImage NativeRenderer::MakeImage(const VideoCore::ImageInfo& info, bo
+     if (info.props.is_block && instance.IsBlockTexelViewSupported()) {
+         flags |= vk::ImageCreateFlagBits::eBlockTexelViewCompatible;
+     }
+-    const vk::ImageUsageFlags usage = UsageOf(instance, info);
+-    const vk::FormatFeatureFlags2 features = FeaturesOf(usage);
++    vk::ImageUsageFlags usage = UsageOf(instance, info);
++    vk::FormatFeatureFlags2 features = FeaturesOf(usage);
+     const vk::Format format = instance.GetSupportedFormat(info.pixel_format, features);
+     const vk::ImageType type = TypeOf(info.type);
+-    const auto properties =
+-        instance.GetPhysicalDevice().getImageFormatProperties2(vk::PhysicalDeviceImageFormatInfo2{
+-            .format = format,
+-            .type = type,
+-            .tiling = vk::ImageTiling::eOptimal,
+-            .usage = usage,
+-            .flags = flags,
+-        });
++    const auto query = [&](vk::ImageUsageFlags image_usage) {
++        return instance.GetPhysicalDevice().getImageFormatProperties2(
++            vk::PhysicalDeviceImageFormatInfo2{
++                .format = format,
++                .type = type,
++                .tiling = vk::ImageTiling::eOptimal,
++                .usage = image_usage,
++                .flags = flags,
++            });
++    };
++    auto properties = query(usage);
++    // FIX-189: AMD's driver refuses storage use for some formats even with extended usage
++    // (BC6H: GT Sport's sky and reflection maps), where NVIDIA's accepts it. Every such texture
++    // was then missing (black sky, flat car paint). Shaders only sample these, so the image is
++    // made without storage use.
++    if (properties.result != vk::Result::eSuccess && (usage & vk::ImageUsageFlagBits::eStorage)) {
++        const vk::ImageUsageFlags sampled_only = usage & ~vk::ImageUsageFlagBits::eStorage;
++        if (auto retry = query(sampled_only); retry.result == vk::Result::eSuccess) {
++            static std::atomic<u32> logged{};
++            if (Sample(logged)) {
++                LOG_INFO(Render_Vulkan, "FIX-189: format {} made without storage use",
++                         vk::to_string(format));
++            }
++            usage = sampled_only;
++            features = FeaturesOf(usage);
++            properties = retry;
++        }
++    }
+     if (properties.result != vk::Result::eSuccess) {
+         static std::atomic<u32> logged{};
+         if (Sample(logged)) {
+-- 
+2.56.0.windows.2
+
