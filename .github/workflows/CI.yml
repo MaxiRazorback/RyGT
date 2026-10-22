@@ -34,6 +34,7 @@ jobs:
           msystem: UCRT64
           update: true
           install: >-
+            git
             mingw-w64-ucrt-x86_64-gcc
             mingw-w64-ucrt-x86_64-ccache
             mingw-w64-ucrt-x86_64-cmake
