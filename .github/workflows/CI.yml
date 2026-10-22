@@ -28,6 +28,22 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Checkout GT Adhoc toolchain
+        uses: actions/checkout@v7
+        with:
+          repository: Nenkai/GTAdhocToolchain
+          ref: 3fecc2ed58e5d46135b2f94d2ce5d3fa8fb7dba0
+          path: tools/GTAdhocToolchain
+          submodules: recursive
+
+      - name: Checkout GT volume tools
+        uses: actions/checkout@v7
+        with:
+          repository: Nenkai/GTToolsSharp
+          ref: a59e6f17e8bf455bdaab84b88b3d02de3a593fc1
+          path: tools/GTToolsSharp
+          submodules: recursive
+
       - name: Set up MSYS2 UCRT64
         uses: msys2/setup-msys2@v2
         with:
@@ -42,6 +58,25 @@ jobs:
             curl
             unzip
             zip
+
+      - name: Set up .NET 10
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Apply RyGT adcpatch changes
+        run: |
+          git -C tools/GTAdhocToolchain apply ../adcpatch/GTAdhocToolchain-exact-roundtrip.patch
+          git -C tools/GTToolsSharp apply ../adcpatch/GTToolsSharp-read-only-open.patch
+
+      - name: Publish offline script tool
+        run: >-
+          dotnet publish tools/adcpatch/adcpatch.csproj
+          -c Release -r win-x64 --self-contained
+          -p:PublishSingleFile=true -o build/adcpatch-publish
+
+      - name: Build stack dump tool
+        run: gcc -O2 -o build/stackdump.exe tools/stackdump/stackdump.c -lpsapi
 
       - name: Cache C++ compilation results
         uses: actions/cache@v4
@@ -123,12 +158,14 @@ jobs:
         run: |
           set -euo pipefail
           stage="RyGT-windows-x86_64"
-          mkdir -p "$stage/libs" "$stage/converter" "$stage/launcher" "$stage/tools"
+          mkdir -p "$stage/libs" "$stage/converter" "$stage/launcher" "$stage/tools" "$stage/tools/adcpatch"
           find build/windows-mingw/core/libs/libs -maxdepth 1 -type f -name '*.prx' -exec cp {} "$stage/libs/" \;
           cp build/windows-mingw/core/relinker/ryty.exe "$stage/converter/"
           probe="$(find build/windows-mingw -type f -name 'ryty-wheel-probe.exe' -print -quit)"
           test -n "$probe"
           cp "$probe" "$stage/tools/ryty-wheel-probe.exe"
+          cp -a build/adcpatch-publish/. "$stage/tools/adcpatch/"
+          cp build/stackdump.exe "$stage/tools/stackdump.exe"
           cp loader/launcher/background.png "$stage/launcher/"
           cp /ucrt64/bin/libgcc_s_seh-1.dll "$stage/"
           cp /ucrt64/bin/libstdc++-6.dll "$stage/"
@@ -137,6 +174,10 @@ jobs:
           cp /ucrt64/bin/libstdc++-6.dll "$stage/converter/"
           cp /ucrt64/bin/libwinpthread-1.dll "$stage/converter/"
           test -f "$stage/RyGT.exe"
+          test -f "$stage/tools/adcpatch/adcpatch.exe"
+          test -f "$stage/tools/adcpatch/openGrim.ad"
+          test -f "$stage/tools/adcpatch/grim.ad"
+          test -f "$stage/tools/stackdump.exe"
           test -n "$(find "$stage/libs" -maxdepth 1 -name '*.prx' -print -quit)"
           cat > "$stage/README.txt" <<'EOF'
           RyGT Windows test build
