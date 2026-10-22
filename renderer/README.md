@@ -70,3 +70,20 @@ launcher's Display > Screen shape > "Fill the screen", is the shape of the game'
 also "21:9", "32:9", width:height or a number; `RYGT_ASPECT` overrides it) widens the race camera's
 16:9 aspect (eboot 0x5e717f) and stretches the picture over the whole window instead of black
 bars. The HUD and menus are stretched with the picture; 16:9, the default, changes nothing.
+
+## Camera Manager
+
+`shadGT-patches/0065-in-game-camera-manager.patch` adds the in-game Camera Manager
+for Windows. It is a plain Git diff against shadGT
+`1d13c88d2e57bc63ce1586fe0b8f3342b6afdd19` on `ryty-gpu`; apply it with `git apply`
+on that checkout, then build the existing `ryty_gpu` target. Its native renderer
+and shader sources are unchanged. This patch follows the existing RyGT convention
+of carrying shadGT additions here; the shadGT source tree is not vendored into RyGT.
+
+The patch includes the dedicated camera sources, build integration and the host
+startup, overlay and input connections. It does not include compiled modules.
+Existing build options are retained; the camera target additionally links Windows
+`bcrypt` for executable validation.
+
+For controls, ranges and presets, see [Camera Manager](../docs/user/CAMERA_MANAGER.md).
+For the standalone Windows tests, see [camera-manager-tests](camera-manager-tests/README.md).
