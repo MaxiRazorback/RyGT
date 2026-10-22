@@ -5,8 +5,6 @@
 // not allow it inside the GPL renderer, so the renderer only loads the plugin at run time when the
 // DLSS option is on and the plugin is present. Plain C; Vulkan handles are passed as is.
 //
-// The renderer hands DLSS the finished game picture (no motion vectors or depth exist at that
-// point), so the plugin runs DLSS with zero motion vectors and resets its history every frame.
 
 #pragma once
 
@@ -18,6 +16,7 @@ extern "C" {
 #endif
 
 #define RYGT_DLSS_API_VERSION 1
+#define RYGT_DLSS_TEMPORAL_API_VERSION 2
 
 typedef struct RygtDlssImage {
     VkImage image;
@@ -61,6 +60,54 @@ typedef void(VKAPI_PTR* PFN_RygtDlss_Shutdown)(void);
 
 // The last error, for the log.
 typedef const char*(VKAPI_PTR* PFN_RygtDlss_LastError)(void);
+
+typedef enum RygtDlssQuality {
+    RYGT_DLSS_QUALITY_DLAA = 0,
+    RYGT_DLSS_QUALITY_QUALITY = 1,
+    RYGT_DLSS_QUALITY_BALANCED = 2,
+    RYGT_DLSS_QUALITY_PERFORMANCE = 3,
+    RYGT_DLSS_QUALITY_ULTRA_PERFORMANCE = 4
+} RygtDlssQuality;
+
+typedef enum RygtDlssFrameFlags {
+    RYGT_DLSS_FRAME_HDR = 1u << 0,
+    RYGT_DLSS_FRAME_DEPTH_INVERTED = 1u << 1,
+    RYGT_DLSS_FRAME_MOTION_JITTERED = 1u << 2,
+    RYGT_DLSS_FRAME_MOTION_OUTPUT_RESOLUTION = 1u << 3,
+    RYGT_DLSS_FRAME_RESET = 1u << 4,
+    RYGT_DLSS_FRAME_AUTO_EXPOSURE = 1u << 5
+} RygtDlssFrameFlags;
+
+typedef struct RygtDlssOptimalSettings {
+    uint32_t struct_size;
+    uint32_t optimal_width, optimal_height;
+    uint32_t minimum_width, minimum_height;
+    uint32_t maximum_width, maximum_height;
+} RygtDlssOptimalSettings;
+
+typedef struct RygtDlssFrame {
+    uint32_t struct_size;
+    uint32_t version;
+    uint64_t frame_id;
+    RygtDlssImage color;
+    RygtDlssImage depth;
+    RygtDlssImage motion;
+    RygtDlssImage output;
+    RygtDlssQuality quality;
+    uint32_t flags;
+    float jitter_x, jitter_y;
+    float motion_scale_x, motion_scale_y;
+    float pre_exposure, exposure_scale;
+    float frame_time_ms;
+} RygtDlssFrame;
+
+typedef int(VKAPI_PTR* PFN_RygtDlss_TemporalApiVersion)(void);
+typedef int(VKAPI_PTR* PFN_RygtDlss_GetOptimalSettings)(
+    uint32_t outputWidth, uint32_t outputHeight, RygtDlssQuality quality,
+    RygtDlssOptimalSettings* settings);
+
+typedef int(VKAPI_PTR* PFN_RygtDlss_EvaluateTemporal)(VkCommandBuffer cmd,
+                                                   const RygtDlssFrame* frame);
 
 #ifdef __cplusplus
 }

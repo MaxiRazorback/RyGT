@@ -20,6 +20,7 @@ commit `4371a500`):
 | `0011-ryGT-quality-preset-memory` | The reused-image pool size follows the launcher's quality preset (`GPU.image_recycle_mb`) |
 | `0012-ryGT-old-shader-fallback-direct-default` | The new renderer is the only renderer (`SHADGT_DIRECT=0` for comparisons); while its own shaders and pipelines are built in the background, draws use the old renderer's stored shaders, so switching causes no shader-compile freezes |
 | `0019-ghost-quad-sample-mask` | Per-quad sample coverage masks restore recorded ghost transparency; ordinary shader caches remain compatible |
+| `0020-fix-dlss-temporal-scene-reconstruction` | Temporal DLSS scene inputs, persistent history, RGB conversion and HUD composition in the serial renderer; full-rate mirror while temporal DLSS is selected |
 
 To build: check out shadGT at `29af7ca6`, apply the patches with
 `git am <RyGT>/renderer/shadGT-patches/*.patch`, then build the `ryty_gpu` target as in the main
@@ -83,6 +84,37 @@ also "21:9", "32:9", width:height or a number; `RYGT_ASPECT` overrides it) widen
 16:9 aspect (eboot 0x5e717f) and stretches the picture over the whole window instead of black
 bars. The HUD and menus are stretched with the picture; 16:9, the default, changes nothing.
 
+
+## Combined renderer enhancements
+
+Patch 0062 applies after the temporal DLSS patch 0020. For the tested source combination,
+check out shadGT `ryty-gpu` at `1d13c88d2e57bc63ce1586fe0b8f3342b6afdd19`, then apply the
+current 0020 and 0062 patches with `git apply`. Other patches in this directory are already
+included in that shadGT revision. Build the `ryty_gpu` target, the main-branch DLSS plugin,
+and the Windows launcher. The renderer/plugin DLSS interface headers must match.
+
+0062 adds smooth recorded-ghost blending and four GPU JSON settings: `ghost_body_opacity`,
+`ghost_rubber_opacity`, `ghost_rim_opacity`, and `ghost_rim_brightness` (0-100, default 25).
+They are read when the game starts. It also adds the PS4 Pro 1080p preset, output-resolution
+UI, optional fast flips, post-DLSS sharpening, experimental HDR, frame-generation gating,
+shader-allocation guards, and bounded texture-memory recovery and supported VRAM paging.
+
+Both renderers support smooth ghost blending, output-resolution UI and post-DLSS sharpening.
+The native renderer synchronizes UI proxy writes before guest texture reads, storage writes,
+copies and resolves, and captures the UI frame under its recording lock. Pro tiling specialization
+is shared between renderers; native pipeline keys distinguish base and alternate layouts.
+Native image/buffer allocation failures reclaim completed allocations and empty allocator blocks,
+then retry the identical allocation once. Live images are not discarded for recovery.
+Recognized SDR gameplay reconstructed by temporal DLSS in the default renderer uses its scene/HUD
+output; other supported frames use the separate UI proxy. Upstream temporal DLSS remains limited
+to the default renderer. Native rendering retains the legacy DLSS interface. HDR is experimental
+in both paths; the native HDR layer is connected, but live HDR gameplay is not validated.
+The Pro option selects the game's 1080p Neo preset; a higher host output size does not make
+every internal game pass render at that resolution.
+
+The launcher retains main's tabbed layout, renderer choice, ultrawide options, wheel support,
+and temporal DLSS behavior. The shader-pack preparation destination retains the upstream
+Hotfix 2 correction (`CUSA03220-direct-sets`).
 Patches 0058 and 0059 limit 0042-intel-arc to Intel GPUs. On NVIDIA its shader translation turned
 races red with magenta cars (memory-only compute barriers and 64-bit shared memory as 32-bit halves,
 with an empty shader store), and it also turned direct memory off and undid SanitizeCopyLayers for
