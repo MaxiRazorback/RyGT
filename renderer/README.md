@@ -84,6 +84,22 @@ also "21:9", "32:9", width:height or a number; `RYGT_ASPECT` overrides it) widen
 16:9 aspect (eboot 0x5e717f) and stretches the picture over the whole window instead of black
 bars. The HUD and menus are stretched with the picture; 16:9, the default, changes nothing.
 
+Patches 0058-0061 are AMD fixes, tested on an RX 7600 (Windows 11, driver 26.8.1, 16 GB RAM) at
+Dragon Trail. They apply after 0057 (shadGT `ryty-gpu` at `7080bee5`).
+- 0058 (FIX-188) turns direct memory back on by default. 0042-intel-arc turned it off for every
+  GPU; without it the native renderer copies every buffer through host upload memory, and a 16 GB
+  PC ran out at the start of a race ("NAT-100: no upload memory"). `SHADGT_DIRECT=0` still turns
+  it off (Intel Arc).
+- 0059 (FIX-189): AMD's driver refuses storage use for BC6H images even with extended usage, so
+  the native renderer made no image for GT Sport's HDR sky and reflection maps (black sky, flat
+  car paint). Such images are now made without storage use; shaders only sample them.
+- 0060 (FIX-191): without manual interpolation (AMD's path), a fragment input that a shader reads
+  both blended (`V_INTERP_P2_F32`) and per vertex (`V_INTERP_MOV_F32`) was read at vertex 0 for the
+  blended read, so terrain and kerbs were drawn as flat-coloured triangles. The blend is now
+  computed from the barycentrics. Stored translations keep the old result: clear
+  `<RyGT folder>\shaders\<serial>-direct-sets` once after updating.
+- 0061 (FIX-187): with frame generation on, minimizing the window (a 0x0 surface) no longer
+  crashes the game; generation stays off until the window is restored.
 
 ## Combined renderer enhancements
 

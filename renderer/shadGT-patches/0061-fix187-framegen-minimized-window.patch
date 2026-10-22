@@ -1,0 +1,65 @@
+From 8aa605fa50d99a7da6b731c2b2e1e8aa63cbb40d Mon Sep 17 00:00:00 2001
+From: MaxiRazorback <344630105+MaxiRazorback@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 20:49:57 -0300
+Subject: [PATCH 61/61] FIX-187: frame generation stays off while the window is
+ minimized (0x0)
+
+A minimized window has a 0x0 surface. FidelityFX accepted that size for its
+swapchain and the next frame asserted creating a 0x0 motion vector image
+(Image::Create: ErrorInitializationFailed, R16G16Sfloat 0x0). Frame generation
+now declines a 0x0 swapchain, so the normal one covers the minimized window,
+and frame preparation is skipped at 0x0. Restoring the window makes the
+swapchain out of date and the recreated one starts frame generation again.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ryty_gpu/ryty_framegen.cpp                    | 10 +++++++++-
+ src/video_core/renderer_vulkan/vk_swapchain.h |  4 ++++
+ 2 files changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/ryty_gpu/ryty_framegen.cpp b/ryty_gpu/ryty_framegen.cpp
+index f244eab5..446fa57e 100644
+--- a/ryty_gpu/ryty_framegen.cpp
++++ b/ryty_gpu/ryty_framegen.cpp
+@@ -135,6 +135,14 @@ bool FrameGen::CreateSwapchain(const Instance& instance, const vk::SwapchainCrea
+     if (!Requested()) {
+         return false;
+     }
++    // FIX-187: a minimized window has a 0x0 surface. FidelityFX accepted that size and the first
++    // frame then failed creating its 0x0 motion vector image (assert in Image::Create). The normal
++    // swapchain covers the minimized window; restoring it makes the swapchain out of date, and
++    // the recreated one starts frame generation again.
++    if (info.imageExtent.width == 0 || info.imageExtent.height == 0) {
++        LOG_INFO(Render_Vulkan, "Frame generation: window is 0x0 (minimized); off until restored");
++        return false;
++    }
+     const vk::Queue async_queue = instance.GetFrameGenQueue(0);
+     const vk::Queue present_queue = instance.GetFrameGenQueue(1);
+     const vk::Queue acquire_queue = instance.GetFrameGenQueue(2);
+@@ -282,7 +290,7 @@ vk::Result FrameGen::Present(vk::Queue queue, const vk::PresentInfoKHR& info) co
+ 
+ void FrameGen::Prepare(vk::CommandBuffer cmdbuf, vk::SwapchainKHR swapchain, vk::Extent2D size,
+                        bool hdr) {
+-    if (!framegen_context) {
++    if (!framegen_context || size.width == 0 || size.height == 0) {
+         return;
+     }
+     if (size != aux_size) {
+diff --git a/src/video_core/renderer_vulkan/vk_swapchain.h b/src/video_core/renderer_vulkan/vk_swapchain.h
+index 9e3d2008..acb78f32 100644
+--- a/src/video_core/renderer_vulkan/vk_swapchain.h
++++ b/src/video_core/renderer_vulkan/vk_swapchain.h
+@@ -104,6 +104,10 @@ public:
+     /// ryGT: frame generation's per-frame preparation, recorded before the present submit.
+     void PrepareFrameGeneration(vk::CommandBuffer cmdbuf) {
+ #ifdef RYTY_GPU
++        // FIX-187: nothing to prepare for a minimized (0x0) window.
++        if (extent.width == 0 || extent.height == 0) {
++            return;
++        }
+         framegen.Prepare(cmdbuf, swapchain, extent, needs_hdr);
+         RytyDlssG::Prepare(instance.GetDevice(), instance.GetAllocator(), cmdbuf, extent);
+ #endif
+-- 
+2.56.0.windows.2
+

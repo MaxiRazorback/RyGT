@@ -1,0 +1,61 @@
+From 103c3e5de8bf157068769a971643eb2d7862a784 Mon Sep 17 00:00:00 2001
+From: MaxiRazorback <344630105+MaxiRazorback@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 00:32:39 -0300
+Subject: [PATCH 60/61] FIX-191: blended reads of per-vertex fragment inputs
+
+Without manual interpolation (AMD's path), V_INTERP_P2_F32 read the input
+plainly. When the same shader also reads that input per vertex
+(V_INTERP_MOV_F32 P10/P20), the input is declared per vertex and the plain
+read is vertex 0, so every pixel of a triangle got its first vertex's value:
+GT Sport's terrain and kerbs were drawn as flat-coloured triangles on an
+RX 7600. P2 now spells out p0 + i*(p1-p0) + j*(p2-p0) from the barycentrics;
+while the input stays interpolated all three reads are the interpolated
+value, so other shaders are unchanged.
+
+Stored translations made before this keep the old result: clear
+<RyGT folder>\shaders\<serial>-direct-sets once.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../translate/vector_interpolation.cpp        | 25 +++++++++++++++++--
+ 1 file changed, 23 insertions(+), 2 deletions(-)
+
+diff --git a/src/shader_recompiler/frontend/translate/vector_interpolation.cpp b/src/shader_recompiler/frontend/translate/vector_interpolation.cpp
+index e7f02d1a..41cd26a8 100644
+--- a/src/shader_recompiler/frontend/translate/vector_interpolation.cpp
++++ b/src/shader_recompiler/frontend/translate/vector_interpolation.cpp
+@@ -82,8 +82,29 @@ void Translator::V_INTERP_P2_F32(const GcnInst& inst) {
+     }
+     ASSERT(!attr.is_flat);
+     if (!profile.needs_manual_interpolation) {
+-        interp = GetInterpolation(vgpr_to_interp[inst.src[0].code]);
+-        SetDst(inst.dst[0], ir.GetAttribute(attrib, inst.control.vintrp.chan));
++        const IR::Attribute bary = vgpr_to_interp[inst.src[0].code];
++        // FIX-191: an input the shader also reads per vertex (V_INTERP_MOV_F32 P10/P20) is
++        // declared per vertex, and a plain read of it is vertex 0: every pixel of a triangle got
++        // its first vertex's value (flat triangles on AMD's path; GT Sport's terrain and kerbs).
++        // The blend is spelled out instead. While the input stays interpolated, all three reads
++        // are the interpolated value and the result is that value.
++        if (interp.primary != Qualifier::PerVertex) {
++            interp = GetInterpolation(bary);
++        }
++        const u32 chan = inst.control.vintrp.chan;
++        const IR::F32 p0 = ir.GetAttribute(attrib, chan, 0);
++        const IR::F32 p1 = ir.GetAttribute(attrib, chan, 1);
++        const IR::F32 p2 = ir.GetAttribute(attrib, chan, 2);
++        IR::F32 i = ir.GetAttribute(bary, 0);
++        IR::F32 j = ir.GetAttribute(bary, 1);
++        if (bary == IR::Attribute::BaryCoordPullModel) {
++            const IR::F32 w = ir.GetAttribute(bary, 2); // I/W, J/W, 1/W
++            i = IR::F32{ir.FPDiv(i, w)};
++            j = IR::F32{ir.FPDiv(j, w)};
++        }
++        const IR::F32 result =
++            ir.FPFma(ir.FPSub(p2, p0), j, ir.FPFma(ir.FPSub(p1, p0), i, p0));
++        SetDst(inst.dst[0], result);
+         return;
+     }
+     // VDST = P20 * VSRC + VDST
+-- 
+2.56.0.windows.2
+
