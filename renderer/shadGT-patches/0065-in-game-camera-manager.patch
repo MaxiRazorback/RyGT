@@ -145,7 +145,7 @@ index 00000000..b0684a89
 +}
 diff --git a/ryty_gpu/camera_math/orbit_motion.h b/ryty_gpu/camera_math/orbit_motion.h
 new file mode 100644
-index 00000000..9b659405
+index 00000000..e6e8724c
 --- /dev/null
 +++ b/ryty_gpu/camera_math/orbit_motion.h
 @@ -0,0 +1,48 @@
@@ -164,7 +164,7 @@ index 00000000..9b659405
 +static inline void motion_step(MotionState* s,const MotionConfig* c,float dt,unsigned active){
 + if(dt<0)dt=0;if(dt>0.05f)dt=0.05f;
 + if(!active){s->vx=s->vy=0;s->returning=0;return;}
-+ float x=c->invert_x?-c->x:c->x,y=c->invert_y?c->y:-c->y;
++ float x=c->invert_x?c->x:-c->x,y=c->invert_y?c->y:-c->y;
 + unsigned moving=x!=0||y!=0;
 + if(moving){s->idle=0;s->returning=0;}else s->idle+=dt;
 + if(!moving&&c->auto_return&&s->idle>=c->delay){
@@ -627,14 +627,23 @@ index 00000000..87913dc1
 +};
 diff --git a/ryty_gpu/ryty_camera_input.h b/ryty_gpu/ryty_camera_input.h
 new file mode 100644
-index 00000000..098ee2df
+index 00000000..8e6d4fe8
 --- /dev/null
 +++ b/ryty_gpu/ryty_camera_input.h
-@@ -0,0 +1,32 @@
+@@ -0,0 +1,41 @@
 +#pragma once
 +#include <SDL3/SDL_events.h>
++#include <algorithm>
++#include <cmath>
 +
 +namespace Ryty::Camera {
++inline float NormalizeOrbitAxis(int raw) {
++    const float value = std::clamp((raw - 128) / 127.f, -1.f, 1.f);
++    const float magnitude = std::abs(value);
++    constexpr float deadzone = .12f;
++    if (magnitude <= deadzone) return 0;
++    return std::copysign((magnitude - deadzone) / (1.f - deadzone), value);
++}
 +enum class InputRoute { Normal, InterfaceOnly, ReleaseBinding, Gamepad };
 +// SDL event routing only; never suppress joystick devices, hotplug or haptic output.
 +constexpr InputRoute RouteInput(bool open, Uint32 type) {
@@ -665,10 +674,10 @@ index 00000000..098ee2df
 +} // namespace Ryty::Camera
 diff --git a/ryty_gpu/ryty_camera_overlay.cpp b/ryty_gpu/ryty_camera_overlay.cpp
 new file mode 100644
-index 00000000..da18a50d
+index 00000000..90bcab59
 --- /dev/null
 +++ b/ryty_gpu/ryty_camera_overlay.cpp
-@@ -0,0 +1,381 @@
+@@ -0,0 +1,382 @@
 +#include "ryty_gpu/ryty_camera.h"
 +#include "ryty_gpu/ryty_input_bridge.h"
 +#include <atomic>
@@ -736,7 +745,8 @@ index 00000000..da18a50d
 +    ImGui::BeginDisabled(!s.orbit);
 +    ImGui::SetNextItemWidth(-105 * scale);
 +    changed |=
-+        ImGui::SliderFloat("Sensitivity", &s.sensitivity, -15, 15, "%.2f");
++        ImGui::SliderFloat("Sensitivity", &s.sensitivity, -15, 15, "%.2f", ImGuiSliderFlags_AlwaysClamp);
++    ImGui::SetItemTooltip("0 = default speed. Negative = slower. Positive = faster. Direction uses Invert X/Y only.");
 +    ImGui::SetNextItemWidth(-105 * scale);
 +    changed |=
 +        ImGui::SliderFloat("Smoothness", &s.smoothing_ms, 0, 1000, "%.0f ms");
@@ -1052,7 +1062,7 @@ index 00000000..da18a50d
 +} // namespace Ryty::Camera
 diff --git a/ryty_gpu/ryty_camera_runtime.cpp b/ryty_gpu/ryty_camera_runtime.cpp
 new file mode 100644
-index 00000000..0cf810e9
+index 00000000..a62e7872
 --- /dev/null
 +++ b/ryty_gpu/ryty_camera_runtime.cpp
 @@ -0,0 +1,369 @@
@@ -1304,7 +1314,7 @@ index 00000000..0cf810e9
 +            data[40] = data[65] = data[100] = settings.orbit;
 +            Stick input;
 +            { std::lock_guard input_lock(input_mutex); input = stick; }
-+            p[26] = input.x; p[27] = input.y; p[28] = 120 * settings.sensitivity;
++            p[26] = input.x; p[27] = input.y; p[28] = OrbitDegreesPerSecond(settings.sensitivity);
 +            p[29] = settings.smoothing_ms; p[30] = settings.return_seconds;
 +            data[124] = settings.auto_return; data[125] = settings.invert_x; data[126] = settings.invert_y;
 +            data[127] = input.focused && now - input.updated < 200;
@@ -1427,10 +1437,10 @@ index 00000000..0cf810e9
 +} // namespace Ryty::Camera
 diff --git a/ryty_gpu/ryty_camera_settings.cpp b/ryty_gpu/ryty_camera_settings.cpp
 new file mode 100644
-index 00000000..0a1118ba
+index 00000000..4350b3d0
 --- /dev/null
 +++ b/ryty_gpu/ryty_camera_settings.cpp
-@@ -0,0 +1,178 @@
+@@ -0,0 +1,181 @@
 +#include "ryty_gpu/ryty_camera_settings.h"
 +#include <fstream>
 +#ifdef _WIN32
@@ -1450,7 +1460,7 @@ index 00000000..0a1118ba
 +            {"invert_y", v.invert_y}, {"sensitivity", v.sensitivity},
 +            {"smoothing_ms", v.smoothing_ms}, {"return_seconds", v.return_seconds}};
 +}
-+Settings ReadSettings(const nlohmann::json& j, View view) {
++Settings ReadSettings(const nlohmann::json& j, View view, bool legacy_sensitivity) {
 +    if (!j.is_object()) throw std::runtime_error("Camera settings must be an object.");
 +    Settings s;
 +    const auto number = [&](const char* key, float& v) {
@@ -1464,13 +1474,14 @@ index 00000000..0a1118ba
 +    number("return_seconds", s.return_seconds);
 +    flag("orbit", s.orbit); flag("auto_return", s.auto_return);
 +    flag("invert_x", s.invert_x); flag("invert_y", s.invert_y);
++    if (legacy_sensitivity && s.sensitivity == 1.f) s.sensitivity = 0;
 +    return Sanitize(s, view);
 +}
 +}
 +Settings Sanitize(Settings v) {
 +    v.fov = v.fov == 0 ? 0 : Bound(v.fov, 30, 100);
 +    v.height = Bound(v.height, -5, 5); v.distance = Bound(v.distance, -5, 5);
-+    v.sensitivity = Bound(v.sensitivity, -15, 15, 1);
++    v.sensitivity = Bound(v.sensitivity, -15, 15, 0);
 +    v.smoothing_ms = Bound(v.smoothing_ms, 0, 1000, 100);
 +    v.return_seconds = Bound(v.return_seconds, 0, 10, 2);
 +    return v;
@@ -1483,7 +1494,7 @@ index 00000000..0a1118ba
 +    return v;
 +}
 +nlohmann::json Encode(const Document& d) {
-+    nlohmann::json j{{"version", 1}, {"global", nlohmann::json::object()}, {"cars", nlohmann::json::object()}};
++    nlohmann::json j{{"version", 1}, {"sensitivity_scale", 2}, {"global", nlohmann::json::object()}, {"cars", nlohmann::json::object()}};
 +    const auto& a = d.appearance;
 +    j["appearance"] = {{"theme_version", 2}, {"scale", a.scale}, {"font_size", a.font_size}, {"opacity", a.opacity}, {"background", a.background}, {"accent", a.accent},
 +        {"x", a.x}, {"y", a.y}, {"width", a.width}, {"height", a.height}};
@@ -1497,6 +1508,8 @@ index 00000000..0a1118ba
 +bool Decode(const nlohmann::json& j, Document& result, std::string& error) {
 +    try {
 +        if (!j.is_object() || j.value("version", 0) != 1) throw std::runtime_error("Unsupported camera preset version.");
++        const int sensitivity_scale = j.value("sensitivity_scale", 1);
++        if (sensitivity_scale != 1 && sensitivity_scale != 2) throw std::runtime_error("Unsupported sensitivity scale.");
 +        Document next;
 +        if (j.contains("appearance")) {
 +            const auto& a = j["appearance"];
@@ -1523,7 +1536,7 @@ index 00000000..0a1118ba
 +        }
 +        if (j.contains("global")) {
 +            if (!j["global"].is_object()) throw std::runtime_error("Invalid global settings.");
-+            for (unsigned i = 0; i < Keys.size(); ++i) if (j["global"].contains(Keys[i])) next.global[i] = ReadSettings(j["global"][Keys[i]], static_cast<View>(i));
++            for (unsigned i = 0; i < Keys.size(); ++i) if (j["global"].contains(Keys[i])) next.global[i] = ReadSettings(j["global"][Keys[i]], static_cast<View>(i), sensitivity_scale == 1);
 +        }
 +        if (j.contains("cars")) {
 +            if (!j["cars"].is_object()) throw std::runtime_error("Invalid car presets.");
@@ -1532,7 +1545,7 @@ index 00000000..0a1118ba
 +                auto id = std::stoull(key);
 +                if (id == 0 || id > UINT32_MAX || key != std::to_string(id)) throw std::runtime_error("Invalid car ID.");
 +                CarPreset entry;
-+                for (unsigned i = 0; i < Keys.size(); ++i) if (car.contains(Keys[i])) { entry.views[i] = ReadSettings(car[Keys[i]], static_cast<View>(i)); entry.enabled[i] = true; }
++                for (unsigned i = 0; i < Keys.size(); ++i) if (car.contains(Keys[i])) { entry.views[i] = ReadSettings(car[Keys[i]], static_cast<View>(i), sensitivity_scale == 1); entry.enabled[i] = true; }
 +                next.cars.emplace(static_cast<std::uint32_t>(id), entry);
 +            }
 +        }
@@ -1611,10 +1624,10 @@ index 00000000..0a1118ba
 +} // namespace Ryty::Camera
 diff --git a/ryty_gpu/ryty_camera_settings.h b/ryty_gpu/ryty_camera_settings.h
 new file mode 100644
-index 00000000..9fd01ebb
+index 00000000..551575d2
 --- /dev/null
 +++ b/ryty_gpu/ryty_camera_settings.h
-@@ -0,0 +1,79 @@
+@@ -0,0 +1,83 @@
 +#pragma once
 +#include <algorithm>
 +#include <array>
@@ -1645,9 +1658,13 @@ index 00000000..9fd01ebb
 +    // Zero means the original, car-specific FOV. Never invent a default angle.
 +    float fov = 0, height = 0, distance = 0;
 +    bool orbit = false, auto_return = true, invert_x = false, invert_y = false;
-+    float sensitivity = 1, smoothing_ms = 100, return_seconds = 2;
++    float sensitivity = 0, smoothing_ms = 100, return_seconds = 2;
 +    bool operator==(const Settings&) const = default;
 +};
++inline float OrbitDegreesPerSecond(float sensitivity) {
++    const float value = std::isfinite(sensitivity) ? std::clamp(sensitivity, -15.f, 15.f) : 0.f;
++    return 120.f * (value < 0 ? 1.f + value / 20.f : 1.f + value / 15.f);
++}
 +struct CarPreset {
 +    std::array<bool, 4> enabled{};
 +    std::array<Settings, 4> views{};
@@ -1725,26 +1742,26 @@ index ce88f1a2..26b40f2d 100644
      // shadGT's main() loads the player list (user/users.json, created with defaults when
      // missing); a gamepad is only assigned to a player that exists ("User 1 not found").
 diff --git a/ryty_gpu/ryty_input_bridge.cpp b/ryty_gpu/ryty_input_bridge.cpp
-index 523ecbbf..08c84f62 100644
+index 523ecbbf..3428aefc 100644
 --- a/ryty_gpu/ryty_input_bridge.cpp
 +++ b/ryty_gpu/ryty_input_bridge.cpp
-@@ -29,6 +29,7 @@
+@@ -29,6 +29,8 @@
  #include "input/input_handler.h"
  #include "video_core/renderdoc.h"
  #include "ryty_gpu/ryty_input_bridge.h"
 +#include "ryty_gpu/ryty_camera.h"
++#include "ryty_gpu/ryty_camera_input.h"
  
  namespace {
  
-@@ -348,6 +349,12 @@ void ForwardInput() {
+@@ -348,6 +350,11 @@ void ForwardInput() {
              }
              controller.SetTriggerFeedback(left, right, left_rumble, right_rumble);
              const auto state = controller.ReadState();
 +            if (slot == 0) {
-+                const auto axis = [](int v) { float x = (v - 128) / 127.f; return std::abs(x) < .12f ? 0.f : std::clamp(x, -1.f, 1.f); };
 +                DWORD foreground_pid{};
 +                GetWindowThreadProcessId(GetForegroundWindow(), &foreground_pid);
-+                Ryty::Camera::PublishStick(axis(ClampAxis(state.axes[2])), axis(ClampAxis(state.axes[3])), foreground_pid == GetCurrentProcessId());
++                Ryty::Camera::PublishStick(Ryty::Camera::NormalizeOrbitAxis(ClampAxis(state.axes[2])), Ryty::Camera::NormalizeOrbitAxis(ClampAxis(state.axes[3])), foreground_pid == GetCurrentProcessId());
 +            }
              RytyPadInputState input{};
              input.buttons = static_cast<std::uint32_t>(state.buttonsState);

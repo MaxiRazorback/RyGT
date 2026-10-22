@@ -11,6 +11,21 @@ int main(int argc, char** argv) {
     std::filesystem::remove(path); std::filesystem::remove(path.string() + ".tmp");
     int errors = 0; auto check = [&](bool ok, const char* name) { std::printf("%s %s\n", ok ? "PASS" : "FAIL", name); errors += !ok; };
     Store store(path); std::string error;
+    check(Settings{}.sensitivity==0 && Sanitize(Settings{}).sensitivity==0,"new and sanitized defaults center sensitivity at zero");
+    Store defaults_store(path.string()+".defaults");
+    Settings defaults_test;defaults_test.sensitivity=-15;defaults_store.SetGlobal(View::Chase,defaults_test);defaults_store.RestoreDefaults(0,View::Chase);
+    check(defaults_store.ReadGlobal(View::Chase).sensitivity==0,"Restore Defaults returns Chase sensitivity to zero");
+    for(float value:{-15.f,0.f,1.f,15.f}) {
+        defaults_test.sensitivity=value;defaults_store.SetGlobal(View::Chase,defaults_test);defaults_store.SetCar(234,View::Chase,defaults_test);
+        Document decoded;std::string message;
+        check(Decode(Encode(defaults_store.Read()),decoded,message) && decoded.global[1].sensitivity==value && decoded.cars.at(234).views[1].sensitivity==value,
+              "negative/zero/positive sensitivity survives global and per-car persistence");
+    }
+    auto old_sensitivity=Encode(defaults_store.Read());old_sensitivity.erase("sensitivity_scale");
+    old_sensitivity["global"]["Chase"]["sensitivity"]=1;old_sensitivity["cars"]["234"]["Chase"]["sensitivity"]=1;
+    Document migrated;std::string migration_error;
+    check(Decode(old_sensitivity,migrated,migration_error) && migrated.global[1].sensitivity==0 && migrated.cars.at(234).views[1].sensitivity==0,
+          "old saved default one migrates to centered default zero for global and custom presets");
     check(store.Load(error) && !store.Dirty() && store.Effective(2148, View::Cockpit).fov == 0, "missing file retains car-specific native FOV");
     Settings global; global.fov = 80; global.height = 0.2f;
     store.SetGlobal(View::Roof, global);

@@ -33,7 +33,8 @@ Existing saved Roof presets remain compatible.
 ## Chase-camera orbit
 
 - Right-stick orbit around the vehicle with 360-degree horizontal rotation.
-- Sensitivity from **-15 to +15**, with **1** retaining the initial response.
+- Sensitivity from **-15 to +15**: **0** is the default, negative values slow
+  rotation and positive values speed it up. Sensitivity does not invert either axis.
 - Motion smoothing from **0 to 1000 ms**.
 - Separate **Invert X** and **Invert Y** options.
 - Optional smooth auto-centering after a configurable **0 to 10 second** delay.

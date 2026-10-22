@@ -40,8 +40,12 @@ int main(int argc,char** argv){
     const bool dock_regression = argc > 1 && std::strcmp(argv[1], "--dock-regression") == 0;
     bool chase_preview=false;
     bool resize_regression=false;
+    bool sensitivity_regression=false;
+    float sensitivity_target=.25f;
+    for(int a=1;a<argc;++a)std::sscanf(argv[a],"--sensitivity-target=%f",&sensitivity_target);
     for(int a=1;a<argc;++a) if(std::strcmp(argv[a],"--chase")==0)chase_preview=true;
     for(int a=1;a<argc;++a) if(std::strcmp(argv[a],"--resize-regression")==0)resize_regression=true;
+    for(int a=1;a<argc;++a) if(std::strcmp(argv[a],"--sensitivity-regression")==0)sensitivity_regression=true;
     if (dock_regression) {
         io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
         ImGui::LoadIniSettingsFromMemory("[Window][RytyCameraSettings]\nPos=0,0\nSize=1280,800\nCollapsed=0\nDockId=0x08BD597D\n\n[Docking][Data]\nDockSpace ID=0x08BD597D Window=0x1BBC0F80 Pos=0,0 Size=1280,800 CentralNode=1\n");
@@ -72,6 +76,13 @@ int main(int argc,char** argv){
         if(!chase_preview && frame==4)io.AddKeyEvent(ImGuiKey_GamepadDpadDown,true);
         if(!chase_preview && frame==7)io.AddKeyEvent(ImGuiKey_GamepadDpadDown,false);
         if(resize_regression&&frame==10)io.DisplaySize={1920,1080};
+        if(sensitivity_regression) {
+            if(frame==18) {io.AddKeyEvent(ImGuiMod_Ctrl,true);io.AddMousePosEvent(597,157);io.AddMouseButtonEvent(0,true);}
+            if(frame==19) {io.AddMouseButtonEvent(0,false);io.AddKeyEvent(ImGuiMod_Ctrl,false);}
+            if(frame==20)io.AddInputCharactersUTF8(std::to_string(sensitivity_target).c_str());
+            if(frame==21)io.AddKeyEvent(ImGuiKey_Enter,true);
+            if(frame==22)io.AddKeyEvent(ImGuiKey_Enter,false);
+        }
         if(chase_preview){
             if(frame==2){const auto* w=ImGui::FindWindowByName("Camera Settings###RytyCameraSettings");io.AddMousePosEvent(w->Pos.x+100*width/1280.f,w->Pos.y+94*height/800.f);io.AddMouseButtonEvent(0,true);}
             if(frame==3)io.AddMouseButtonEvent(0,false);
@@ -112,6 +123,8 @@ int main(int argc,char** argv){
         if(frame==22)save("overlay-global.bmp");
         if(ImGui::GetDrawData()->TotalVtxCount==0)++errors;
     }
+    std::printf("GLOBAL_CHASE_SENSITIVITY %.6f\n", Ryty::Camera::Presets().ReadGlobal(Ryty::Camera::View::Chase).sensitivity);
+    if(sensitivity_regression && std::abs(Ryty::Camera::Presets().ReadGlobal(Ryty::Camera::View::Chase).sensitivity-sensitivity_target)>.00001f)++errors;
     Ryty::Camera::CloseOverlay();ImGui_ImplDX11_NewFrame();ImGui::NewFrame();Ryty::Camera::DrawOverlay();ImGui::Render();
     if(ImGui::Core::captures || !(io.ConfigFlags & ImGuiConfigFlags_NavEnableGamepad))++errors;
     if(!chase_preview && clicks.empty() && Ryty::Camera::selection_requests)++errors;
