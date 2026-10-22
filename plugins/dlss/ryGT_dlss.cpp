@@ -3,19 +3,19 @@
 // ryGT's optional DLSS plugin (dlss\ryGT_dlss.dll). It scales the finished game picture with
 // NVIDIA DLSS through NVIDIA's NGX SDK, which is linked here and not in the GPL renderer.
 //
-// The renderer only has the finished picture, without motion vectors or depth, so DLSS runs with
-// zero motion vectors, a flat depth image, no jitter and its history reset every frame: a
-// single-frame upscale, not temporal DLSS.
 
 #include <windows.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
 #include <string>
 #include <vector>
 
+#include "ModeCache.hpp"
+#include "TemporalHistory.hpp"
 #include "rygt_dlss_api.h" // Vulkan first: the NGX headers use its types
 
 #include "nvsdk_ngx_helpers.h"
@@ -46,6 +46,11 @@ bool g_initialized = false;
 NVSDK_NGX_Parameter* g_params = nullptr;
 NVSDK_NGX_Handle* g_feature = nullptr;
 uint32_t g_feature_in_w = 0, g_feature_in_h = 0, g_feature_out_w = 0, g_feature_out_h = 0;
+RygtDlss::ModeCache<NVSDK_NGX_PerfQuality_Value> modeCache;
+RygtDlss::TemporalHistory temporalHistory;
+bool g_feature_temporal = false;
+RygtDlssQuality g_temporal_quality = RYGT_DLSS_QUALITY_DLAA;
+uint32_t g_temporal_flags = 0;
 
 // Device functions the plugin itself uses.
 PFN_vkGetPhysicalDeviceMemoryProperties p_vkGetPhysicalDeviceMemoryProperties = nullptr;
@@ -210,7 +215,7 @@ void ClearAux(VkCommandBuffer cmd, AuxImage& aux) {
 }
 
 // The quality mode whose input size range holds the given input size for this output size.
-bool PickMode(uint32_t in_w, uint32_t in_h, uint32_t out_w, uint32_t out_h,
+bool QueryMode(uint32_t in_w, uint32_t in_h, uint32_t out_w, uint32_t out_h,
               NVSDK_NGX_PerfQuality_Value* mode) {
     if (in_w > out_w || in_h > out_h) {
         return false;
@@ -241,11 +246,91 @@ bool PickMode(uint32_t in_w, uint32_t in_h, uint32_t out_w, uint32_t out_h,
     return false;
 }
 
+bool PickMode(uint32_t in_w, uint32_t in_h, uint32_t out_w, uint32_t out_h,
+              NVSDK_NGX_PerfQuality_Value* mode) {
+    const auto selected = modeCache.Get({in_w, in_h, out_w, out_h}, [&]() {
+        NVSDK_NGX_PerfQuality_Value candidate{};
+        if (!QueryMode(in_w, in_h, out_w, out_h, &candidate)) {
+            return std::optional<NVSDK_NGX_PerfQuality_Value>{};
+        }
+        return std::optional<NVSDK_NGX_PerfQuality_Value>{candidate};
+    });
+    if (!selected) {
+        return false;
+    }
+    *mode = *selected;
+    return true;
+}
+
 void ReleaseFeature() {
     if (g_feature) {
         if (p_vkDeviceWaitIdle) p_vkDeviceWaitIdle(g_device);
         NVSDK_NGX_VULKAN_ReleaseFeature(g_feature);
         g_feature = nullptr;
+    }
+    temporalHistory.Invalidate();
+    g_feature_temporal = false;
+}
+
+bool TemporalQuality(RygtDlssQuality quality, NVSDK_NGX_PerfQuality_Value& mode) {
+    switch (quality) {
+    case RYGT_DLSS_QUALITY_DLAA: mode = NVSDK_NGX_PerfQuality_Value_DLAA; return true;
+    case RYGT_DLSS_QUALITY_QUALITY: mode = NVSDK_NGX_PerfQuality_Value_MaxQuality; return true;
+    case RYGT_DLSS_QUALITY_BALANCED: mode = NVSDK_NGX_PerfQuality_Value_Balanced; return true;
+    case RYGT_DLSS_QUALITY_PERFORMANCE: mode = NVSDK_NGX_PerfQuality_Value_MaxPerf; return true;
+    case RYGT_DLSS_QUALITY_ULTRA_PERFORMANCE: mode = NVSDK_NGX_PerfQuality_Value_UltraPerformance; return true;
+    default: SetError("invalid temporal DLSS quality mode"); return false;
+    }
+}
+
+bool ValidImage(const RygtDlssImage& image) {
+    return image.image && image.view && image.width && image.height;
+}
+
+bool ValidTemporalFrame(const RygtDlssFrame* frame) {
+    constexpr uint32_t known_flags = RYGT_DLSS_FRAME_HDR | RYGT_DLSS_FRAME_DEPTH_INVERTED |
+        RYGT_DLSS_FRAME_MOTION_JITTERED | RYGT_DLSS_FRAME_MOTION_OUTPUT_RESOLUTION |
+        RYGT_DLSS_FRAME_RESET | RYGT_DLSS_FRAME_AUTO_EXPOSURE;
+    if (!frame || frame->struct_size != sizeof(RygtDlssFrame) ||
+        frame->version != RYGT_DLSS_TEMPORAL_API_VERSION) {
+        SetError("temporal DLSS frame has an incompatible ABI");
+        return false;
+    }
+    if ((frame->flags & ~known_flags) || !ValidImage(frame->color) || !ValidImage(frame->depth) ||
+        !ValidImage(frame->motion) || !ValidImage(frame->output) ||
+        frame->output.image == frame->color.image || frame->output.image == frame->depth.image ||
+        frame->output.image == frame->motion.image ||
+        frame->output.format != VK_FORMAT_R16G16B16A16_SFLOAT) {
+        SetError("temporal DLSS requires distinct valid scene inputs and an RGBA16F output");
+        return false;
+    }
+    const auto& input = frame->color;
+    const auto& motion_size = (frame->flags & RYGT_DLSS_FRAME_MOTION_OUTPUT_RESOLUTION)
+        ? frame->output : input;
+    if (frame->depth.width != input.width || frame->depth.height != input.height ||
+        frame->motion.width != motion_size.width || frame->motion.height != motion_size.height ||
+        input.width > frame->output.width || input.height > frame->output.height ||
+        (frame->motion.format != VK_FORMAT_R16G16_SFLOAT &&
+         frame->motion.format != VK_FORMAT_R32G32_SFLOAT)) {
+        SetError("temporal DLSS scene dimensions or motion format are inconsistent");
+        return false;
+    }
+    if (!std::isfinite(frame->jitter_x) || !std::isfinite(frame->jitter_y) ||
+        !std::isfinite(frame->motion_scale_x) || !std::isfinite(frame->motion_scale_y) ||
+        frame->motion_scale_x == 0.0f || frame->motion_scale_y == 0.0f ||
+        !std::isfinite(frame->pre_exposure) || frame->pre_exposure <= 0.0f ||
+        !std::isfinite(frame->exposure_scale) || frame->exposure_scale <= 0.0f ||
+        !std::isfinite(frame->frame_time_ms) || frame->frame_time_ms <= 0.0f) {
+        SetError("temporal DLSS jitter, motion scale, exposure or frame time is invalid");
+        return false;
+    }
+    switch (frame->depth.format) {
+    case VK_FORMAT_D16_UNORM:
+    case VK_FORMAT_D32_SFLOAT:
+    case VK_FORMAT_D24_UNORM_S8_UINT:
+    case VK_FORMAT_D32_SFLOAT_S8_UINT:
+    case VK_FORMAT_R32_SFLOAT: return true;
+    default: SetError("unsupported temporal DLSS depth format"); return false;
     }
 }
 
@@ -304,6 +389,8 @@ __declspec(dllexport) int VKAPI_CALL RygtDlss_Init(VkInstance instance,
                                                    VkDevice device, PFN_vkGetInstanceProcAddr gipa,
                                                    PFN_vkGetDeviceProcAddr gdpa,
                                                    const wchar_t* data_path) {
+    modeCache.Reset();
+    temporalHistory.Invalidate();
     SetupCommonInfo();
     g_instance = instance;
     g_physical_device = physical_device;
@@ -376,7 +463,7 @@ __declspec(dllexport) int VKAPI_CALL RygtDlss_Evaluate(VkCommandBuffer cmd,
         SetError("DLSS is not initialized");
         return 1;
     }
-    if (!g_feature || g_feature_in_w != input->width || g_feature_in_h != input->height ||
+    if (!g_feature || g_feature_temporal || g_feature_in_w != input->width || g_feature_in_h != input->height ||
         g_feature_out_w != output->width || g_feature_out_h != output->height) {
         ReleaseFeature();
         NVSDK_NGX_PerfQuality_Value mode{};
@@ -443,7 +530,134 @@ __declspec(dllexport) int VKAPI_CALL RygtDlss_Evaluate(VkCommandBuffer cmd,
     return 0;
 }
 
+__declspec(dllexport) int VKAPI_CALL RygtDlss_TemporalApiVersion(void) {
+    return RYGT_DLSS_TEMPORAL_API_VERSION;
+}
+
+__declspec(dllexport) int VKAPI_CALL RygtDlss_GetOptimalSettings(
+    uint32_t outputWidth, uint32_t outputHeight, RygtDlssQuality quality, RygtDlssOptimalSettings* settings) {
+    NVSDK_NGX_PerfQuality_Value mode{};
+    if (!g_initialized || !g_params || !outputWidth || !outputHeight || !settings ||
+        settings->struct_size != sizeof(RygtDlssOptimalSettings)) {
+        SetError("invalid or uninitialized temporal DLSS settings query");
+        return 1;
+    }
+    if (!TemporalQuality(quality, mode)) return 1;
+    RygtDlssOptimalSettings result{};
+    result.struct_size = sizeof(result);
+    float unused_sharpness{};
+    const auto status = NGX_DLSS_GET_OPTIMAL_SETTINGS(g_params, outputWidth, outputHeight, mode,
+        &result.optimal_width, &result.optimal_height, &result.maximum_width, &result.maximum_height,
+        &result.minimum_width, &result.minimum_height, &unused_sharpness);
+    if (NVSDK_NGX_FAILED(status) || !result.optimal_width || !result.optimal_height) {
+        SetError("temporal DLSS optimal-settings query failed: " + ResultText(status));
+        return 1;
+    }
+    *settings = result;
+    SetError("");
+    return 0;
+}
+
+__declspec(dllexport) int VKAPI_CALL RygtDlss_EvaluateTemporal(VkCommandBuffer cmd,
+                                                              const RygtDlssFrame* frame) {
+    if (!g_initialized || !g_params || !cmd) {
+        SetError("temporal DLSS is not initialized or command buffer is null");
+        return 1;
+    }
+    if (!ValidTemporalFrame(frame)) return 1;
+    NVSDK_NGX_PerfQuality_Value mode{};
+    if (!TemporalQuality(frame->quality, mode)) return 1;
+    const uint32_t stable_flags = frame->flags & ~RYGT_DLSS_FRAME_RESET;
+    const auto& input = frame->color;
+    const auto& output = frame->output;
+    if (!g_feature || !g_feature_temporal || g_feature_in_w != input.width ||
+        g_feature_in_h != input.height || g_feature_out_w != output.width ||
+        g_feature_out_h != output.height || g_temporal_quality != frame->quality ||
+        g_temporal_flags != stable_flags) {
+        RygtDlssOptimalSettings settings{sizeof(RygtDlssOptimalSettings)};
+        if (RygtDlss_GetOptimalSettings(output.width, output.height, frame->quality, &settings)) return 1;
+        if (input.width < settings.minimum_width || input.width > settings.maximum_width ||
+            input.height < settings.minimum_height || input.height > settings.maximum_height) {
+            SetError("render dimensions are outside the selected temporal DLSS mode's range");
+            return 1;
+        }
+        ReleaseFeature();
+        for (const char* key : {NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA,
+                               NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Quality,
+                               NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Balanced,
+                               NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Performance,
+                               NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraPerformance}) {
+            NVSDK_NGX_Parameter_SetUI(g_params, key, NVSDK_NGX_DLSS_Hint_Render_Preset_M);
+        }
+        NVSDK_NGX_DLSS_Create_Params create{};
+        create.Feature.InWidth = input.width;
+        create.Feature.InHeight = input.height;
+        create.Feature.InTargetWidth = output.width;
+        create.Feature.InTargetHeight = output.height;
+        create.Feature.InPerfQualityValue = mode;
+        create.InFeatureCreateFlags = 0;
+        if (!(frame->flags & RYGT_DLSS_FRAME_MOTION_OUTPUT_RESOLUTION))
+            create.InFeatureCreateFlags |= NVSDK_NGX_DLSS_Feature_Flags_MVLowRes;
+        if (frame->flags & RYGT_DLSS_FRAME_HDR)
+            create.InFeatureCreateFlags |= NVSDK_NGX_DLSS_Feature_Flags_IsHDR;
+        if (frame->flags & RYGT_DLSS_FRAME_DEPTH_INVERTED)
+            create.InFeatureCreateFlags |= NVSDK_NGX_DLSS_Feature_Flags_DepthInverted;
+        if (frame->flags & RYGT_DLSS_FRAME_MOTION_JITTERED)
+            create.InFeatureCreateFlags |= NVSDK_NGX_DLSS_Feature_Flags_MVJittered;
+        if (frame->flags & RYGT_DLSS_FRAME_AUTO_EXPOSURE)
+            create.InFeatureCreateFlags |= NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;
+        const auto status = NGX_VULKAN_CREATE_DLSS_EXT1(g_device, cmd, 1, 1, &g_feature, g_params, &create);
+        if (NVSDK_NGX_FAILED(status) || !g_feature) {
+            g_feature = nullptr;
+            SetError("DLSS 4.5 temporal feature creation failed: " + ResultText(status));
+            return 1;
+        }
+        g_feature_in_w = input.width; g_feature_in_h = input.height;
+        g_feature_out_w = output.width; g_feature_out_h = output.height;
+        g_feature_temporal = true;
+        g_temporal_quality = frame->quality;
+        g_temporal_flags = stable_flags;
+    }
+    const VkImageSubresourceRange color_range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    const VkImageSubresourceRange depth_range{
+        static_cast<VkImageAspectFlags>(frame->depth.format == VK_FORMAT_R32_SFLOAT
+            ? VK_IMAGE_ASPECT_COLOR_BIT : VK_IMAGE_ASPECT_DEPTH_BIT),
+        0, 1, 0, 1};
+    const auto wrap = [](const RygtDlssImage& image, VkImageSubresourceRange range, bool writable) {
+        return NVSDK_NGX_Create_ImageView_Resource_VK(image.view, image.image, range,
+            image.format, image.width, image.height, writable);
+    };
+    auto color = wrap(input, color_range, false);
+    auto depth = wrap(frame->depth, depth_range, false);
+    auto motion = wrap(frame->motion, color_range, false);
+    auto out = wrap(output, color_range, true);
+    NVSDK_NGX_VK_DLSS_Eval_Params eval{};
+    eval.Feature.pInColor = &color;
+    eval.Feature.pInOutput = &out;
+    eval.pInDepth = &depth;
+    eval.pInMotionVectors = &motion;
+    eval.InJitterOffsetX = frame->jitter_x;
+    eval.InJitterOffsetY = frame->jitter_y;
+    eval.InRenderSubrectDimensions = {input.width, input.height};
+    eval.InReset = temporalHistory.NeedsReset(frame->frame_id, frame->flags & RYGT_DLSS_FRAME_RESET);
+    eval.InMVScaleX = frame->motion_scale_x;
+    eval.InMVScaleY = frame->motion_scale_y;
+    eval.InPreExposure = frame->pre_exposure;
+    eval.InExposureScale = frame->exposure_scale;
+    eval.InFrameTimeDeltaInMsec = frame->frame_time_ms;
+    const auto status = NGX_VULKAN_EVALUATE_DLSS_EXT(cmd, g_feature, g_params, &eval);
+    if (NVSDK_NGX_FAILED(status)) {
+        temporalHistory.Invalidate();
+        SetError("DLSS 4.5 temporal evaluation failed: " + ResultText(status));
+        return 1;
+    }
+    temporalHistory.Commit(frame->frame_id);
+    SetError("");
+    return 0;
+}
+
 __declspec(dllexport) void VKAPI_CALL RygtDlss_Shutdown(void) {
+    modeCache.Reset();
     ReleaseFeature();
     if (g_device) {
         DestroyAux(g_motion);

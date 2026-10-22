@@ -938,7 +938,7 @@ namespace RyGT
         readonly string root = AppDomain.CurrentDomain.BaseDirectory.TrimEnd('\\');
         readonly Settings settings;
         readonly TextBox game, update, modules, fonts, log;
-        readonly Button setup, play;
+        readonly Button setup, play, addDlss;
         readonly Label status;
         readonly Panel[] pages = new Panel[3];
         readonly Button[] tabs = new Button[3];
@@ -1141,6 +1141,13 @@ namespace RyGT
             // button below (NVIDIA's DLSS SDK and Streamline SDK, or another game's copies).
             string dlssDir = Path.Combine(root, "dlss");
             var dlss = AddOption(graphics, "", "GPU", "dlss_enabled", false);
+            // DLSS's input is the game's own picture, at most 1920 x 1080 (#61).
+            graphics.Controls.Add(new Label
+            {
+                Text = "Internal resolution: up to 1920 x 1080.\nAt 4K output, DLSS corresponds to Performance mode.",
+                AutoSize = true, MaximumSize = new Size(330, 0), BackColor = Color.Transparent, ForeColor = Dark.DimText,
+                Tag = "heading", Margin = new Padding(22, 2, 0, 6)
+            });
             var dlssg = AddOption(graphics, "", "GPU", "dlssg_enabled", false);
             dlssg.Margin = new Padding(22, 2, 0, 2);
             Action refreshDlss = delegate
@@ -1157,9 +1164,18 @@ namespace RyGT
                 dlssg.Enabled = dlssgInstalled;
             };
             refreshDlss();
-            var dlssFiles = new Button { Text = "Add DLSS files...", AutoSize = true, Margin = new Padding(22, 2, 0, 4) };
-            dlssFiles.Click += delegate
+            addDlss = new Button { Text = "Add DLSS files...", AutoSize = true, Margin = new Padding(22, 2, 0, 4) };
+            addDlss.Click += delegate
             {
+                // The game keeps the DLSS files open while it runs (#61).
+                var games = Process.GetProcessesByName("GTSport");
+                bool gameRunning = games.Length != 0;
+                foreach (var process in games) process.Dispose();
+                if (gameRunning)
+                {
+                    MessageBox.Show(this, "Close GT Sport before adding or replacing the DLSS files.");
+                    return;
+                }
                 using (var dialog = new FolderBrowserDialog
                 {
                     Description = "Pick the folder with your NVIDIA DLSS files: nvngx_dlss.dll for upscaling; " +
@@ -1179,7 +1195,10 @@ namespace RyGT
                             // Found anywhere under the picked folder (the SDKs keep them in bin\x64).
                             var found = Directory.GetFiles(dialog.SelectedPath, name, SearchOption.AllDirectories);
                             if (found.Length == 0) continue;
-                            File.Copy(found[0], Path.Combine(dlssDir, name), true);
+                            // The upscaler is checked to be NVIDIA's 64-bit DLSS library, and the one
+                            // it replaces is kept as a .bak (#61).
+                            if (name == "nvngx_dlss.dll") InstallDlssLibrary(found[0], dlssDir);
+                            else File.Copy(found[0], Path.Combine(dlssDir, name), true);
                             ++copied;
                         }
                     }
@@ -1193,7 +1212,23 @@ namespace RyGT
                         : "Copied " + copied + " DLSS file(s) into the dlss folder.");
                 }
             };
-            graphics.Controls.Add(dlssFiles);
+            graphics.Controls.Add(addDlss);
+            AddDlssSharpening(graphics, dlss);
+            // DLSS and FSR both upscale, so one at a time; DLSS runs in Performance mode (#61).
+            fsr.CheckedChanged += delegate { if (fsr.Checked && dlss.Checked) dlss.Checked = false; };
+            Action updateDlss = delegate
+            {
+                if (!dlss.Checked) return;
+                if (fsr.Checked) fsr.Checked = false;
+                try
+                {
+                    if (ReadStringSetting("GPU", "dlss_quality", "performance") != "performance")
+                        WriteSetting("GPU", "dlss_quality", "performance");
+                }
+                catch (Exception e) { MessageBox.Show(this, "Could not save the DLSS setting: " + e.Message); }
+            };
+            dlss.CheckedChanged += delegate { updateDlss(); };
+            updateDlss();
             framegen.CheckedChanged += delegate { if (framegen.Checked && dlssg.Checked) dlssg.Checked = false; };
             dlssg.CheckedChanged += delegate { if (dlssg.Checked && framegen.Checked) framegen.Checked = false; };
             // GTS-007: in the rain the game renders the scene a second time for the wet track's
@@ -1203,10 +1238,25 @@ namespace RyGT
             // GTS-008: the rear-view mirror is redrawn every second frame (its picture is kept).
             var mirror = AddOption(graphics, "Rear-view mirror at half rate (a little faster)", "GPU",
                                    "mirror_half_rate", false);
+            // The half-rate mirror is off while temporal DLSS is on, to keep its motion data (#61).
+            Action updateMirror = delegate
+            {
+                mirror.Enabled = !dlss.Checked;
+                mirror.Text = dlss.Checked ? "Half-rate rear-view mirror (disabled by DLSS)"
+                                          : "Rear-view mirror at half rate (a little faster)";
+            };
+            dlss.CheckedChanged += delegate { updateMirror(); };
+            updateMirror();
 
             // The direct renderer (shaders read game memory in place; Tokyo rain 42.7 fps vs 32.1)
             // is the only renderer since 2026-10-16; the old renderer's stored shaders stand in
             // while its own are built (D10), so it has no option any more.
+
+            var extras = Section(right, "Enhancements");
+            AddOption(extras, "PS4 Pro mode", "GPU", "ps4_pro", false);
+            AddOption(extras, "Draw the UI at screen resolution", "GPU", "ui_hires", false);
+            AddOption(extras, "Fast flips (no 30 fps snapping)", "GPU", "fast_flips", false);
+            AddOption(extras, "HDR (experimental; needs Windows HDR on)", "GPU", "hdr_allowed", false);
 
             // Shaders: the stored ones are built while the splash screen shows; a new one pauses
             // the game until it is compiled (instead of a stutter and missing objects).
@@ -1819,6 +1869,56 @@ namespace RyGT
             panel.Controls.Add(row);
         }
 
+        void AddDlssSharpening(TableLayoutPanel panel, CheckBox dlss)
+        {
+            var row = new TableLayoutPanel
+            {
+                ColumnCount = 3, AutoSize = true, Dock = DockStyle.Fill,
+                Margin = new Padding(22, 2, 0, 4), MinimumSize = new Size(0, 30)
+            };
+            row.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            row.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            row.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 65));
+            var label = new Label
+            {
+                Text = "DLSS sharpening", AutoSize = true, Anchor = AnchorStyles.Left,
+                Margin = new Padding(0, 0, 4, 0)
+            };
+            var slider = new TrackBar
+            {
+                Name = "dlssSharpeningSlider", Minimum = 0, Maximum = 100,
+                BackColor = Dark.Field,
+                Value = Math.Max(0, Math.Min(100, ReadIntSetting("GPU", "dlss_sharpening", 0))),
+                SmallChange = 1, LargeChange = 10, TickStyle = TickStyle.None,
+                AutoSize = false, Height = 28, Dock = DockStyle.Fill,
+                Margin = new Padding(0), MinimumSize = new Size(80, 28),
+                AccessibleName = "DLSS sharpening"
+            };
+            var value = new Label
+            {
+                Name = "dlssSharpeningValue", AutoSize = true, Anchor = AnchorStyles.Left,
+                Margin = new Padding(4, 0, 0, 0)
+            };
+            Action refresh = delegate
+            {
+                value.Text = slider.Value == 0 ? "0% (off)" : slider.Value + "%";
+                row.Enabled = dlss.Checked && dlss.Enabled;
+            };
+            slider.ValueChanged += delegate
+            {
+                refresh();
+                try { WriteSetting("GPU", "dlss_sharpening", slider.Value); }
+                catch (Exception e) { MessageBox.Show(this, "Could not save the setting: " + e.Message); }
+            };
+            dlss.CheckedChanged += delegate { refresh(); };
+            dlss.EnabledChanged += delegate { refresh(); };
+            refresh();
+            row.Controls.Add(label, 0, 0);
+            row.Controls.Add(slider, 1, 0);
+            row.Controls.Add(value, 2, 0);
+            panel.Controls.Add(row);
+        }
+
         CheckBox AddOption(TableLayoutPanel panel, string text, string sectionName, string key, bool fallback)
         {
             var box = new DarkCheckBox { Text = text, AutoSize = true, Checked = ReadSetting(sectionName, key, fallback), Margin = new Padding(0, 2, 0, 2) };
@@ -1838,11 +1938,53 @@ namespace RyGT
             return parsed as Dictionary<string, object> ?? new Dictionary<string, object>();
         }
 
+        internal static void InstallDlssLibrary(string source, string directory)
+        {
+            if (!string.Equals(Path.GetFileName(source), "nvngx_dlss.dll", StringComparison.OrdinalIgnoreCase))
+                throw new InvalidDataException("Select the NVIDIA Super Resolution file named nvngx_dlss.dll.");
+            using (var reader = new BinaryReader(File.OpenRead(source)))
+            {
+                if (reader.BaseStream.Length < 64 || reader.ReadUInt16() != 0x5a4d)
+                    throw new InvalidDataException("The selected file is not a Windows DLL.");
+                reader.BaseStream.Position = 0x3c;
+                int pe = reader.ReadInt32();
+                if (pe < 64 || pe > reader.BaseStream.Length - 26)
+                    throw new InvalidDataException("The selected DLL has an invalid PE header.");
+                reader.BaseStream.Position = pe;
+                if (reader.ReadUInt32() != 0x4550 || reader.ReadUInt16() != 0x8664)
+                    throw new InvalidDataException("DLSS requires a 64-bit Windows DLL.");
+                reader.BaseStream.Position = pe + 22;
+                if ((reader.ReadUInt16() & 0x2000) == 0 || reader.ReadUInt16() != 0x20b)
+                    throw new InvalidDataException("DLSS requires a 64-bit Windows DLL.");
+            }
+            var version = FileVersionInfo.GetVersionInfo(source);
+            if ((version.CompanyName ?? "").IndexOf("NVIDIA", StringComparison.OrdinalIgnoreCase) < 0 ||
+                (version.FileDescription ?? "").IndexOf("DLSS", StringComparison.OrdinalIgnoreCase) < 0)
+                throw new InvalidDataException("The selected file is not an NVIDIA DLSS library.");
+            string destination = Path.Combine(directory, "nvngx_dlss.dll");
+            if (string.Equals(Path.GetFullPath(source), Path.GetFullPath(destination), StringComparison.OrdinalIgnoreCase)) return;
+            Directory.CreateDirectory(directory);
+            string temporary = destination + ".install-" + Guid.NewGuid().ToString("N");
+            try
+            {
+                File.Copy(source, temporary);
+                if (File.Exists(destination))
+                    File.Replace(temporary, destination, destination + "." + DateTime.UtcNow.ToString("yyyyMMdd-HHmmss-fffffff") + ".bak");
+                else
+                    File.Move(temporary, destination);
+            }
+            finally
+            {
+                if (File.Exists(temporary)) File.Delete(temporary);
+            }
+        }
+
         void RefreshState()
         {
             bool ready = File.Exists(Exe) && Directory.Exists(Path.Combine(root, "app0", "sce_module"));
             play.Enabled = ready && !busy;
             setup.Enabled = !busy;
+            addDlss.Enabled = !busy;
             if (!busy) status.Text = ready ? "Ready. Press Play." : "Not set up yet. Pick the folders and press Set up.";
         }
 
