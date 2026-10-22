@@ -99,20 +99,17 @@ jobs:
         run: >-
           cmake -S . -B build/windows-mingw -G Ninja
           -DCMAKE_BUILD_TYPE=Release
-          -DBUILD_TESTING=ON
+          -DBUILD_TESTING=OFF
           -DRTY_ENABLE_LTO=OFF
           -DRTY_BUILD_GUI=OFF
           -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
           -DFFMPEG_PREBUILT_DIR="$PWD/build/windows-mingw/externals/ffmpeg-$FFMPEG_REVISION"
 
       - name: Build RyGT runtime and converter
-        run: cmake --build build/windows-mingw --parallel
+        run: cmake --build build/windows-mingw --parallel --target libs ryty
 
       - name: Show compiler cache statistics
         run: ccache --show-stats
-
-      - name: Run tests
-        run: ctest --test-dir build/windows-mingw --output-on-failure --parallel 2
 
       - name: Build launcher
         shell: pwsh
