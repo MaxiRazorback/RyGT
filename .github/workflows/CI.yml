@@ -70,6 +70,7 @@ jobs:
           git -C tools/GTToolsSharp apply ../adcpatch/GTToolsSharp-read-only-open.patch
 
       - name: Publish offline script tool
+        shell: pwsh
         run: >-
           dotnet publish tools/adcpatch/adcpatch.csproj
           -c Release -r win-x64 --self-contained
