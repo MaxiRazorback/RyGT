@@ -22,7 +22,7 @@ Subject: [PATCH] fix(dlss): reconstruct scene with temporal inputs before HUD
  create mode 100644 ryty_gpu/ryty_gts_dlss.h
 
 diff --git a/ryty_gpu/RytyGpu.cmake b/ryty_gpu/RytyGpu.cmake
-index 569ff3a0..066fb873 100644
+index d21f913f..5dacab78 100644
 --- a/ryty_gpu/RytyGpu.cmake
 +++ b/ryty_gpu/RytyGpu.cmake
 @@ -106,6 +106,7 @@ ryty_add_library(ryty_gpu libSceVideoOut
@@ -246,10 +246,10 @@ index 3855d5e0..9a33fb2e 100644
  class Pass {
  public:
 diff --git a/ryty_gpu/ryty_game_patch.cpp b/ryty_gpu/ryty_game_patch.cpp
-index dbd1dd51..89644511 100644
+index 86fb44bb..73c42d8d 100644
 --- a/ryty_gpu/ryty_game_patch.cpp
 +++ b/ryty_gpu/ryty_game_patch.cpp
-@@ -967,6 +967,14 @@ void InstallMirrorHalfRate(u8* base) {
+@@ -1098,6 +1098,14 @@ void InstallMirrorHalfRate(u8* base) {
      if (!wanted) {
          return;
      }
@@ -700,19 +700,19 @@ index dfe112e5..d026a0ae 100644
      SETTING_FORWARD_BOOL(m_gpu, FrameGenEnabled, framegen_enabled)
      SETTING_FORWARD_BOOL(m_gpu, DlssgEnabled, dlssg_enabled)
 diff --git a/src/video_core/renderer_vulkan/vk_presenter.cpp b/src/video_core/renderer_vulkan/vk_presenter.cpp
-index a1430be5..c9cae7ea 100644
+index 57a2025c..861f128e 100644
 --- a/src/video_core/renderer_vulkan/vk_presenter.cpp
 +++ b/src/video_core/renderer_vulkan/vk_presenter.cpp
-@@ -838,7 +838,7 @@ static vk::Format GetFrameViewFormat(const Libraries::VideoOut::PixelFormat form
+@@ -856,7 +856,7 @@ static vk::Format GetFrameViewFormat(const Libraries::VideoOut::PixelFormat form
  
  Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& attribute,
                                 VAddr cpu_address) {
 -    g_prepared_frames.fetch_add(1, std::memory_order_relaxed); // DIAG-137
 +    const u64 guestFrame = g_prepared_frames.fetch_add(1, std::memory_order_relaxed);
-     auto desc = VideoCore::TextureCache::ImageDesc{attribute, cpu_address};
-     const auto image_id = texture_cache.FindImage(desc);
-     texture_cache.UpdateImage(image_id);
-@@ -878,9 +878,16 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup&
+     rasterizer->FrameDumpFlip(); // NAT-116
+ #ifdef RYTY_GPU
+     if (auto* native = rasterizer->Native()) {
+@@ -902,9 +902,16 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup&
  
      auto& image = texture_cache.GetImage(image_id);
      auto image_view = *image.FindView(view_info).image_view;
@@ -730,7 +730,7 @@ index a1430be5..c9cae7ea 100644
      const u32 capture_game_only_count = VideoCore::ConsumeGameOnlyScreenshotRequests();
      std::optional<ScreenshotReadback> pending_screenshot;
  
-@@ -929,6 +936,11 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup&
+@@ -955,6 +962,11 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup&
      const vk::CommandBuffer pass_cmdbuf = draw_scheduler.DirectCommandBuffer();
      bool scaled = false;
  #ifdef RYTY_GPU
@@ -743,10 +743,10 @@ index a1430be5..c9cae7ea 100644
      if (const auto dlss_view =
              dlss_pass.Render(pass_cmdbuf, image.GetImage(), image_view, view_info.format,
 diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
-index b301a23d..0db4e07e 100644
+index b163c2de..5809d9e3 100644
 --- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
 +++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
-@@ -61,7 +61,11 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
+@@ -67,7 +67,11 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
        liverpool{liverpool_}, memory{Core::Memory::Instance()},
        pipeline_cache{instance, scheduler, liverpool, buffer_cache.GetSparsePageShift()},
        host_markers_enabled{EmulatorSettings.IsVkHostMarkersEnabled()},
@@ -759,7 +759,7 @@ index b301a23d..0db4e07e 100644
      // R5: buffer stage workers use their own rings.
      AmdGpu::DrawPipe::worker_init = [](u32 index) { VideoCore::BufferCache::SetStageWorker(index); };
      if (!EmulatorSettings.IsNullGPU()) {
-@@ -1648,6 +1652,85 @@ void NoteDrawKey(std::pair<u64, u64> key, int outcome) {
+@@ -1729,6 +1733,85 @@ void NoteDrawKey(std::pair<u64, u64> key, int outcome) {
  static void NoteMenuBarDraw(u64 vs, u64 ps); // FIX-127
  static thread_local bool t_frosted_rt = false; // DIAG-139: the draw renders the bar's blur
  
@@ -845,10 +845,10 @@ index b301a23d..0db4e07e 100644
  void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
      RENDERER_TRACE;
      ++Common::GetWorkCounters().draws;
-@@ -1877,6 +1960,10 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
-         PhaseTimer t{Phase::BeginRendering};
-         state = BeginRendering(pipeline);
-         FinalizeTextureLayouts(&state);
+@@ -1973,6 +2056,10 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
+         if (FrameDumpActive() || ExposureLogOn()) {
+             FrameDumpPass(regs, state, pipeline); // NAT-117
+         }
 +#ifdef RYTY_GPU
 +        if (RytyDlss::TemporalEnabled()) applyTemporalDlss(pipeline, state, true);
 +        prepareNativeHud(state);
@@ -856,7 +856,7 @@ index b301a23d..0db4e07e 100644
  
          if (ctx->needs_barrier) {
              runtime.FlushBarriers();
-@@ -1916,6 +2003,9 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
+@@ -2012,6 +2099,9 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
                      instance_offset);
      }
      DebugState.IncDrawCall();
@@ -866,7 +866,7 @@ index b301a23d..0db4e07e 100644
  
      // DIAG-041: draws into GT Sport's car thumbnail (448x126 linear targets) and into the watched
      // images of its chain: the shaders, every image and buffer they touch, and empty bindings.
-@@ -2168,6 +2258,9 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
+@@ -2274,6 +2364,9 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
      }
      auto state = BeginRendering(pipeline);
      FinalizeTextureLayouts(&state);
@@ -876,7 +876,7 @@ index b301a23d..0db4e07e 100644
  
      if (ctx->needs_barrier) {
          runtime.FlushBarriers();
-@@ -2973,6 +3066,19 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
+@@ -3592,6 +3685,19 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
          Common::PhaseTimer t{Common::Phase::TextureRebind};
          RebindTextures(pipeline->IsCompute(), num_color_targets);
      }
@@ -896,7 +896,7 @@ index b301a23d..0db4e07e 100644
      if (pipeline->IsCompute()) {
          FinalizeTextureLayouts();
      }
-@@ -3760,6 +3866,10 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
+@@ -4397,6 +4503,10 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                      return !env || env[0] != '0';
                  }();
                  const bool read_in_place = [&] {
@@ -907,18 +907,7 @@ index b301a23d..0db4e07e 100644
                      // DIAG-128 bisect: SHADGT_DIRECT_READS_STAGES=<hex mask of SwStage bits>,
                      // SHADGT_DIRECT_READS_MAX=<bytes> (larger ranges take the usual path),
                      // SHADGT_DIRECT_READS_MIN=<bytes> (smaller ranges take the usual path).
-@@ -4663,8 +4773,8 @@ void Rasterizer::FinalizeTextureLayouts(RenderState* render_state) {
-         ASSERT(backing != image.backing_images.end());
- 
-         ImageBindingRequirements requirements{
--            .is_depth = image.info.props.is_depth,
--            .has_stencil = image.info.props.has_stencil,
-+            .is_depth = bool(image.info.props.is_depth),
-+            .has_stencil = bool(image.info.props.has_stencil),
-             .feedback_layout_supported = instance.IsAttachmentFeedbackLoopLayoutSupported(),
-             .is_compute = render_state == nullptr,
-         };
-@@ -4715,6 +4825,7 @@ void Rasterizer::FinalizeTextureLayouts(RenderState* render_state) {
+@@ -5379,6 +5489,7 @@ void Rasterizer::FinalizeTextureLayouts(RenderState* render_state) {
  }
  
  RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
@@ -926,7 +915,7 @@ index b301a23d..0db4e07e 100644
      ctx->attachment_feedback_loop = {};
      const auto& regs = liverpool->DrawRegs();
      const auto& key = pipeline->GetGraphicsKey();
-@@ -4903,6 +5014,23 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
+@@ -5567,6 +5678,23 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
      return state;
  }
  
@@ -950,10 +939,10 @@ index b301a23d..0db4e07e 100644
  void Rasterizer::Resolve() {
      const auto& mrt0_hint = liverpool->DrawCbExtent(0);
      const auto& mrt1_hint = liverpool->DrawCbExtent(1);
-@@ -5310,6 +5438,12 @@ void Rasterizer::UpdateViewportScissorState() const {
+@@ -6028,6 +6156,12 @@ void Rasterizer::UpdateViewportScissorState() const {
      }
  
-     auto& dynamic_state = scheduler.GetDynamicState();
+     auto& dynamic_state = DynState(); // NAT-101
 +#ifdef RYTY_GPU
 +    if (ctx->dlssNativeDraw) {
 +        temporalDlss.ScaleHud(g_prepared_frames.load(std::memory_order_relaxed),
@@ -964,7 +953,7 @@ index b301a23d..0db4e07e 100644
      dynamic_state.SetScissors(scissors);
  }
 diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.h b/src/video_core/renderer_vulkan/vk_rasterizer.h
-index d3c6308d..4e793c93 100644
+index 382aa522..d86f5b22 100644
 --- a/src/video_core/renderer_vulkan/vk_rasterizer.h
 +++ b/src/video_core/renderer_vulkan/vk_rasterizer.h
 @@ -22,6 +22,9 @@
@@ -977,7 +966,7 @@ index d3c6308d..4e793c93 100644
  
  namespace AmdGpu {
  struct Liverpool;
-@@ -57,6 +60,9 @@ public:
+@@ -58,6 +61,9 @@ public:
      [[nodiscard]] VideoCore::TextureCache& GetTextureCache() noexcept {
          return texture_cache;
      }
@@ -987,7 +976,7 @@ index d3c6308d..4e793c93 100644
  
      /// PERF-047: a direct draw's pipeline, selected on the command thread as it decodes the
      /// draw, with the user data each stage's specialization was decided on.
-@@ -480,6 +486,8 @@ private:
+@@ -543,6 +549,8 @@ private:
      /// MT-001: the per-draw state of one recording thread. The recorder thread uses main_ctx;
      /// worker threads of the multithreaded recorder get their own.
      struct DrawContext {
@@ -996,7 +985,7 @@ index d3c6308d..4e793c93 100644
          std::array<ImageBinding, Shader::NUM_IMAGES> image_bindings;
          u32 image_binding_base = 0; // PERF-121: next free entry across the draw's stages
          /// PERF-123: each hardware stage's last image bindings, reused when the next draw's
-@@ -512,6 +520,12 @@ private:
+@@ -576,6 +584,12 @@ private:
          bool needs_barrier{};
      };
      DrawContext main_ctx;
@@ -1078,6 +1067,3 @@ index 5855a5c9..530c96ad 100644
  
  private:
      const Vulkan::Instance& instance;
--- 
-2.55.0.windows.5
-

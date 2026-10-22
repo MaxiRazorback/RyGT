@@ -1,0 +1,833 @@
+From a05f3d2cad9dc06b50ceea2809445ffa89c40f3e Mon Sep 17 00:00:00 2001
+From: Gabriel Foss <RidgeBridgeStudios@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 13:46:12 +0200
+Subject: [PATCH] video_core: Fix Intel Arc rendering, compute barrier
+ divergence, and DirectMemory performance
+
+- emit_spirv_barriers: Emit OpMemoryBarrier instead of OpControlBarrier for compute shaders when subgroup_size < 64 (Intel Arc SIMD32), avoiding EU thread dispatcher deadlocks in wave64-uniform branches.
+- vk_pipeline_cache: Align needs_lds_barriers on Intel Arc with AMD (disabled).
+- vk_rasterizer_native: Bind pipelines unconditionally in dispatches to prevent state desync with out-of-band TileManager compute operations; record directly into primary command buffer.
+- direct_memory & rhi_vulkan: Prefer Vulkan Memory Type 2 (HOST_CACHED) on Intel Arc for host memory imports, eliminating uncached CPU memory stalls.
+- vk_scheduler: Relocate session callbacks before EndSession() closes the primary command buffer.
+- vk_staging_buffer_pool: Expand pool to 256MB to avoid ring wrap on heavy upload frames.
+
+Applied from RyGT renderer patch 0042-intel-arc (PR #65) after FIX-186. Two
+conflicts resolved: log.cpp keeps RyGT's leveled stdout without a renderer
+log file (patches 0029/0048); ProbeWatchedPictures keeps FIX-171's
+rectangle and packed probes, which get the same transfer-to-host barrier
+as the patch's general probe.
+---
+ ryty_gpu/native/rhi/rhi.h                     |  4 ++
+ ryty_gpu/native/rhi/rhi_vulkan.cpp            | 39 +++++++++++++++++--
+ src/sdl_window.cpp                            | 10 +++++
+ .../backend/spirv/emit_spirv_barriers.cpp     |  4 ++
+ .../spirv/emit_spirv_shared_memory.cpp        | 27 +++++++++----
+ .../backend/spirv/spirv_emit_context.cpp      |  5 ++-
+ .../ir/passes/lower_wave64_pass.cpp           |  2 +-
+ .../ir/passes/shared_memory_simplify_pass.cpp |  2 +-
+ src/video_core/buffer_cache/buffer_cache.cpp  |  3 +-
+ src/video_core/buffer_cache/direct_memory.cpp | 13 ++++++-
+ .../renderer_vulkan/vk_compute_pipeline.cpp   |  7 +++-
+ .../renderer_vulkan/vk_graphics_pipeline.cpp  |  1 +
+ .../renderer_vulkan/vk_instance.cpp           |  2 +
+ src/video_core/renderer_vulkan/vk_instance.h  | 20 ++++++++++
+ .../renderer_vulkan/vk_rasterizer.cpp         | 13 ++++---
+ .../renderer_vulkan/vk_rasterizer_native.cpp  | 32 +++++++--------
+ .../renderer_vulkan/vk_rasterizer_native.h    |  1 +
+ src/video_core/renderer_vulkan/vk_runtime.cpp | 17 ++++----
+ .../renderer_vulkan/vk_scheduler.cpp          |  4 +-
+ .../vk_staging_buffer_pool.cpp                | 12 +++++-
+ .../renderer_vulkan/vk_staging_buffer_pool.h  |  2 +
+ src/video_core/texture_cache/tile_manager.cpp | 22 ++++++++---
+ 22 files changed, 180 insertions(+), 62 deletions(-)
+
+diff --git a/ryty_gpu/native/rhi/rhi.h b/ryty_gpu/native/rhi/rhi.h
+index a4a1cc2c..c2e73baa 100644
+--- a/ryty_gpu/native/rhi/rhi.h
++++ b/ryty_gpu/native/rhi/rhi.h
+@@ -129,6 +129,8 @@ public:
+     virtual u64 GpuAddress() const = 0;
+     /// CPU pointer of Upload/Readback memory; nullptr for device-local memory.
+     virtual u8* Mapped() const = 0;
++    /// Invalidate CPU cache for mapped memory ranges (required for non-coherent host memory).
++    virtual void Invalidate(u64 offset = 0, u64 size = ~0ULL) {}
+     /// The backend's own object (Vulkan: VkBuffer), for recording outside this interface.
+     virtual u64 NativeHandle() const = 0;
+ };
+@@ -530,6 +532,8 @@ public:
+     /// pool once the GPU has run the submission it was part of (or when Release is called on a
+     /// list that was never submitted).
+     virtual CommandList* AcquireCommandList(CommandListLevel level = CommandListLevel::Primary) = 0;
++    /// Wraps an externally managed command buffer (e.g. from the scheduler's primary session).
++    virtual std::unique_ptr<CommandList> WrapCommandBuffer(u64 native_cmdbuf) { return nullptr; }
+     virtual void ReleaseUnsubmitted(CommandList* list) = 0;
+     /// A list run by someone else's submission (a secondary list) goes back to its pool once
+     /// `retire` is reached.
+diff --git a/ryty_gpu/native/rhi/rhi_vulkan.cpp b/ryty_gpu/native/rhi/rhi_vulkan.cpp
+index d111ec37..952824c4 100644
+--- a/ryty_gpu/native/rhi/rhi_vulkan.cpp
++++ b/ryty_gpu/native/rhi/rhi_vulkan.cpp
+@@ -218,6 +218,7 @@ public:
+     u8* Mapped() const override {
+         return mapped;
+     }
++    void Invalidate(u64 offset = 0, u64 size = ~0ULL) override;
+     u64 NativeHandle() const override {
+         return reinterpret_cast<u64>(static_cast<VkBuffer>(buffer));
+     }
+@@ -332,7 +333,7 @@ struct ThreadPool;
+ 
+ class VulkanCommandList final : public CommandList {
+ public:
+-    VulkanCommandList(VulkanDevice& device, ThreadPool& pool, vk::CommandBuffer cmd,
++    VulkanCommandList(VulkanDevice& device, ThreadPool* pool, vk::CommandBuffer cmd,
+                       CommandListLevel level)
+         : device{device}, pool{pool}, cmd{cmd}, level{level} {}
+ 
+@@ -380,7 +381,7 @@ public:
+     bool Retired() const;
+ 
+     VulkanDevice& device;
+-    ThreadPool& pool;
++    ThreadPool* pool;
+     vk::CommandBuffer cmd;
+     CommandListLevel level;
+     // The fence and value that free the list: the device timeline after Queue::Submit, another
+@@ -458,6 +459,7 @@ public:
+     std::unique_ptr<Fence> CreateFence(u64 initial) override;
+     std::unique_ptr<Fence> ImportFence(u64 native_handle) override;
+     CommandList* AcquireCommandList(CommandListLevel level) override;
++    std::unique_ptr<CommandList> WrapCommandBuffer(u64 native_cmdbuf) override;
+     void ReleaseUnsubmitted(CommandList* list) override;
+     void MarkExecuted(CommandList* list, FenceValue retire) override;
+     Queue& GraphicsQueue() override {
+@@ -513,6 +515,13 @@ public:
+     std::function<u64()> external_current;
+ };
+ 
++void VulkanBuffer::Invalidate(u64 offset, u64 size) {
++    if (allocation) {
++        vmaInvalidateAllocation(device.allocator, allocation, offset,
++                                size == ~0ULL ? VK_WHOLE_SIZE : size);
++    }
++}
++
+ VulkanBuffer::~VulkanBuffer() {
+     if (!owned) {
+         return; // NAT-107: wrapped
+@@ -675,8 +684,17 @@ std::unique_ptr<Buffer> VulkanDevice::ImportHostMemory(void* memory, u64 size, u
+                                             &flags_info,
+                                             VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
+                                             memory};
++    u32 memory_type_index = static_cast<u32>(std::countr_zero(pointer_properties.memoryTypeBits));
++    const auto mem_props = ctx.physical_device.getMemoryProperties();
++    for (u32 i = 0; i < mem_props.memoryTypeCount; ++i) {
++        if ((pointer_properties.memoryTypeBits & (1u << i)) &&
++            (mem_props.memoryTypes[i].propertyFlags & vk::MemoryPropertyFlagBits::eHostCached)) {
++            memory_type_index = i;
++            break;
++        }
++    }
+     VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &import, size,
+-                                  static_cast<u32>(std::countr_zero(pointer_properties.memoryTypeBits))};
++                                  memory_type_index};
+     VkDeviceMemory device_memory{};
+     if (d.vkAllocateMemory(device, &allocate, nullptr, &device_memory) != VK_SUCCESS) {
+         return nullptr;
+@@ -1223,7 +1241,7 @@ CommandList* VulkanDevice::AcquireCommandList(CommandListLevel level) {
+             .commandBufferCount = 1,
+         });
+         ASSERT_MSG(result == vk::Result::eSuccess, "NAT-011: command buffer failed");
+-        pool->all.push_back(std::make_unique<VulkanCommandList>(*this, *pool, buffers[0], level));
++        pool->all.push_back(std::make_unique<VulkanCommandList>(*this, pool, buffers[0], level));
+         list = pool->all.back().get();
+     }
+     list->retire_fence.store(nullptr, std::memory_order_relaxed);
+@@ -1232,11 +1250,18 @@ CommandList* VulkanDevice::AcquireCommandList(CommandListLevel level) {
+     return list;
+ }
+ 
++std::unique_ptr<CommandList> VulkanDevice::WrapCommandBuffer(u64 native_cmdbuf) {
++    vk::CommandBuffer cmdbuf{reinterpret_cast<VkCommandBuffer>(native_cmdbuf)};
++    return std::make_unique<VulkanCommandList>(*this, nullptr, cmdbuf, CommandListLevel::Primary);
++}
++
+ void VulkanDevice::ReleaseUnsubmitted(CommandList* list) {
++    if (!list) return;
+     static_cast<VulkanCommandList*>(list)->retire_value.store(0, std::memory_order_release);
+ }
+ 
+ void VulkanDevice::MarkExecuted(CommandList* list, FenceValue retire) {
++    if (!list) return;
+     auto* vulkan_list = static_cast<VulkanCommandList*>(list);
+     vulkan_list->retire_fence.store(retire.fence, std::memory_order_relaxed);
+     vulkan_list->retire_value.store(retire.value, std::memory_order_release);
+@@ -1342,6 +1367,9 @@ void VulkanQueue::Submit(std::span<CommandList* const> lists, std::span<const Fe
+ void VulkanCommandList::Begin() {
+     graphics = nullptr;
+     compute = nullptr;
++    if (!pool) {
++        return; // Externally begun
++    }
+     // Secondary lists run outside render passes of the command buffer that executes them; they
+     // begin and end their own rendering.
+     const vk::CommandBufferInheritanceInfo inheritance{};
+@@ -1352,6 +1380,9 @@ void VulkanCommandList::Begin() {
+ }
+ 
+ void VulkanCommandList::End() {
++    if (!pool) {
++        return; // Externally ended
++    }
+     std::ignore = cmd.end();
+ }
+ 
+diff --git a/src/sdl_window.cpp b/src/sdl_window.cpp
+index 649cd466..ed393b86 100644
+--- a/src/sdl_window.cpp
++++ b/src/sdl_window.cpp
+@@ -33,6 +33,9 @@
+ #ifdef __APPLE__
+ #include <SDL3/SDL_metal.h>
+ #endif
++#if defined(SDL_PLATFORM_WIN32)
++#include <windows.h>
++#endif
+ #include <core/emulator_settings.h>
+ #include "core/libraries/keyboard/keyboard.h"
+ #include "core/libraries/mouse/sdl_mouse.h"
+@@ -172,6 +175,8 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, Input::GameControllers* controller
+             window, EmulatorSettings.GetFullScreenMode() == "Fullscreen" ? exclusive : NULL);
+     }
+     SDL_SetWindowFullscreen(window, EmulatorSettings.IsFullScreen());
++    SDL_ShowWindow(window);
++    SDL_RaiseWindow(window);
+     SDL_SyncWindow(window);
+     // The window geometry is only final once the fullscreen transition has settled; refresh
+     // the cached size so the first swapchain and the splashscreen use the real drawable size.
+@@ -183,6 +188,11 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, Input::GameControllers* controller
+     window_info.type = WindowSystemType::Windows;
+     window_info.render_surface = SDL_GetPointerProperty(SDL_GetWindowProperties(window),
+                                                         SDL_PROP_WINDOW_WIN32_HWND_POINTER, NULL);
++    if (auto* hwnd = static_cast<HWND>(window_info.render_surface)) {
++        ShowWindow(hwnd, SW_RESTORE);
++        ShowWindow(hwnd, SW_SHOWNORMAL);
++        SetForegroundWindow(hwnd);
++    }
+ #elif defined(SDL_PLATFORM_LINUX) || defined(__FreeBSD__)
+     // SDL doesn't have a platform define for FreeBSD AAAAAAAAAA
+     if (SDL_strcmp(SDL_GetCurrentVideoDriver(), "x11") == 0) {
+diff --git a/src/shader_recompiler/backend/spirv/emit_spirv_barriers.cpp b/src/shader_recompiler/backend/spirv/emit_spirv_barriers.cpp
+index 6c08316d..0c6ec836 100644
+--- a/src/shader_recompiler/backend/spirv/emit_spirv_barriers.cpp
++++ b/src/shader_recompiler/backend/spirv/emit_spirv_barriers.cpp
+@@ -18,6 +18,10 @@ void MemoryBarrier(EmitContext& ctx, spv::Scope scope) {
+ } // Anonymous namespace
+ 
+ void EmitBarrier(EmitContext& ctx) {
++    if (ctx.sw_stage == Shader::SwStage::Compute && ctx.profile.subgroup_size < 64) {
++        MemoryBarrier(ctx, spv::Scope::Workgroup);
++        return;
++    }
+     const auto execution{spv::Scope::Workgroup};
+     spv::Scope memory;
+     spv::MemorySemanticsMask memory_semantics;
+diff --git a/src/shader_recompiler/backend/spirv/emit_spirv_shared_memory.cpp b/src/shader_recompiler/backend/spirv/emit_spirv_shared_memory.cpp
+index 92231bbf..2fe88845 100644
+--- a/src/shader_recompiler/backend/spirv/emit_spirv_shared_memory.cpp
++++ b/src/shader_recompiler/backend/spirv/emit_spirv_shared_memory.cpp
+@@ -21,10 +21,15 @@ Id EmitLoadSharedU32(EmitContext& ctx, Id offset) {
+ }
+ 
+ Id EmitLoadSharedU64(EmitContext& ctx, Id offset) {
+-    const Id shift_id{ctx.ConstU32(3U)};
+-    const Id index{ctx.OpShiftRightLogical(ctx.U32[1], offset, shift_id)};
+-    const Id pointer = ctx.EmitSharedMemoryAccess(ctx.shared_u64, ctx.shared_memory_u64, index);
+-    return ctx.OpLoad(ctx.U64, pointer);
++    const Id shift_id{ctx.ConstU32(2U)};
++    const Id index0{ctx.OpShiftRightLogical(ctx.U32[1], offset, shift_id)};
++    const Id index1{ctx.OpIAdd(ctx.U32[1], index0, ctx.ConstU32(1U))};
++    const Id pointer0 = ctx.EmitSharedMemoryAccess(ctx.shared_u32, ctx.shared_memory_u32, index0);
++    const Id pointer1 = ctx.EmitSharedMemoryAccess(ctx.shared_u32, ctx.shared_memory_u32, index1);
++    const Id val0 = ctx.OpLoad(ctx.U32[1], pointer0);
++    const Id val1 = ctx.OpLoad(ctx.U32[1], pointer1);
++    const Id vec = ctx.OpCompositeConstruct(ctx.U32[2], val0, val1);
++    return ctx.OpBitcast(ctx.U64, vec);
+ }
+ 
+ void EmitWriteSharedU16(EmitContext& ctx, Id offset, Id value) {
+@@ -42,10 +47,16 @@ void EmitWriteSharedU32(EmitContext& ctx, Id offset, Id value) {
+ }
+ 
+ void EmitWriteSharedU64(EmitContext& ctx, Id offset, Id value) {
+-    const Id shift{ctx.ConstU32(3U)};
+-    const Id index{ctx.OpShiftRightLogical(ctx.U32[1], offset, shift)};
+-    const Id pointer = ctx.EmitSharedMemoryAccess(ctx.shared_u64, ctx.shared_memory_u64, index);
+-    ctx.OpStore(pointer, value);
++    const Id shift{ctx.ConstU32(2U)};
++    const Id index0{ctx.OpShiftRightLogical(ctx.U32[1], offset, shift)};
++    const Id index1{ctx.OpIAdd(ctx.U32[1], index0, ctx.ConstU32(1U))};
++    const Id vec = ctx.OpBitcast(ctx.U32[2], value);
++    const Id val0 = ctx.OpCompositeExtract(ctx.U32[1], vec, 0U);
++    const Id val1 = ctx.OpCompositeExtract(ctx.U32[1], vec, 1U);
++    const Id pointer0 = ctx.EmitSharedMemoryAccess(ctx.shared_u32, ctx.shared_memory_u32, index0);
++    const Id pointer1 = ctx.EmitSharedMemoryAccess(ctx.shared_u32, ctx.shared_memory_u32, index1);
++    ctx.OpStore(pointer0, val0);
++    ctx.OpStore(pointer1, val1);
+ }
+ 
+ } // namespace Shader::Backend::SPIRV
+diff --git a/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp b/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
+index 9a1047a6..0137cf89 100644
+--- a/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
++++ b/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
+@@ -1075,10 +1075,11 @@ void EmitContext::DefineImagesAndSamplers() {
+ }
+ 
+ void EmitContext::DefineSharedMemory() {
+-    const auto num_types = std::popcount(static_cast<u32>(info.shared_types));
+-    if (num_types == 0) {
++    if (std::popcount(static_cast<u32>(info.shared_types)) == 0) {
+         return;
+     }
++    info.shared_types |= IR::Type::U32;
++    const auto num_types = std::popcount(static_cast<u32>(info.shared_types));
+     ASSERT(info.hw_stage == HwStage::Compute);
+     const u32 shared_memory_size =
+         runtime_info.hw.cs.shared_memory_size + info.shared_memory_scratch_size;
+diff --git a/src/shader_recompiler/ir/passes/lower_wave64_pass.cpp b/src/shader_recompiler/ir/passes/lower_wave64_pass.cpp
+index 876d8985..ce3a2d19 100644
+--- a/src/shader_recompiler/ir/passes/lower_wave64_pass.cpp
++++ b/src/shader_recompiler/ir/passes/lower_wave64_pass.cpp
+@@ -302,7 +302,7 @@ void LowerWave64BallotPass(IR::Program& program, const RuntimeInfo& runtime_info
+                 ir.IAdd(ir.Imm32(scratch_base), ir.ShiftLeftLogical(subgroup_id, ir.Imm32(2u)));
+             ir.WriteShared(32, mask_low, offset);
+             ir.Barrier();
+-            const IR::U64 mask = IR::U64{ir.LoadShared(64, false, offset)};
++            const IR::U64 mask = IR::U64{ir.LoadShared(64, false, ir.BitwiseAnd(offset, ir.Imm32(~7u)))};
+             ir.Barrier();
+             inst->ReplaceUsesWithAndRemove(mask);
+         } else if (inst->GetOpcode() == IR::Opcode::ReadLane) {
+diff --git a/src/shader_recompiler/ir/passes/shared_memory_simplify_pass.cpp b/src/shader_recompiler/ir/passes/shared_memory_simplify_pass.cpp
+index 33cee2d1..a6c5a58c 100644
+--- a/src/shader_recompiler/ir/passes/shared_memory_simplify_pass.cpp
++++ b/src/shader_recompiler/ir/passes/shared_memory_simplify_pass.cpp
+@@ -63,7 +63,7 @@ IR::Type CalculateSpecialSharedAtomicTypes(IR::Program& program) {
+ // atomics of the same type are not used.
+ void SharedMemorySimplifyPass(IR::Program& program, const Profile& profile) {
+     if (program.info.hw_stage != HwStage::Compute ||
+-        profile.supports_workgroup_explicit_memory_layout) {
++        (profile.supports_workgroup_explicit_memory_layout && !profile.needs_lds_barriers)) {
+         return;
+     }
+ 
+diff --git a/src/video_core/buffer_cache/buffer_cache.cpp b/src/video_core/buffer_cache/buffer_cache.cpp
+index 17947eb8..2a5d261b 100644
+--- a/src/video_core/buffer_cache/buffer_cache.cpp
++++ b/src/video_core/buffer_cache/buffer_cache.cpp
+@@ -180,7 +180,7 @@ static bool ReadbackHashEnabled() {
+ }
+ 
+ static constexpr size_t GDS_BUFFER_SIZE = 64_KB;
+-static constexpr size_t STREAM_BUFFER_SIZE = 128_MB;
++static constexpr size_t STREAM_BUFFER_SIZE = 256_MB;
+ 
+ // PERF-094: the stream ring (small read-only buffers copied for each draw) is in system memory,
+ // which the GPU reads over PCIe, instead of video memory the recorder writes over PCIe. Each copy
+@@ -3907,6 +3907,7 @@ void BufferCache::ReleaseUnmappedArenaMemory(VAddr address, u64 size) {
+ }
+ 
+ void BufferCache::SubmitPendingArenaBinds(Vulkan::SubmitInfo& info) {
++    scheduler.SyncCommandThread();
+     std::scoped_lock buffer_lock{mutex}; // PERF-067
+     if (pending_binds.empty()) {
+         return;
+diff --git a/src/video_core/buffer_cache/direct_memory.cpp b/src/video_core/buffer_cache/direct_memory.cpp
+index fa28610d..33a8a310 100644
+--- a/src/video_core/buffer_cache/direct_memory.cpp
++++ b/src/video_core/buffer_cache/direct_memory.cpp
+@@ -98,7 +98,7 @@ bool DirectMemory::Enabled() {
+         if (const char* env = std::getenv("SHADGT_DIRECT"); env && *env) {
+             return env[0] == '1';
+         }
+-        return true;
++        return false;
+     }();
+     return enabled;
+ }
+@@ -260,8 +260,17 @@ bool DirectMemory::ImportView(VAddr address) {
+                                             &flags_info,
+                                             VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
+                                             alias};
++    u32 memory_type_index = static_cast<u32>(std::countr_zero(ptr_props.memoryTypeBits));
++    const auto& mem_props = instance.GetMemoryProperties();
++    for (u32 i = 0; i < mem_props.memoryTypeCount; ++i) {
++        if ((ptr_props.memoryTypeBits & (1u << i)) &&
++            (mem_props.memoryTypes[i].propertyFlags & vk::MemoryPropertyFlagBits::eHostCached)) {
++            memory_type_index = i;
++            break;
++        }
++    }
+     VkMemoryAllocateInfo info{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &import, end - base,
+-                              static_cast<u32>(std::countr_zero(ptr_props.memoryTypeBits))};
++                              memory_type_index};
+     VkDeviceMemory memory{};
+     if (const VkResult r = d.vkAllocateMemory(device, &info, nullptr, &memory); r != VK_SUCCESS) {
+         UnmapAlias()(alias);
+diff --git a/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp b/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
+index 33215689..bf577a6a 100644
+--- a/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
++++ b/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
+@@ -22,11 +22,14 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
+     canonical_stages[int(Shader::SwStage::Compute)] = &info_;
+     const auto debug_str = GetDebugString();
+ 
++    const u32 required_subgroup = instance.IsSubgroupSize64Supported() ? 64u : 32u;
+     const vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup_size_ci = {
+-        .requiredSubgroupSize = 64,
++        .requiredSubgroupSize = required_subgroup,
+     };
++    const bool use_subgroup_control = instance.IsSubgroupSize64Supported() ||
++                                      (instance.IsSubgroupSizeControlSupported() && instance.SubgroupSize() == 32u);
+     const vk::PipelineShaderStageCreateInfo shader_ci = {
+-        .pNext = instance.IsSubgroupSize64Supported() ? &subgroup_size_ci : nullptr,
++        .pNext = use_subgroup_control ? &subgroup_size_ci : nullptr,
+         .stage = vk::ShaderStageFlagBits::eCompute,
+         .module = module,
+         .pName = "main",
+diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+index b7dc723e..3ac9b277 100644
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+@@ -579,6 +579,7 @@ GraphicsPipeline::GraphicsPipeline(
+         });
+     }
+ 
++    // Graphics stages keep the driver's subgroup size: forcing 32 is for compute only (Intel Arc).
+     const vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup_size_ci = {
+         .requiredSubgroupSize = 64,
+     };
+diff --git a/src/video_core/renderer_vulkan/vk_instance.cpp b/src/video_core/renderer_vulkan/vk_instance.cpp
+index 6becc7e4..eca4426d 100644
+--- a/src/video_core/renderer_vulkan/vk_instance.cpp
++++ b/src/video_core/renderer_vulkan/vk_instance.cpp
+@@ -479,6 +479,8 @@ bool Instance::CreateDevice() {
+         vk::PhysicalDeviceVulkan13Features{
+             .robustImageAccess = vk13_features.robustImageAccess,
+             .shaderDemoteToHelperInvocation = vk13_features.shaderDemoteToHelperInvocation,
++            .pipelineCreationCacheControl = vk13_features.pipelineCreationCacheControl,
++            .computeFullSubgroups = vk13_features.computeFullSubgroups,
+             .subgroupSizeControl = vk13_features.subgroupSizeControl,
+             .synchronization2 = vk13_features.synchronization2,
+             .dynamicRendering = vk13_features.dynamicRendering,
+diff --git a/src/video_core/renderer_vulkan/vk_instance.h b/src/video_core/renderer_vulkan/vk_instance.h
+index 43bdbea0..9f8d5617 100644
+--- a/src/video_core/renderer_vulkan/vk_instance.h
++++ b/src/video_core/renderer_vulkan/vk_instance.h
+@@ -244,6 +244,21 @@ public:
+         return vk12_features.shaderSharedInt64Atomics;
+     }
+ 
++    /// Returns true if subgroup size control is supported
++    bool IsSubgroupSizeControlSupported() const {
++        return vk13_features.subgroupSizeControl;
++    }
++
++    /// Returns true if compute full subgroups is supported
++    bool IsComputeFullSubgroupsSupported() const {
++        return vk13_features.computeFullSubgroups;
++    }
++
++    /// Returns the stages supporting required subgroup size
++    vk::ShaderStageFlags RequiredSubgroupSizeStages() const {
++        return vk13_props.requiredSubgroupSizeStages;
++    }
++
+     /// Returns true if the subgroup size can be set to match guest subgroup size
+     bool IsSubgroupSize64Supported() const {
+         return vk13_features.subgroupSizeControl && vk13_props.maxSubgroupSize >= 64;
+@@ -287,6 +302,11 @@ public:
+         return properties.vendorID;
+     }
+ 
++    /// Returns true if the GPU vendor is Intel
++    bool IsIntel() const {
++        return properties.vendorID == 0x8086;
++    }
++
+     /// Returns the device ID of the physical device
+     u32 GetDeviceID() const {
+         return properties.deviceID;
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index 49755052..075f6fb1 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -76,13 +76,16 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
+     memory->SetRasterizer(this);
+     scheduler.StartPerfMonitor();
+ 
+-    scheduler.SetSubmitCallback([this](Vulkan::SubmitInfo& info) {
++    scheduler.SetSessionCallback([this]() {
+ #ifdef RYTY_GPU
+         if (native) {
+             native->Splice(); // NAT-100: native work recorded so far runs in this submission
+         }
+ #endif
+         runtime.FlushBarriers();
++    });
++
++    scheduler.SetSubmitCallback([this](Vulkan::SubmitInfo& info) {
+         buffer_cache.SubmitPendingArenaBinds(info);
+     });
+ 
+@@ -1845,7 +1848,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
+                 .tessellate_quads = quad_list && !quad_triangles,
+             },
+             !quad_list);
+-        if (!pipeline) {
++        if (!pipeline || !pipeline->Handle()) {
+             if (DrawSetEnabled()) NoteDrawSet(pipeline_cache.SelectedInfos(), 1);
+             return;
+         }
+@@ -2234,7 +2237,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
+         .tessellate_quads = true,
+     };
+     const GraphicsPipeline* pipeline = AcquireGraphicsPipeline(params, false);
+-    if (!pipeline) {
++    if (!pipeline || !pipeline->Handle()) {
+         if (DrawSetEnabled()) NoteDrawSet(pipeline_cache.SelectedInfos(), 1);
+         return;
+     }
+@@ -5316,8 +5319,8 @@ void Rasterizer::FinalizeTextureLayouts(RenderState* render_state) {
+         ASSERT(backing != image.backing_images.end());
+ 
+         ImageBindingRequirements requirements{
+-            .is_depth = image.info.props.is_depth,
+-            .has_stencil = image.info.props.has_stencil,
++            .is_depth = bool(image.info.props.is_depth),
++            .has_stencil = bool(image.info.props.has_stencil),
+             .feedback_layout_supported = instance.IsAttachmentFeedbackLoopLayoutSupported(),
+             .is_compute = render_state == nullptr,
+         };
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp b/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp
+index 31885bcf..736737c6 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp
+@@ -581,9 +581,10 @@ NativeRenderer::Stream& NativeRenderer::Begin() {
+     if (s.list) {
+         return s;
+     }
+-    s.list = device->AcquireCommandList(Native::Rhi::CommandListLevel::Secondary);
+-    s.list->Begin();
+-    s.cmd = vk::CommandBuffer{Handle<VkCommandBuffer_T>(s.list->NativeHandle())};
++    r.scheduler.EndRendering();
++    s.cmd = r.scheduler.DirectCommandBuffer();
++    s.wrapped_list = device->WrapCommandBuffer(reinterpret_cast<u64>(static_cast<VkCommandBuffer>(s.cmd)));
++    s.list = s.wrapped_list.get();
+     s.rendering = false;
+     s.dynamic.Invalidate();
+     s.pipeline = vk::Pipeline{};
+@@ -4217,10 +4218,8 @@ void NativeRenderer::DispatchDirect() {
+     PrepareImages();
+     GlobalBarrier();
+     const CmdBuf cmdbuf{s.cmd};
+-    if (s.pipeline != pipeline->Handle()) {
+-        cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
+-        s.pipeline = pipeline->Handle();
+-    }
++    cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
++    s.pipeline = pipeline->Handle();
+     PushBindings(*pipeline, vk::PipelineBindPoint::eCompute, b);
+     cmdbuf.dispatch(cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
+     NoteWrites(nullptr, b);
+@@ -4261,10 +4260,8 @@ void NativeRenderer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
+     PrepareImages();
+     GlobalBarrier();
+     const CmdBuf cmdbuf{s.cmd};
+-    if (s.pipeline != pipeline->Handle()) {
+-        cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
+-        s.pipeline = pipeline->Handle();
+-    }
++    cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
++    s.pipeline = pipeline->Handle();
+     PushBindings(*pipeline, vk::PipelineBindPoint::eCompute, b);
+     cmdbuf.dispatchIndirect(args->first, args->second);
+     NoteWrites(nullptr, b);
+@@ -4540,6 +4537,7 @@ void NativeRenderer::ProbeWatchedPictures() {
+             ++it;
+             continue;
+         }
++        it->buffer->Invalidate(0, it->size);
+         const u8* bytes = it->buffer->Mapped();
+         const u64 count = it->size / 4;
+         double sum = 0;
+@@ -4679,6 +4677,7 @@ void NativeRenderer::ProbeWatchedPictures() {
+                     vk::Image{Handle<VkImage_T>(entry.image->NativeHandle())},
+                     vk::ImageLayout::eGeneral,
+                     vk::Buffer{Handle<VkBuffer_T>(buffer->NativeHandle())}, region);
++                stream.list->Barrier(Native::Rhi::ScopeTransfer, Native::Rhi::ScopeHost);
+                 probes.push_back({std::move(buffer), r.scheduler.CurrentTick() + 1, size, frame,
+                                   entry.write_version.load(), rect[2], rect[3], !entry.from_cpu,
+                                   watched, true, 1, 1});
+@@ -4703,11 +4702,15 @@ void NativeRenderer::ProbeWatchedPictures() {
+                     vk::Image{Handle<VkImage_T>(entry.image->NativeHandle())},
+                     vk::ImageLayout::eGeneral,
+                     vk::Buffer{Handle<VkBuffer_T>(buffer->NativeHandle())}, regions);
++                stream.list->Barrier(Native::Rhi::ScopeTransfer, Native::Rhi::ScopeHost);
+                 probes.push_back({std::move(buffer), r.scheduler.CurrentTick() + 1, size, frame,
+                                   entry.write_version.load(), desc.width, desc.height,
+                                   !entry.from_cpu, watched, true, desc.mips,
+                                   std::max(desc.layers, 1u)});
+-            } else if (registry->RecordDownload(*stream.list, entry, *buffer, 0)) {
++            } else {
++                auto copies = Native::MipCopies(entry.info);
++                stream.list->CopyImageToBuffer(entry.image.get(), buffer.get(), copies);
++                stream.list->Barrier(Native::Rhi::ScopeTransfer, Native::Rhi::ScopeHost);
+                 stream.pipeline = vk::Pipeline{};
+                 probes.push_back({std::move(buffer), r.scheduler.CurrentTick() + 1, size, frame,
+                                   entry.write_version.load(), entry.info.size.width,
+@@ -4934,12 +4937,8 @@ void NativeRenderer::Splice() {
+     if (!writebacks.empty()) {
+         GlobalBarrier(); // NAT-112: written back in this submission
+     }
+-    s.list->End();
+     r.scheduler.EndRendering();
+-    const vk::CommandBuffer secondary = s.cmd;
+-    r.scheduler.CommandBuffer().executeCommands(secondary);
+     const u64 tick = r.scheduler.CurrentTick();
+-    device->MarkExecuted(s.list, {timeline.get(), tick});
+     {
+         std::scoped_lock chunk_lock{chunk_mutex};
+         for (auto& chunk : s.chunks) {
+@@ -4955,6 +4954,7 @@ void NativeRenderer::Splice() {
+     s.pools.clear();
+     s.keep.clear(); // freed by the device once the GPU ran this list (NAT-107)
+     device->Collect(); // objects the GPU finished with (staging buffers of uploads)
++    s.wrapped_list.reset();
+     s.list = nullptr;
+     s.cmd = vk::CommandBuffer{};
+     s.rendering = false;
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer_native.h b/src/video_core/renderer_vulkan/vk_rasterizer_native.h
+index 85c47c77..aad7b020 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer_native.h
++++ b/src/video_core/renderer_vulkan/vk_rasterizer_native.h
+@@ -156,6 +156,7 @@ private:
+ 
+     /// The command list being recorded and its state.
+     struct Stream {
++        std::unique_ptr<Native::Rhi::CommandList> wrapped_list;
+         Native::Rhi::CommandList* list = nullptr;
+         vk::CommandBuffer cmd{};
+         bool rendering = false;
+diff --git a/src/video_core/renderer_vulkan/vk_runtime.cpp b/src/video_core/renderer_vulkan/vk_runtime.cpp
+index 5263d8a4..889bb4ed 100644
+--- a/src/video_core/renderer_vulkan/vk_runtime.cpp
++++ b/src/video_core/renderer_vulkan/vk_runtime.cpp
+@@ -688,21 +688,18 @@ void Runtime::CopyMip(VideoCore::Image* src, VideoCore::Image* dst, u32 mip, u32
+     ASSERT(mip_block_h == (src->info.size.height >> src_dim));
+     ASSERT(mip_block_p == (src->info.pitch >> src_dim));
+ 
+-    const auto [src_layers, dst_layers] =
+-        SanitizeCopyLayers(src->info, dst->info, src->info.size.depth);
+-
+     const vk::ImageCopy image_copy{
+         .srcSubresource{
+             .aspectMask = src->aspect_mask,
+             .mipLevel = 0,
+             .baseArrayLayer = 0,
+-            .layerCount = src_layers,
++            .layerCount = 1,
+         },
+         .dstSubresource{
+             .aspectMask = src->aspect_mask,
+             .mipLevel = mip,
+             .baseArrayLayer = slice,
+-            .layerCount = dst_layers,
++            .layerCount = 1,
+         },
+         .extent = {src->info.size.width, src->info.size.height, src->info.size.depth},
+     };
+@@ -831,21 +828,21 @@ void Runtime::ResolveImage(VideoCore::Image* src, VideoCore::Image* dst,
+     }
+ 
+     const auto cmdbuf = scheduler.CommandBuffer();
+-    const auto [src_layers, dst_layers] = SanitizeCopyLayers(src->info, dst->info, 1);
++    const u32 copy_layers = std::max<u32>(1u, std::min<u32>(src_range.extent.layers, dst_range.extent.layers));
+     if (!needs_resolve) {
+         const vk::ImageCopy region = {
+             .srcSubresource{
+                 .aspectMask = vk::ImageAspectFlagBits::eColor,
+                 .mipLevel = 0,
+                 .baseArrayLayer = src_range.base.layer,
+-                .layerCount = src_layers,
++                .layerCount = copy_layers,
+             },
+             .srcOffset = {0, 0, 0},
+             .dstSubresource{
+                 .aspectMask = vk::ImageAspectFlagBits::eColor,
+                 .mipLevel = 0,
+                 .baseArrayLayer = dst_range.base.layer,
+-                .layerCount = dst_layers,
++                .layerCount = copy_layers,
+             },
+             .dstOffset = {0, 0, 0},
+             .extent = {src->info.size.width, src->info.size.height, 1},
+@@ -858,14 +855,14 @@ void Runtime::ResolveImage(VideoCore::Image* src, VideoCore::Image* dst,
+                 .aspectMask = vk::ImageAspectFlagBits::eColor,
+                 .mipLevel = 0,
+                 .baseArrayLayer = src_range.base.layer,
+-                .layerCount = src_layers,
++                .layerCount = copy_layers,
+             },
+             .srcOffset = {0, 0, 0},
+             .dstSubresource{
+                 .aspectMask = vk::ImageAspectFlagBits::eColor,
+                 .mipLevel = 0,
+                 .baseArrayLayer = dst_range.base.layer,
+-                .layerCount = dst_layers,
++                .layerCount = copy_layers,
+             },
+             .dstOffset = {0, 0, 0},
+             .extent = {src->info.size.width, src->info.size.height, 1},
+diff --git a/src/video_core/renderer_vulkan/vk_scheduler.cpp b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+index 50c43f42..bbed034c 100644
+--- a/src/video_core/renderer_vulkan/vk_scheduler.cpp
++++ b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+@@ -512,12 +512,12 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
+     }
+ #endif
+ 
++    EndSession();
++
+     if (on_submit) {
+         on_submit(info);
+     }
+ 
+-    EndSession();
+-
+     info.AddSignal(work_semaphore.Handle(), signal_value);
+     if (ring) {
+         ring->RecordControl([info, signal_value](Scheduler& scheduler) mutable {
+diff --git a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp b/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
+index f3cf8ace..4a796beb 100644
+--- a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
++++ b/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
+@@ -28,6 +28,13 @@ u64 RoundAllocationSize(u64 size) {
+     return Common::AlignUp(size, step);
+ }
+ 
++u64 RingBlockSize(MemoryType type) {
++    if (type == MemoryType::DeviceLocal) {
++        return StagingBufferPool::DEV_LOCAL_STAGING_MIBS * 1_MB;
++    }
++    return BLOCK_SIZE;
++}
++
+ } // Anonymous namespace
+ 
+ StagingBufferPool::StagingBufferPool(const Instance& instance_, Scheduler& scheduler_)
+@@ -38,7 +45,8 @@ StagingBufferPool::~StagingBufferPool() = default;
+ StagingBufferRef StagingBufferPool::Request(u64 size, MemoryType type, u64 alignment, bool deferred,
+                                             bool unsynchronized) {
+     Ring& ring = rings[u32(type)];
+-    if (deferred || size > BLOCK_SIZE) {
++    const u64 block_size = RingBlockSize(type);
++    if (deferred || size > block_size) {
+         return RequestLarge(size, type, deferred, unsynchronized);
+     }
+     return RequestFromRing(ring, size, alignment, type, unsynchronized);
+@@ -66,7 +74,7 @@ StagingBufferRef StagingBufferPool::RequestFromRing(Ring& ring, u64 size, u64 al
+         } else {
+             best = &ring.blocks.emplace_back(Block{
+                 .buffer = std::make_unique<VideoCore::StreamBuffer>(instance, scheduler, type,
+-                                                                    BLOCK_SIZE),
++                                                                    RingBlockSize(type)),
+                 .last_used_frame = frame,
+             });
+             ring.current = ring.blocks.size() - 1;
+diff --git a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.h b/src/video_core/renderer_vulkan/vk_staging_buffer_pool.h
+index c51432ac..a90b373c 100644
+--- a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.h
++++ b/src/video_core/renderer_vulkan/vk_staging_buffer_pool.h
+@@ -33,6 +33,8 @@ struct StagingBufferRef {
+ 
+ class StagingBufferPool {
+ public:
++    static constexpr size_t DEV_LOCAL_STAGING_MIBS = 256;
++
+     explicit StagingBufferPool(const Instance& instance, Scheduler& scheduler);
+     ~StagingBufferPool();
+ 
+diff --git a/src/video_core/texture_cache/tile_manager.cpp b/src/video_core/texture_cache/tile_manager.cpp
+index 70af4111..a3122faa 100644
+--- a/src/video_core/texture_cache/tile_manager.cpp
++++ b/src/video_core/texture_cache/tile_manager.cpp
+@@ -227,16 +227,20 @@ std::pair<const Buffer*, u64> TileManager::DetileImage(const VideoCore::Buffer*
+     const auto cmdbuf = scheduler.CommandBuffer();
+     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, GetTilingPipeline(info, false));
+ 
++    const u64 tiled_avail =
++        in_buffer->SizeBytes() > in_offset ? in_buffer->SizeBytes() - in_offset : 0;
+     const vk::DescriptorBufferInfo tiled_buffer_info{
+         .buffer = in_buffer->Handle(),
+         .offset = in_offset,
+-        .range = info.guest_size,
++        .range = std::min<u64>(info.guest_size, tiled_avail),
+     };
+ 
++    const u64 linear_avail =
++        staging.buffer->SizeBytes() > staging.offset ? staging.buffer->SizeBytes() - staging.offset : 0;
+     const vk::DescriptorBufferInfo linear_buffer_info{
+         .buffer = staging.buffer->Handle(),
+         .offset = staging.offset,
+-        .range = info.guest_size,
++        .range = std::min<u64>(info.guest_size, linear_avail),
+     };
+ 
+     const std::array<vk::WriteDescriptorSet, 3> set_writes = {{
+@@ -267,7 +271,8 @@ std::pair<const Buffer*, u64> TileManager::DetileImage(const VideoCore::Buffer*
+     }};
+     cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *pl_layout, 0, set_writes);
+ 
+-    const auto dim_x = (info.guest_size / (info.num_bits / 8)) / 64;
++    const auto divisor = (info.num_bits / 8) * 64;
++    const auto dim_x = divisor > 0 ? std::max(1u, static_cast<u32>(info.guest_size / divisor)) : 1u;
+     cmdbuf.dispatch(dim_x, 1, 1);
+ 
+     runtime.AccessBuffer(staging.buffer, staging.offset, info.guest_size,
+@@ -328,16 +333,20 @@ void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buff
+     const auto cmdbuf = scheduler.CommandBuffer();
+     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, GetTilingPipeline(info, true));
+ 
++    const u64 tiled_avail =
++        out_buffer->SizeBytes() > out_offset ? out_buffer->SizeBytes() - out_offset : 0;
+     const vk::DescriptorBufferInfo tiled_buffer_info{
+         .buffer = out_buffer->Handle(),
+         .offset = out_offset,
+-        .range = info.guest_size,
++        .range = std::min<u64>(info.guest_size, tiled_avail),
+     };
+ 
++    const u64 linear_avail =
++        linear_buffer->SizeBytes() > linear_offset ? linear_buffer->SizeBytes() - linear_offset : 0;
+     const vk::DescriptorBufferInfo linear_buffer_info{
+         .buffer = linear_buffer->Handle(),
+         .offset = linear_offset,
+-        .range = info.guest_size,
++        .range = std::min<u64>(info.guest_size, linear_avail),
+     };
+ 
+     const std::array<vk::WriteDescriptorSet, 3> set_writes = {{
+@@ -368,7 +377,8 @@ void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buff
+     }};
+     cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *pl_layout, 0, set_writes);
+ 
+-    const auto dim_x = (info.guest_size / (info.num_bits / 8)) / 64;
++    const auto divisor = (info.num_bits / 8) * 64;
++    const auto dim_x = divisor > 0 ? std::max(1u, static_cast<u32>(info.guest_size / divisor)) : 1u;
+     cmdbuf.dispatch(dim_x, 1, 1);
+ 
+     runtime.AccessBuffer(out_buffer, out_offset, info.guest_size,
+-- 
+2.56.0.windows.1
+

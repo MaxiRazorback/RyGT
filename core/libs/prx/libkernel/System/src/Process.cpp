@@ -338,6 +338,15 @@ int APS5_VABI sceKernelIsTrinityMode(void) {
 }
 
 int APS5_VABI sceKernelIsNeoMode(void) {
+#ifdef _WIN32
+    using Query = int (APS5_VABI*)();
+    if (const HMODULE renderer = GetModuleHandleW(L"libSceVideoOut.prx")) {
+        if (const auto query = reinterpret_cast<Query>(
+                reinterpret_cast<void*>(GetProcAddress(renderer, "WslcK1FQcGI")))) {
+            return query() == 1 ? 1 : 0;
+        }
+    }
+#endif
     return 0;
 }
 

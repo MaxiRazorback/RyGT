@@ -1,0 +1,35 @@
+From 7d3e3d823c916e928a341a0e27726ffb82fca7ce Mon Sep 17 00:00:00 2001
+From: MaxiRazorback <344630105+MaxiRazorback@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 00:32:36 -0300
+Subject: [PATCH 58/61] FIX-188: direct memory on by default again
+
+The Intel Arc patch (a05f3d2c) turned DirectMemory off for every GPU. Without
+it the native renderer copies every buffer through host upload memory, and on
+a 16 GB PC (RX 7600) a race asserted at its start: "NAT-100: no upload memory
+(11779456 bytes)". SHADGT_DIRECT=0 still turns it off (Intel Arc).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/video_core/buffer_cache/direct_memory.cpp | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/src/video_core/buffer_cache/direct_memory.cpp b/src/video_core/buffer_cache/direct_memory.cpp
+index 33a8a310..5aae2f90 100644
+--- a/src/video_core/buffer_cache/direct_memory.cpp
++++ b/src/video_core/buffer_cache/direct_memory.cpp
+@@ -98,7 +98,11 @@ bool DirectMemory::Enabled() {
+         if (const char* env = std::getenv("SHADGT_DIRECT"); env && *env) {
+             return env[0] == '1';
+         }
+-        return false;
++        // FIX-188: on by default again. The Intel Arc patch turned it off for everyone; without
++        // it the native renderer copies every buffer through host upload memory, and a 16 GB PC
++        // (RX 7600) ran out of it at the start of a race (NAT-100: no upload memory).
++        // SHADGT_DIRECT=0 turns it off (Intel Arc).
++        return true;
+     }();
+     return enabled;
+ }
+-- 
+2.56.0.windows.2
+

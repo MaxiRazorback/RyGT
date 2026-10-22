@@ -1213,6 +1213,7 @@ namespace RyGT
                 }
             };
             graphics.Controls.Add(addDlss);
+            AddDlssSharpening(graphics, dlss);
             // DLSS and FSR both upscale, so one at a time; DLSS runs in Performance mode (#61).
             fsr.CheckedChanged += delegate { if (fsr.Checked && dlss.Checked) dlss.Checked = false; };
             Action updateDlss = delegate
@@ -1250,6 +1251,12 @@ namespace RyGT
             // The direct renderer (shaders read game memory in place; Tokyo rain 42.7 fps vs 32.1)
             // is the only renderer since 2026-10-16; the old renderer's stored shaders stand in
             // while its own are built (D10), so it has no option any more.
+
+            var extras = Section(right, "Enhancements");
+            AddOption(extras, "PS4 Pro mode", "GPU", "ps4_pro", false);
+            AddOption(extras, "Draw the UI at screen resolution", "GPU", "ui_hires", false);
+            AddOption(extras, "Fast flips (no 30 fps snapping)", "GPU", "fast_flips", false);
+            AddOption(extras, "HDR (experimental; needs Windows HDR on)", "GPU", "hdr_allowed", false);
 
             // Shaders: the stored ones are built while the splash screen shows; a new one pauses
             // the game until it is compiled (instead of a stutter and missing objects).
@@ -1859,6 +1866,56 @@ namespace RyGT
             };
             row.Controls.Add(label);
             row.Controls.Add(renderer);
+            panel.Controls.Add(row);
+        }
+
+        void AddDlssSharpening(TableLayoutPanel panel, CheckBox dlss)
+        {
+            var row = new TableLayoutPanel
+            {
+                ColumnCount = 3, AutoSize = true, Dock = DockStyle.Fill,
+                Margin = new Padding(22, 2, 0, 4), MinimumSize = new Size(0, 30)
+            };
+            row.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            row.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            row.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 65));
+            var label = new Label
+            {
+                Text = "DLSS sharpening", AutoSize = true, Anchor = AnchorStyles.Left,
+                Margin = new Padding(0, 0, 4, 0)
+            };
+            var slider = new TrackBar
+            {
+                Name = "dlssSharpeningSlider", Minimum = 0, Maximum = 100,
+                BackColor = Dark.Field,
+                Value = Math.Max(0, Math.Min(100, ReadIntSetting("GPU", "dlss_sharpening", 0))),
+                SmallChange = 1, LargeChange = 10, TickStyle = TickStyle.None,
+                AutoSize = false, Height = 28, Dock = DockStyle.Fill,
+                Margin = new Padding(0), MinimumSize = new Size(80, 28),
+                AccessibleName = "DLSS sharpening"
+            };
+            var value = new Label
+            {
+                Name = "dlssSharpeningValue", AutoSize = true, Anchor = AnchorStyles.Left,
+                Margin = new Padding(4, 0, 0, 0)
+            };
+            Action refresh = delegate
+            {
+                value.Text = slider.Value == 0 ? "0% (off)" : slider.Value + "%";
+                row.Enabled = dlss.Checked && dlss.Enabled;
+            };
+            slider.ValueChanged += delegate
+            {
+                refresh();
+                try { WriteSetting("GPU", "dlss_sharpening", slider.Value); }
+                catch (Exception e) { MessageBox.Show(this, "Could not save the setting: " + e.Message); }
+            };
+            dlss.CheckedChanged += delegate { refresh(); };
+            dlss.EnabledChanged += delegate { refresh(); };
+            refresh();
+            row.Controls.Add(label, 0, 0);
+            row.Controls.Add(slider, 1, 0);
+            row.Controls.Add(value, 2, 0);
             panel.Controls.Add(row);
         }
 
