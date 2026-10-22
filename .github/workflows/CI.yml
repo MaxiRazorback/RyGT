@@ -99,7 +99,7 @@ jobs:
         run: >-
           cmake -S . -B build/windows-mingw -G Ninja
           -DCMAKE_BUILD_TYPE=Release
-          -DBUILD_TESTING=OFF
+          -DBUILD_TESTING:BOOL=OFF
           -DRTY_ENABLE_LTO=OFF
           -DRTY_BUILD_GUI=OFF
           -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
