@@ -4,6 +4,7 @@ on:
   push:
     branches: [development]
   pull_request:
+    branches: [development]
   workflow_dispatch:
 
 permissions:
@@ -15,7 +16,7 @@ concurrency:
 
 jobs:
   windows:
-    name: Runtime libraries and converter (Windows x64)
+    name: RyGT Windows x64 build
     runs-on: windows-latest
     env:
       CCACHE_DIR: ${{ github.workspace }}/.ccache
@@ -23,12 +24,12 @@ jobs:
       run:
         shell: msys2 {0}
     steps:
-      - name: Checkout with submodules
+      - name: Checkout RyGT and submodules
         uses: actions/checkout@v7
         with:
           submodules: recursive
 
-      - name: Checkout GT Adhoc toolchain
+      - name: Checkout adcpatch dependencies
         uses: actions/checkout@v7
         with:
           repository: Nenkai/GTAdhocToolchain
@@ -44,6 +45,14 @@ jobs:
           path: tools/GTToolsSharp
           submodules: recursive
 
+      - name: Checkout shadGT Vulkan renderer
+        uses: actions/checkout@v7
+        with:
+          repository: mlgprorektm8/shadGT
+          ref: 1d13c88d2e57bc63ce1586fe0b8f3342b6afdd19
+          path: renderer/shadGT
+          submodules: recursive
+
       - name: Set up MSYS2 UCRT64
         uses: msys2/setup-msys2@v2
         with:
@@ -57,27 +66,23 @@ jobs:
             mingw-w64-ucrt-x86_64-ninja
             curl
             unzip
-            zip
 
-      - name: Set up .NET 10
+      - name: Set up .NET 10 for adcpatch
         uses: actions/setup-dotnet@v5
         with:
           dotnet-version: 10.0.x
 
-      - name: Apply RyGT adcpatch changes
+      - name: Apply RyGT adcpatch patches
         run: |
           git -C tools/GTAdhocToolchain apply ../adcpatch/GTAdhocToolchain-exact-roundtrip.patch
           git -C tools/GTToolsSharp apply ../adcpatch/GTToolsSharp-read-only-open.patch
 
-      - name: Publish offline script tool
+      - name: Publish adcpatch with its script files
         shell: pwsh
         run: >-
           dotnet publish tools/adcpatch/adcpatch.csproj
           -c Release -r win-x64 --self-contained
           -p:PublishSingleFile=true -o build/adcpatch-publish
-
-      - name: Build stack dump tool
-        run: gcc -O2 -o build/stackdump.exe tools/stackdump/stackdump.c -lpsapi
 
       - name: Cache C++ compilation results
         uses: actions/cache@v4
@@ -90,14 +95,14 @@ jobs:
       - name: Reset compiler cache statistics
         run: ccache --zero-stats
 
-      - name: Get pinned FFmpeg revision
+      - name: Verify and read the pinned FFmpeg revision
         id: ffmpeg
         run: |
           set -euo pipefail
           expected="$(git ls-tree HEAD 3rdparty/ffmpeg-core | awk '{print $3}')"
           actual="$(git -C 3rdparty/ffmpeg-core rev-parse HEAD)"
           if [ ! -f 3rdparty/ffmpeg-core/CMakeLists.txt ]; then
-            echo "FFmpeg submodule is missing; check recursive checkout."
+            echo "FFmpeg submodule is missing; checkout must include recursive submodules."
             exit 1
           fi
           if [ "$actual" != "$expected" ]; then
@@ -129,7 +134,7 @@ jobs:
             test -f "$package/include/libavcodec/avcodec.h"
           fi
 
-      - name: Configure
+      - name: Configure the documented Windows build
         env:
           FFMPEG_REVISION: ${{ steps.ffmpeg.outputs.sha }}
         run: >-
@@ -141,13 +146,13 @@ jobs:
           -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
           -DFFMPEG_PREBUILT_DIR="$PWD/build/windows-mingw/externals/ffmpeg-$FFMPEG_REVISION"
 
-      - name: Build RyGT runtime and converter
-        run: cmake --build build/windows-mingw --parallel --target libs ryty ryty-wheel-probe
+      - name: Build runtime libraries, converter, wheel probe, and stackdump
+        run: |
+          mkdir -p build
+          cmake --build build/windows-mingw --parallel --target libs ryty ryty-wheel-probe
+          gcc -O2 -static -static-libgcc -o build/stackdump.exe tools/stackdump/stackdump.c -lpsapi
 
-      - name: Show compiler cache statistics
-        run: ccache --show-stats
-
-      - name: Build launcher
+      - name: Build the RyGT launcher
         shell: pwsh
         run: |
           $stage = Join-Path $env:GITHUB_WORKSPACE 'RyGT-windows-x86_64'
@@ -155,12 +160,42 @@ jobs:
           & .\loader\build.cmd $stage
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Assemble Windows app artifact
+      - name: Set up CMake and Ninja for the renderer
+        uses: lukka/get-cmake@latest
+
+      - name: Set up Visual Studio x64 environment
+        uses: egor-tensin/vs-shell@v2
+        with:
+          arch: x64
+
+      - name: Add LLVM to PATH
+        shell: pwsh
+        run: '"C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_PATH -Append'
+
+      - name: Build the documented shadGT Vulkan renderer
+        shell: pwsh
+        run: |
+          Push-Location renderer/shadGT
+          try {
+            cmake --preset x64-Clang-Release -DSHADGT_RYTY_GPU=ON
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            cmake --build Build/x64-Clang-Release --target ryty_gpu --parallel $env:NUMBER_OF_PROCESSORS
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            if (-not (Test-Path 'Build/x64-Clang-Release/libSceVideoOut.prx')) {
+              throw 'The renderer build did not produce libSceVideoOut.prx.'
+            }
+          }
+          finally {
+            Pop-Location
+          }
+
+      - name: Assemble the RyGT test app
         run: |
           set -euo pipefail
           stage="RyGT-windows-x86_64"
-          mkdir -p "$stage/libs" "$stage/converter" "$stage/launcher" "$stage/tools" "$stage/tools/adcpatch"
+          mkdir -p "$stage/libs" "$stage/converter" "$stage/launcher" "$stage/tools/adcpatch"
           find build/windows-mingw/core/libs/libs -maxdepth 1 -type f -name '*.prx' -exec cp {} "$stage/libs/" \;
+          cp renderer/shadGT/Build/x64-Clang-Release/libSceVideoOut.prx "$stage/libs/"
           cp build/windows-mingw/core/relinker/ryty.exe "$stage/converter/"
           probe="$(find build/windows-mingw -type f -name 'ryty-wheel-probe.exe' -print -quit)"
           test -n "$probe"
@@ -168,36 +203,40 @@ jobs:
           cp -a build/adcpatch-publish/. "$stage/tools/adcpatch/"
           cp build/stackdump.exe "$stage/tools/stackdump.exe"
           cp loader/launcher/background.png "$stage/launcher/"
-          cp /ucrt64/bin/libgcc_s_seh-1.dll "$stage/"
-          cp /ucrt64/bin/libstdc++-6.dll "$stage/"
-          cp /ucrt64/bin/libwinpthread-1.dll "$stage/"
-          cp /ucrt64/bin/libgcc_s_seh-1.dll "$stage/converter/"
-          cp /ucrt64/bin/libstdc++-6.dll "$stage/converter/"
-          cp /ucrt64/bin/libwinpthread-1.dll "$stage/converter/"
+          for runtime in libgcc_s_seh-1.dll libstdc++-6.dll libwinpthread-1.dll; do
+            cp "/ucrt64/bin/$runtime" "$stage/"
+            cp "/ucrt64/bin/$runtime" "$stage/converter/"
+          done
           test -f "$stage/RyGT.exe"
+          test -n "$(find "$stage/libs" -maxdepth 1 -name '*.prx' -print -quit)"
+          test -s "$stage/libs/libSceVideoOut.prx"
+          test -f "$stage/converter/ryty.exe"
+          test -f "$stage/tools/ryty-wheel-probe.exe"
           test -f "$stage/tools/adcpatch/adcpatch.exe"
           test -f "$stage/tools/adcpatch/openGrim.ad"
           test -f "$stage/tools/adcpatch/grim.ad"
           test -f "$stage/tools/stackdump.exe"
-          test -n "$(find "$stage/libs" -maxdepth 1 -name '*.prx' -print -quit)"
           cat > "$stage/README.txt" <<'EOF'
           RyGT Windows test build
 
-          Run RyGT.exe to open the launcher. It builds the launcher, converter, and RyGT runtime
-          libraries from this repository. The included launcher background is in launcher/.
+          Run RyGT.exe to open the launcher. This package contains the converter, RyGT runtime
+          libraries, wheel probe, offline script tool and its scripts, stackdump, and launcher art.
 
-          To play, you also need your own decrypted GT Sport CUSA03220 update 1.69 dump and PS4
-          firmware modules and fonts. The Vulkan renderer and AMD FSR library are not built here;
-          obtain them from a RyGT release or build shadGT as documented in the repository README.
+          This package includes shadGT's Vulkan renderer (libSceVideoOut.prx). It does not include
+          the AMD FSR library, game files, or PS4 firmware.
+          To play, use your own decrypted GT Sport CUSA03220 update 1.69 dump and firmware files,
+          and install a Vulkan-capable graphics driver.
 
-          See docs/gt-sport/README.md in the RyGT repository for setup instructions.
+          Setup instructions: https://github.com/mlgprorektm8/RyGT/blob/development/docs/gt-sport/README.md
           EOF
-          zip -qr RyGT-windows-x86_64.zip "$stage"
 
-      - name: Upload build artifact
+      - name: Show compiler cache statistics
+        run: ccache --show-stats
+
+      - name: Upload downloadable RyGT test app
         uses: actions/upload-artifact@v7
         with:
           name: RyGT-windows-x86_64
-          path: RyGT-windows-x86_64.zip
+          path: RyGT-windows-x86_64/**
           if-no-files-found: error
           retention-days: 14
