@@ -172,3 +172,30 @@ R92CP in the garage and in races). They are older than these patches and do not 
 RenderDoc replay of the same frame. Ruled out so far: FIX-191, image recycling, MSAA, draw-to-draw
 barriers, finishing the GPU after every draw, the staging ring, zero-filled new images, present
 FSR and zeroed undefined shader registers.
+
+## Radeon RX 400 to RX 9000 (0065)
+
+Patch 0065 applies after 0064. The fixes above were checked against the Vulkan reports of each
+Radeon generation's newest Windows driver on vulkan.gpuinfo.org: RX 580 and RX Vega (2.0.283,
+Vulkan 1.3.264), RX 5700 XT and RX 6800 (2.0.353), RX 7600 (2.0.406) and RX 9070 XT (2.0.416).
+Every generation has what the renderer requires (Vulkan 1.3, push descriptors, vertex attribute
+divisor, robustness2). FIX-189 and FIX-211 ask the driver per format, so they follow each card.
+The texture formats the RX 7600 cannot use (96-bit R32G32B32, signed 10-bit A2B10G10R10) are
+missing on every Radeon, and GT Sport's logs show no textures made in them.
+- AMD-301: the 64-wide subgroup requirement goes only to stages the driver lists
+  (`requiredSubgroupSizeStages`: compute on every Radeon, fragment from RX 7000 on). It was
+  given to every graphics stage, which the Vulkan spec does not allow.
+- AMD-302: RX 400/500 have no `shaderFloat16`; translated shaders that use 16-bit floats declare
+  Float16, so `VK_AMD_gpu_shader_half_float` (on every Radeon) is enabled in that case.
+- XESS-210: if XeSS does not start on a GPU, temporal upscaling switches to FSR 3.1.
+- AMD-300 (test switch): `SHADGT_SIMULATE_GPU=gcn|rdna1|rdna2` makes the device report only what
+  an RX 400/500/Vega, RX 5000 or RX 6000 driver offers; `SHADGT_SIMULATE_SKIP=<item>,...` keeps
+  items real (extension names, `f16`, `gpl`, `v3d`, `af2`, `sub`, `push`, `driver`).
+
+Tested on an RX 7600: races with 0065, and the simulated RX 400/500, RX 5000 and RX 6000 paths to
+the menus. A full RX 400/500 simulation (both `VK_EXT_graphics_pipeline_library` and
+`VK_EXT_vertex_input_dynamic_state` off in the driver) loses the device in a compute dispatch,
+while the same renderer paths with the extensions still enabled in the driver render. That points
+at the RDNA 3 driver in that mode rather than the renderer; RX 400/500 run AMD's separate legacy
+driver, so only a real card can confirm them. The buffer cache's 4 GB sparse arena pages exceed
+the 2 GB `maxBufferSize` every Radeon reports; RDNA 3's driver accepts them.
