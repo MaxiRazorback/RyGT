@@ -106,7 +106,7 @@ jobs:
           -DFFMPEG_PREBUILT_DIR="$PWD/build/windows-mingw/externals/ffmpeg-$FFMPEG_REVISION"
 
       - name: Build RyGT runtime and converter
-        run: cmake --build build/windows-mingw --parallel --target libs ryty
+        run: cmake --build build/windows-mingw --parallel --target libs ryty ryty-wheel-probe
 
       - name: Show compiler cache statistics
         run: ccache --show-stats
@@ -123,9 +123,12 @@ jobs:
         run: |
           set -euo pipefail
           stage="RyGT-windows-x86_64"
-          mkdir -p "$stage/libs" "$stage/converter" "$stage/launcher"
+          mkdir -p "$stage/libs" "$stage/converter" "$stage/launcher" "$stage/tools"
           find build/windows-mingw/core/libs/libs -maxdepth 1 -type f -name '*.prx' -exec cp {} "$stage/libs/" \;
           cp build/windows-mingw/core/relinker/ryty.exe "$stage/converter/"
+          probe="$(find build/windows-mingw -type f -name 'ryty-wheel-probe.exe' -print -quit)"
+          test -n "$probe"
+          cp "$probe" "$stage/tools/ryty-wheel-probe.exe"
           cp loader/launcher/background.png "$stage/launcher/"
           cp /ucrt64/bin/libgcc_s_seh-1.dll "$stage/"
           cp /ucrt64/bin/libstdc++-6.dll "$stage/"
