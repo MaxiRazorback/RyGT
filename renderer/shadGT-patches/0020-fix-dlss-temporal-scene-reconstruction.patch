@@ -1,0 +1,1069 @@
+From e167cef2c592ee2273a52d947c0b4dd30e56963b Mon Sep 17 00:00:00 2001
+From: WillScarlettOhara <leilumultipass@gmail.com>
+Date: Tue, 20 Oct 2026 23:51:33 +0200
+Subject: [PATCH] fix(dlss): reconstruct scene with temporal inputs before HUD
+
+---
+ ryty_gpu/RytyGpu.cmake                        |   1 +
+ ryty_gpu/rygt_dlss_api.h                      |  51 ++-
+ ryty_gpu/ryty_dlss.cpp                        |  57 +++-
+ ryty_gpu/ryty_dlss.h                          |   8 +
+ ryty_gpu/ryty_game_patch.cpp                  |   8 +
+ ryty_gpu/ryty_gts_dlss.cpp                    | 314 ++++++++++++++++++
+ ryty_gpu/ryty_gts_dlss.h                      |  66 ++++
+ src/core/emulator_settings.h                  |   7 +-
+ .../renderer_vulkan/vk_presenter.cpp          |  16 +-
+ .../renderer_vulkan/vk_rasterizer.cpp         | 140 +++++++-
+ .../renderer_vulkan/vk_rasterizer.h           |  14 +
+ src/video_core/texture_cache/blit_helper.cpp  |  16 +-
+ src/video_core/texture_cache/blit_helper.h    |   5 +
+ 13 files changed, 690 insertions(+), 13 deletions(-)
+ create mode 100644 ryty_gpu/ryty_gts_dlss.cpp
+ create mode 100644 ryty_gpu/ryty_gts_dlss.h
+
+diff --git a/ryty_gpu/RytyGpu.cmake b/ryty_gpu/RytyGpu.cmake
+index d21f913f..5dacab78 100644
+--- a/ryty_gpu/RytyGpu.cmake
++++ b/ryty_gpu/RytyGpu.cmake
+@@ -106,6 +106,7 @@ ryty_add_library(ryty_gpu libSceVideoOut
+         ryty_gpu/ryty_diag.cpp
+         # NVIDIA DLSS through the optional plugin dlss\ryGT_dlss.dll (ryty_dlss.h).
+         ryty_gpu/ryty_dlss.cpp
++        ryty_gpu/ryty_gts_dlss.cpp
+         # AMD FSR 3.1 through amd_fidelityfx_vk.dll (ryty_fsr3.h).
+         ryty_gpu/ryty_fsr3.cpp
+         # AMD FSR 3.1 frame generation (ryty_framegen.h).
+diff --git a/ryty_gpu/rygt_dlss_api.h b/ryty_gpu/rygt_dlss_api.h
+index ce567e1b..5b3ca6f3 100644
+--- a/ryty_gpu/rygt_dlss_api.h
++++ b/ryty_gpu/rygt_dlss_api.h
+@@ -5,8 +5,6 @@
+ // not allow it inside the GPL renderer, so the renderer only loads the plugin at run time when the
+ // DLSS option is on and the plugin is present. Plain C; Vulkan handles are passed as is.
+ //
+-// The renderer hands DLSS the finished game picture (no motion vectors or depth exist at that
+-// point), so the plugin runs DLSS with zero motion vectors and resets its history every frame.
+ 
+ #pragma once
+ 
+@@ -18,6 +16,7 @@ extern "C" {
+ #endif
+ 
+ #define RYGT_DLSS_API_VERSION 1
++#define RYGT_DLSS_TEMPORAL_API_VERSION 2
+ 
+ typedef struct RygtDlssImage {
+     VkImage image;
+@@ -62,6 +61,54 @@ typedef void(VKAPI_PTR* PFN_RygtDlss_Shutdown)(void);
+ // The last error, for the log.
+ typedef const char*(VKAPI_PTR* PFN_RygtDlss_LastError)(void);
+ 
++typedef enum RygtDlssQuality {
++    RYGT_DLSS_QUALITY_DLAA = 0,
++    RYGT_DLSS_QUALITY_QUALITY = 1,
++    RYGT_DLSS_QUALITY_BALANCED = 2,
++    RYGT_DLSS_QUALITY_PERFORMANCE = 3,
++    RYGT_DLSS_QUALITY_ULTRA_PERFORMANCE = 4
++} RygtDlssQuality;
++
++typedef enum RygtDlssFrameFlags {
++    RYGT_DLSS_FRAME_HDR = 1u << 0,
++    RYGT_DLSS_FRAME_DEPTH_INVERTED = 1u << 1,
++    RYGT_DLSS_FRAME_MOTION_JITTERED = 1u << 2,
++    RYGT_DLSS_FRAME_MOTION_OUTPUT_RESOLUTION = 1u << 3,
++    RYGT_DLSS_FRAME_RESET = 1u << 4,
++    RYGT_DLSS_FRAME_AUTO_EXPOSURE = 1u << 5
++} RygtDlssFrameFlags;
++
++typedef struct RygtDlssOptimalSettings {
++    uint32_t struct_size;
++    uint32_t optimal_width, optimal_height;
++    uint32_t minimum_width, minimum_height;
++    uint32_t maximum_width, maximum_height;
++} RygtDlssOptimalSettings;
++
++typedef struct RygtDlssFrame {
++    uint32_t struct_size;
++    uint32_t version;
++    uint64_t frame_id;
++    RygtDlssImage color;
++    RygtDlssImage depth;
++    RygtDlssImage motion;
++    RygtDlssImage output;
++    RygtDlssQuality quality;
++    uint32_t flags;
++    float jitter_x, jitter_y;
++    float motion_scale_x, motion_scale_y;
++    float pre_exposure, exposure_scale;
++    float frame_time_ms;
++} RygtDlssFrame;
++
++typedef int(VKAPI_PTR* PFN_RygtDlss_TemporalApiVersion)(void);
++typedef int(VKAPI_PTR* PFN_RygtDlss_GetOptimalSettings)(
++    uint32_t outputWidth, uint32_t outputHeight, RygtDlssQuality quality,
++    RygtDlssOptimalSettings* settings);
++
++typedef int(VKAPI_PTR* PFN_RygtDlss_EvaluateTemporal)(VkCommandBuffer cmd,
++                                                   const RygtDlssFrame* frame);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/ryty_gpu/ryty_dlss.cpp b/ryty_gpu/ryty_dlss.cpp
+index 48c00705..126e4fd4 100644
+--- a/ryty_gpu/ryty_dlss.cpp
++++ b/ryty_gpu/ryty_dlss.cpp
+@@ -5,6 +5,7 @@
+ 
+ #include <algorithm>
+ #include <cstring>
++#include <cstdlib>
+ #include <string>
+ 
+ #include "common/logging/log.h"
+@@ -26,6 +27,9 @@ struct Plugin {
+     PFN_RygtDlss_Evaluate evaluate{};
+     PFN_RygtDlss_Shutdown shutdown{};
+     PFN_RygtDlss_LastError last_error{};
++    PFN_RygtDlss_TemporalApiVersion temporal_version{};
++    PFN_RygtDlss_GetOptimalSettings optimal_settings{};
++    PFN_RygtDlss_EvaluateTemporal evaluate_temporal{};
+     bool tried{};
+     bool ready{}; // Init succeeded
+ };
+@@ -37,6 +41,26 @@ std::string LastError() {
+ 
+ } // namespace
+ 
++bool TemporalRequested() {
++    static const bool requested = [] {
++        const char* value = std::getenv("SHADGT_DLSS_TEMPORAL");
++        return value ? std::strcmp(value, "1") == 0 : EmulatorSettings.IsDlssEnabled();
++    }();
++    return requested;
++}
++
++RygtDlssQuality Quality() {
++    const char* overrideMode = std::getenv("SHADGT_DLSS_QUALITY");
++    const auto mode = overrideMode ? std::string{overrideMode} : EmulatorSettings.GetDlssQuality();
++    if (mode == "ultra_performance") return RYGT_DLSS_QUALITY_ULTRA_PERFORMANCE;
++    if (mode == "performance") return RYGT_DLSS_QUALITY_PERFORMANCE;
++    if (mode == "balanced") return RYGT_DLSS_QUALITY_BALANCED;
++    if (mode == "quality") return RYGT_DLSS_QUALITY_QUALITY;
++    if (mode == "dlaa") return RYGT_DLSS_QUALITY_DLAA;
++    LOG_WARNING(Render_Vulkan, "Temporal DLSS: unknown mode '{}'; using Performance", mode);
++    return RYGT_DLSS_QUALITY_PERFORMANCE;
++}
++
+ bool Load() {
+     if (g_plugin.tried) {
+         return g_plugin.module != nullptr;
+@@ -75,6 +99,9 @@ bool Load() {
+     LOAD(evaluate, "RygtDlss_Evaluate");
+     LOAD(shutdown, "RygtDlss_Shutdown");
+     LOAD(last_error, "RygtDlss_LastError");
++    LOAD(temporal_version, "RygtDlss_TemporalApiVersion");
++    LOAD(optimal_settings, "RygtDlss_GetOptimalSettings");
++    LOAD(evaluate_temporal, "RygtDlss_EvaluateTemporal");
+ #undef LOAD
+     if (!g_plugin.get_instance_extensions || !g_plugin.get_device_extensions || !g_plugin.init ||
+         !g_plugin.supports || !g_plugin.evaluate || !g_plugin.shutdown || !g_plugin.last_error) {
+@@ -146,6 +173,10 @@ bool Init(vk::Instance instance, vk::PhysicalDevice physical_device, vk::Device
+     }
+     g_plugin.ready = true;
+     LOG_INFO(Render_Vulkan, "ryGT DLSS: ready");
++    if (TemporalRequested()) {
++        LOG_INFO(Render_Vulkan, "ryGT DLSS: temporal interface v2 {}",
++                 TemporalEnabled() ? "armed; waiting for a matching scene" : "unavailable; keeping spatial fallback");
++    }
+     return true;
+ }
+ 
+@@ -156,6 +187,30 @@ void Shutdown() {
+     }
+ }
+ 
++bool TemporalEnabled() {
++    return TemporalRequested() && g_plugin.ready && g_plugin.temporal_version &&
++           g_plugin.temporal_version() == RYGT_DLSS_TEMPORAL_API_VERSION &&
++           g_plugin.optimal_settings && g_plugin.evaluate_temporal;
++}
++
++bool GetOptimalSettings(u32 width, u32 height, RygtDlssQuality quality,
++                        RygtDlssOptimalSettings& settings) {
++    settings = {.struct_size = sizeof(settings)};
++    return TemporalEnabled() &&
++           g_plugin.optimal_settings(width, height, quality, &settings) == 0;
++}
++
++bool EvaluateTemporal(vk::CommandBuffer cmdbuf, const RygtDlssFrame& frame) {
++    if (!TemporalEnabled()) {
++        return false;
++    }
++    if (g_plugin.evaluate_temporal(cmdbuf, &frame) != 0) {
++        LOG_ERROR(Render_Vulkan, "ryGT temporal DLSS: {}", LastError());
++        return false;
++    }
++    return true;
++}
++
+ void Pass::Create(vk::Device device_, VmaAllocator allocator, u32 num_images) {
+     device = device_;
+     available_imgs.resize(num_images);
+@@ -168,7 +223,7 @@ void Pass::Create(vk::Device device_, VmaAllocator allocator, u32 num_images) {
+ vk::ImageView Pass::Render(vk::CommandBuffer cmdbuf, vk::Image input_image, vk::ImageView input,
+                            vk::Format input_format, vk::Extent2D input_size,
+                            vk::Extent2D output_size) {
+-    if (!g_plugin.ready || failed) {
++    if (!g_plugin.ready || failed || TemporalRequested()) {
+         return input;
+     }
+     if (!g_plugin.supports(input_size.width, input_size.height, output_size.width,
+diff --git a/ryty_gpu/ryty_dlss.h b/ryty_gpu/ryty_dlss.h
+index 3855d5e0..9a33fb2e 100644
+--- a/ryty_gpu/ryty_dlss.h
++++ b/ryty_gpu/ryty_dlss.h
+@@ -14,6 +14,7 @@
+ #include "common/types.h"
+ #include "video_core/renderer_vulkan/vk_common.h"
+ #include "video_core/texture_cache/image.h"
++#include "ryty_gpu/rygt_dlss_api.h"
+ 
+ namespace Vulkan::RytyDlss {
+ 
+@@ -34,6 +35,13 @@ bool Init(vk::Instance instance, vk::PhysicalDevice physical_device, vk::Device
+ /// Releases DLSS; the device must be idle.
+ void Shutdown();
+ 
++bool TemporalRequested();
++bool TemporalEnabled();
++RygtDlssQuality Quality();
++bool GetOptimalSettings(u32 width, u32 height, RygtDlssQuality quality,
++                        RygtDlssOptimalSettings& settings);
++bool EvaluateTemporal(vk::CommandBuffer cmdbuf, const RygtDlssFrame& frame);
++
+ /// Scales the game picture into an output image at the window size, like the FSR pass.
+ class Pass {
+ public:
+diff --git a/ryty_gpu/ryty_game_patch.cpp b/ryty_gpu/ryty_game_patch.cpp
+index 86fb44bb..73c42d8d 100644
+--- a/ryty_gpu/ryty_game_patch.cpp
++++ b/ryty_gpu/ryty_game_patch.cpp
+@@ -1098,6 +1098,14 @@ void InstallMirrorHalfRate(u8* base) {
+     if (!wanted) {
+         return;
+     }
++    bool temporal = ConfigFlag("dlss_enabled", false);
++    if (const char* overrideMode = std::getenv("SHADGT_DLSS_TEMPORAL")) {
++        temporal = std::strcmp(overrideMode, "1") == 0;
++    }
++    if (temporal) {
++        std::fprintf(stderr, "[patch] GTS-008: half-rate mirror disabled for temporal DLSS motion continuity\n");
++        return;
++    }
+     constexpr u64 kSite = 0x111011a; // RVA of "cmp byte ptr [r13+0x5a8], 0"
+     static const u8 kOriginal[] = {0x41, 0x80, 0xbd, 0xa8, 0x05, 0x00, 0x00, 0x00};
+     u8* site = base + kSite;
+diff --git a/ryty_gpu/ryty_gts_dlss.cpp b/ryty_gpu/ryty_gts_dlss.cpp
+new file mode 100644
+index 00000000..e70a031d
+--- /dev/null
++++ b/ryty_gpu/ryty_gts_dlss.cpp
+@@ -0,0 +1,314 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++#include <algorithm>
++#include <cmath>
++#include <cstdlib>
++#include "common/logging/log.h"
++#include "ryty_gpu/ryty_gts_dlss.h"
++#include "video_core/renderer_vulkan/vk_instance.h"
++#include "video_core/renderer_vulkan/vk_runtime.h"
++#include "video_core/renderer_vulkan/vk_platform.h"
++
++namespace Vulkan {
++namespace {
++vk::Extent2D Size(const VideoCore::Image& image) {
++    return {image.info.size.width, image.info.size.height};
++}
++constexpr vk::ImageSubresourceLayers ColorLayer{vk::ImageAspectFlagBits::eColor, 0, 0, 1};
++vk::ImageBlit Blit(vk::Extent2D from, vk::Extent2D to) {
++    return {.srcSubresource = ColorLayer,
++            .srcOffsets = std::array{vk::Offset3D{0, 0, 0},
++                                    vk::Offset3D{s32(from.width), s32(from.height), 1}},
++            .dstSubresource = ColorLayer,
++            .dstOffsets = std::array{vk::Offset3D{0, 0, 0},
++                                    vk::Offset3D{s32(to.width), s32(to.height), 1}}};
++}
++} // namespace
++
++GtsDlssPass::GtsDlssPass(const Instance& gpuInstance, Scheduler& gpuScheduler, Runtime& gpuRuntime)
++    : instance{gpuInstance}, scheduler{gpuScheduler}, runtime{gpuRuntime} {
++    quality = RytyDlss::Quality();
++}
++
++RygtDlssImage GtsDlssPass::Texture::Descriptor() const {
++    return {static_cast<VkImage>(static_cast<vk::Image>(image)),
++            static_cast<VkImageView>(view.get()), static_cast<VkFormat>(format),
++            size.width, size.height};
++}
++
++void GtsDlssPass::create(Texture& t, vk::Format format, vk::Extent2D size,
++                          vk::ImageAspectFlags aspects) {
++    t.view.reset();
++    t.presentView.reset();
++    t.image.Destroy();
++    t.image = VideoCore::UniqueImage{instance.GetDevice(), instance.GetAllocator()};
++    t.format = format;
++    t.size = size;
++    t.aspects = aspects;
++    t.layout = vk::ImageLayout::eUndefined;
++    auto usage = vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eTransferSrc |
++                 vk::ImageUsageFlagBits::eTransferDst;
++    if (aspects == vk::ImageAspectFlagBits::eColor) {
++        usage |= vk::ImageUsageFlagBits::eColorAttachment;
++        if (format == vk::Format::eR16G16B16A16Sfloat) usage |= vk::ImageUsageFlagBits::eStorage;
++    }
++    t.image.Create({.flags = vk::ImageCreateFlagBits::eMutableFormat,
++                    .imageType = vk::ImageType::e2D,
++                    .format = format,
++                    .extent = {size.width, size.height, 1},
++                    .mipLevels = 1,
++                    .arrayLayers = 1,
++                    .samples = vk::SampleCountFlagBits::e1,
++                    .usage = usage});
++    t.view = Check<"create temporal scene view">(instance.GetDevice().createImageViewUnique({
++        .image = t.image,
++        .viewType = vk::ImageViewType::e2D,
++        .format = format,
++        .subresourceRange = {.aspectMask = aspects & ~vk::ImageAspectFlagBits::eStencil,
++                             .levelCount = 1, .layerCount = 1}}));
++}
++
++void GtsDlssPass::transit(Texture& t, vk::ImageLayout layout) {
++    const vk::ImageMemoryBarrier2 barrier{
++        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
++        .srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
++        .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
++        .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
++        .oldLayout = t.layout, .newLayout = layout, .image = t.image,
++        .subresourceRange = {.aspectMask = t.aspects, .levelCount = 1, .layerCount = 1}};
++    scheduler.CommandBuffer().pipelineBarrier2(vk::DependencyInfo{
++        .imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &barrier});
++    t.layout = layout;
++}
++
++void GtsDlssPass::copyInput(VideoCore::Image& source, Texture& dest) {
++    scheduler.EndRendering();
++    runtime.Transit(&source, vk::ImageLayout::eTransferSrcOptimal,
++                    vk::PipelineStageFlagBits2::eCopy, vk::AccessFlagBits2::eTransferRead);
++    runtime.FlushBarriers();
++    transit(dest, vk::ImageLayout::eTransferDstOptimal);
++    const auto aspect = dest.aspects & ~vk::ImageAspectFlagBits::eStencil;
++    const vk::ImageCopy region{.srcSubresource = {aspect, 0, 0, 1},
++                               .dstSubresource = {aspect, 0, 0, 1},
++                               .extent = {renderSize.width, renderSize.height, 1}};
++    scheduler.CommandBuffer().copyImage(source.GetImage(), vk::ImageLayout::eTransferSrcOptimal,
++        dest.image, vk::ImageLayout::eTransferDstOptimal, region);
++    transit(dest, vk::ImageLayout::eShaderReadOnlyOptimal);
++}
++
++bool GtsDlssPass::Capture(u64 frame, VideoCore::Image& color, VideoCore::Image& sourceDepth,
++                         VideoCore::Image& sourceMotion, VideoCore::Image& resolved,
++                         const std::array<float, 28>& constants) {
++    if (!RytyDlss::TemporalEnabled() || failed || !supportedDisplay || requestedSize.width == 0 ||
++        scheduler.ThreadRing() || sceneFrame == frame) return false;
++    const auto input = Size(color);
++    const auto output = quality == RYGT_DLSS_QUALITY_DLAA ? input : requestedSize;
++    if (input != renderSize || output != outputSize || depth.format != sourceDepth.info.pixel_format) {
++        RygtDlssOptimalSettings settings{};
++        if (!RytyDlss::GetOptimalSettings(output.width, output.height, quality, settings) ||
++            input.width < settings.minimum_width || input.height < settings.minimum_height ||
++            input.width > settings.maximum_width || input.height > settings.maximum_height) {
++            LOG_WARNING(Render_Vulkan, "Temporal DLSS: {}x{} is outside mode {} for {}x{}; keeping game TAA",
++                        input.width, input.height, u32(quality), output.width, output.height);
++            failed = true;
++            return false;
++        }
++        scheduler.EndRendering();
++        runtime.FlushBarriers();
++        scheduler.Finish();
++        renderSize = input;
++        outputSize = output;
++        create(this->color, color.info.pixel_format, input);
++        create(depth, sourceDepth.info.pixel_format, input, sourceDepth.aspect_mask);
++        create(motion, sourceMotion.info.pixel_format, input);
++        create(reconstruction, vk::Format::eR16G16B16A16Sfloat, output);
++        create(native, vk::Format::eA2B10G10R10UnormPack32, output);
++        reconstruction.presentView = Check<"create DLSS BGR copy view">(
++            instance.GetDevice().createImageViewUnique({
++                .image = reconstruction.image, .viewType = vk::ImageViewType::e2D,
++                .format = reconstruction.format,
++                .components = {.r = vk::ComponentSwizzle::eB, .g = vk::ComponentSwizzle::eG,
++                               .b = vk::ComponentSwizzle::eR, .a = vk::ComponentSwizzle::eOne},
++                .subresourceRange = {.aspectMask = vk::ImageAspectFlagBits::eColor,
++                                     .levelCount = 1, .layerCount = 1}}));
++        if (!colorCopy) colorCopy = std::make_unique<VideoCore::BlitHelper>(instance, scheduler);
++        reset = true;
++        LOG_INFO(Render_Vulkan, "Temporal DLSS: actual scene {}x{} -> {}x{}, preset M, mode {}",
++                 input.width, input.height, output.width, output.height, u32(quality));
++    }
++    const auto now = std::chrono::steady_clock::now();
++    if (lastScene.time_since_epoch().count()) {
++        frameTimeMs = std::clamp(std::chrono::duration<float, std::milli>(now-lastScene).count(),
++                                   0.01f, 1000.f);
++        reset |= frameTimeMs > 250.f;
++    }
++    lastScene = now;
++    reset |= sceneFrame == ~u64{} || frame != sceneFrame + 1;
++    sceneFrame = frame;
++    sceneUid = resolved.image_uid;
++    outputFrame = ~u64{};
++    displayUid = 0;
++    jitterX = constants[20] * constants[14];
++    jitterY = constants[21] * constants[15];
++    copyInput(sourceDepth, depth);
++    copyInput(sourceMotion, motion);
++    copyInput(color, this->color);
++    return true;
++}
++
++bool GtsDlssPass::HasScene(u64 frame, u64 uid) const {
++    return !failed && sceneFrame == frame && sceneUid == uid && outputFrame != frame;
++}
++
++void GtsDlssPass::PrepareScene(u64 frame, VideoCore::Image& resolved) {
++    if (!HasScene(frame, resolved.image_uid)) return;
++    const auto previous = resolved.backing->state;
++    scheduler.EndRendering();
++    transit(color, vk::ImageLayout::eTransferSrcOptimal);
++    runtime.Transit(&resolved, vk::ImageLayout::eTransferDstOptimal,
++                    vk::PipelineStageFlagBits2::eCopy, vk::AccessFlagBits2::eTransferWrite);
++    runtime.FlushBarriers();
++    const vk::ImageCopy region{.srcSubresource = ColorLayer, .dstSubresource = ColorLayer,
++                              .extent = {renderSize.width, renderSize.height, 1}};
++    scheduler.CommandBuffer().copyImage(color.image, vk::ImageLayout::eTransferSrcOptimal,
++        resolved.GetImage(), vk::ImageLayout::eTransferDstOptimal, region);
++    resolved.MarkGpuModified();
++    runtime.Transit(&resolved, previous.layout, previous.pl_stage, previous.access_mask);
++    runtime.FlushBarriers();
++}
++
++void GtsDlssPass::Resolve(u64 frame, VideoCore::Image& display) {
++    if (failed || frame != sceneFrame || outputFrame == frame || Size(display) != renderSize ||
++        display.info.pixel_format != vk::Format::eA2B10G10R10UnormPack32) return;
++    scheduler.EndRendering();
++    runtime.Transit(&display, vk::ImageLayout::eShaderReadOnlyOptimal,
++                    vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderRead);
++    runtime.FlushBarriers();
++    transit(reconstruction, vk::ImageLayout::eGeneral);
++    VideoCore::ImageViewInfo viewInfo{};
++    viewInfo.format = vk::Format::eA2R10G10B10UnormPack32;
++    const auto view = *display.FindView(viewInfo).image_view;
++    RygtDlssFrame desc{};
++    desc.struct_size = sizeof(desc);
++    desc.version = RYGT_DLSS_TEMPORAL_API_VERSION;
++    desc.frame_id = frame;
++    desc.color = {static_cast<VkImage>(display.GetImage()), static_cast<VkImageView>(view),
++                  static_cast<VkFormat>(viewInfo.format),
++                  renderSize.width, renderSize.height};
++    desc.depth = depth.Descriptor();
++    desc.motion = motion.Descriptor();
++    desc.output = reconstruction.Descriptor();
++    desc.quality = quality;
++    desc.flags = reset ? RYGT_DLSS_FRAME_RESET : 0;
++    desc.jitter_x = jitterX; desc.jitter_y = jitterY;
++    desc.motion_scale_x = -float(renderSize.width) * .5f;
++    desc.motion_scale_y = float(renderSize.height) * .5f;
++    desc.pre_exposure = 1.f; desc.exposure_scale = 1.f;
++    desc.frame_time_ms = frameTimeMs;
++    const bool ok = RytyDlss::EvaluateTemporal(scheduler.DirectCommandBuffer(), desc);
++    scheduler.GetDynamicState().Invalidate();
++    if (!ok) { failed = true; return; }
++    ++evaluatedFrames;
++    static u32 loggedFrames = 0;
++    if (loggedFrames++ < 8) {
++        LOG_INFO(Render_Vulkan, "Temporal DLSS: frame {} reset {} jitter ({}, {}) MV scale ({}, {})",
++                 frame, reset, jitterX, jitterY, desc.motion_scale_x, desc.motion_scale_y);
++    }
++    reset = false;
++    transit(reconstruction, vk::ImageLayout::eShaderReadOnlyOptimal);
++    transit(native, vk::ImageLayout::eColorAttachmentOptimal);
++    colorCopy->CopyColorViews(outputSize, native.format, reconstruction.presentView.get(), native.view.get());
++    displayUid = display.image_uid;
++    outputFrame = frame;
++    nativeDirty = true;
++}
++
++bool GtsDlssPass::isActive(u64 frame, u64 uid) const {
++    return !failed && uid && uid == displayUid && frame == outputFrame;
++}
++
++bool GtsDlssPass::OverrideHud(u64 frame, u64 uid, RenderState& state) {
++    if (!isActive(frame, uid) || state.num_color_attachments != 1 ||
++        state.depth_stencil_attachment.has_depth || state.depth_stencil_attachment.has_stencil) return false;
++    state.width = outputSize.width;
++    state.height = outputSize.height;
++    state.color_attachments[0].image_view = native.view.get();
++    state.color_attachments[0].image_layout = vk::ImageLayout::eColorAttachmentOptimal;
++    state.color_attachments[0].is_clear = 0;
++    nativeDirty = true;
++    ++nativeHudDraws;
++    return true;
++}
++
++void GtsDlssPass::SyncGuestRead(u64 frame, VideoCore::Image& display) {
++    if (!isActive(frame, display.image_uid) || !nativeDirty) return;
++    const auto previous = display.backing->state;
++    copyBack(display);
++    ++guestSyncs;
++    runtime.Transit(&display, previous.layout, previous.pl_stage, previous.access_mask);
++    runtime.FlushBarriers();
++    transit(native, vk::ImageLayout::eColorAttachmentOptimal);
++}
++
++void GtsDlssPass::FallbackHud(u64 frame, VideoCore::Image& display, vk::ImageLayout restoreLayout) {
++    if (!isActive(frame, display.image_uid)) return;
++    copyBack(display);
++    runtime.Transit(&display, restoreLayout, vk::PipelineStageFlagBits2::eAllCommands,
++                    vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite);
++    runtime.FlushBarriers();
++    outputFrame = ~u64{};
++    ++fallbacks;
++    static bool logged = false;
++    if (!logged) {
++        LOG_WARNING(Render_Vulkan, "Temporal DLSS: unsupported HUD attachment; using guest-sized composition for this frame");
++        logged = true;
++    }
++}
++
++void GtsDlssPass::ScaleHud(u64 frame, u64 uid, Viewports& viewports, Scissors& scissors) const {
++    if (!isActive(frame, uid)) return;
++    const float sx = float(outputSize.width) / renderSize.width;
++    const float sy = float(outputSize.height) / renderSize.height;
++    for (auto& v : viewports) { v.x *= sx; v.width *= sx; v.y *= sy; v.height *= sy; }
++    for (auto& s : scissors) {
++        const s32 left = std::clamp<s32>(std::floor(s.offset.x*sx), 0, outputSize.width);
++        const s32 top = std::clamp<s32>(std::floor(s.offset.y*sy), 0, outputSize.height);
++        const s32 right = std::clamp<s32>(std::ceil((float(s.offset.x)+s.extent.width)*sx), left, outputSize.width);
++        const s32 bottom = std::clamp<s32>(std::ceil((float(s.offset.y)+s.extent.height)*sy), top, outputSize.height);
++        s = vk::Rect2D{{left, top}, {u32(right-left), u32(bottom-top)}};
++    }
++}
++
++void GtsDlssPass::copyBack(VideoCore::Image& display) {
++    scheduler.EndRendering();
++    transit(native, vk::ImageLayout::eTransferSrcOptimal);
++    runtime.Transit(&display, vk::ImageLayout::eTransferDstOptimal,
++                    vk::PipelineStageFlagBits2::eBlit, vk::AccessFlagBits2::eTransferWrite);
++    runtime.FlushBarriers();
++    scheduler.DirectCommandBuffer().blitImage(native.image, vk::ImageLayout::eTransferSrcOptimal,
++        display.GetImage(), vk::ImageLayout::eTransferDstOptimal, Blit(outputSize, renderSize), vk::Filter::eLinear);
++    display.MarkGpuModified();
++    nativeDirty = false;
++}
++
++vk::ImageView GtsDlssPass::PreparePresent(u64 frame, VideoCore::Image& display, vk::Format viewFormat) {
++    if (!isActive(frame, display.image_uid)) return {};
++    if (nativeDirty) copyBack(display);
++    transit(native, vk::ImageLayout::eShaderReadOnlyOptimal);
++    ++nativePresentations;
++    if (nativePresentations == 1 || nativePresentations % 600 == 0) {
++        LOG_INFO(Render_Vulkan,
++                 "Temporal DLSS: presenting {}x{}; evaluated {}, native presentations {}, native HUD draws {}, guest reads {}, fallbacks {}",
++                 outputSize.width, outputSize.height, evaluatedFrames, nativePresentations,
++                 nativeHudDraws, guestSyncs, fallbacks);
++    }
++    if (!native.presentView) {
++        native.presentView = Check<"create temporal presentation view">(
++            instance.GetDevice().createImageViewUnique({
++                .image = native.image, .viewType = vk::ImageViewType::e2D,
++                .format = viewFormat, .components = {.a = vk::ComponentSwizzle::eOne},
++                .subresourceRange = {.aspectMask = vk::ImageAspectFlagBits::eColor,
++                                     .levelCount = 1, .layerCount = 1}}));
++    }
++    return native.presentView.get();
++}
++} // namespace Vulkan
+diff --git a/ryty_gpu/ryty_gts_dlss.h b/ryty_gpu/ryty_gts_dlss.h
+new file mode 100644
+index 00000000..e2e6379c
+--- /dev/null
++++ b/ryty_gpu/ryty_gts_dlss.h
+@@ -0,0 +1,66 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++#pragma once
++
++#include <array>
++#include <chrono>
++#include <memory>
++#include "ryty_gpu/ryty_dlss.h"
++#include "video_core/renderer_vulkan/vk_scheduler.h"
++#include "video_core/texture_cache/blit_helper.h"
++
++namespace Vulkan {
++class Instance;
++class Runtime;
++
++class GtsDlssPass {
++public:
++    GtsDlssPass(const Instance& instance, Scheduler& scheduler, Runtime& runtime);
++    void SetOutputSize(vk::Extent2D size, bool hdrEncoded) {
++        requestedSize = size;
++        supportedDisplay = !hdrEncoded;
++    }
++    bool Capture(u64 frame, VideoCore::Image& color, VideoCore::Image& depth,
++                 VideoCore::Image& motion, VideoCore::Image& resolved,
++                 const std::array<float, 28>& constants);
++    bool HasScene(u64 frame, u64 resolvedUid) const;
++    void PrepareScene(u64 frame, VideoCore::Image& resolved);
++    void Resolve(u64 frame, VideoCore::Image& display);
++    bool OverrideHud(u64 frame, u64 uid, RenderState& state);
++    void FallbackHud(u64 frame, VideoCore::Image& display, vk::ImageLayout restoreLayout);
++    void SyncGuestRead(u64 frame, VideoCore::Image& display);
++    void ScaleHud(u64 frame, u64 uid, Viewports& viewports, Scissors& scissors) const;
++    vk::ImageView PreparePresent(u64 frame, VideoCore::Image& display, vk::Format viewFormat);
++    vk::Extent2D OutputSize() const { return outputSize; }
++
++private:
++    struct Texture {
++        VideoCore::UniqueImage image;
++        vk::UniqueImageView view;
++        vk::UniqueImageView presentView;
++        vk::Format format{};
++        vk::Extent2D size{};
++        vk::ImageAspectFlags aspects{vk::ImageAspectFlagBits::eColor};
++        vk::ImageLayout layout{vk::ImageLayout::eUndefined};
++        RygtDlssImage Descriptor() const;
++    };
++    void create(Texture& texture, vk::Format format, vk::Extent2D size,
++                vk::ImageAspectFlags aspects = vk::ImageAspectFlagBits::eColor);
++    void transit(Texture& texture, vk::ImageLayout layout);
++    void copyInput(VideoCore::Image& source, Texture& dest);
++    void copyBack(VideoCore::Image& display);
++    bool isActive(u64 frame, u64 uid) const;
++
++    const Instance& instance;
++    Scheduler& scheduler;
++    Runtime& runtime;
++    Texture color, depth, motion, reconstruction, native;
++    std::unique_ptr<VideoCore::BlitHelper> colorCopy;
++    vk::Extent2D requestedSize{}, renderSize{}, outputSize{};
++    RygtDlssQuality quality{RYGT_DLSS_QUALITY_PERFORMANCE};
++    u64 sceneFrame{~u64{}}, sceneUid{}, displayUid{}, outputFrame{~u64{}};
++    float jitterX{}, jitterY{}, frameTimeMs{1000.f / 60};
++    bool reset{true}, failed{}, supportedDisplay{}, nativeDirty{};
++    u64 evaluatedFrames{}, nativePresentations{}, guestSyncs{}, nativeHudDraws{}, fallbacks{};
++    std::chrono::steady_clock::time_point lastScene{};
++};
++} // namespace Vulkan
+diff --git a/src/core/emulator_settings.h b/src/core/emulator_settings.h
+index dfe112e5..d026a0ae 100644
+--- a/src/core/emulator_settings.h
++++ b/src/core/emulator_settings.h
+@@ -1,4 +1,4 @@
+-﻿// SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
++// SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #pragma once
+@@ -421,6 +421,7 @@ struct GPUSettings {
+     Setting<int> rcas_attenuation{250};
+     // ryGT: scale with NVIDIA DLSS through the optional plugin (dlss\ryGT_dlss.dll).
+     Setting<bool> dlss_enabled{false};
++    Setting<std::string> dlss_quality{"performance"};
+     // ryGT: with fsr_enabled, scale with AMD FSR 3.1 (amd_fidelityfx_vk.dll) instead of FSR 1.
+     Setting<bool> fsr3_enabled{true};
+     // ryGT: AMD FSR 3.1 frame generation (amd_fidelityfx_vk.dll) adds a generated frame between
+@@ -463,6 +464,7 @@ struct GPUSettings {
+             make_override<GPUSettings>("rcas_enabled", &GPUSettings::rcas_enabled),
+             make_override<GPUSettings>("rcas_attenuation", &GPUSettings::rcas_attenuation),
+             make_override<GPUSettings>("dlss_enabled", &GPUSettings::dlss_enabled),
++            make_override<GPUSettings>("dlss_quality", &GPUSettings::dlss_quality),
+             make_override<GPUSettings>("fsr3_enabled", &GPUSettings::fsr3_enabled),
+             make_override<GPUSettings>("framegen_enabled", &GPUSettings::framegen_enabled),
+             make_override<GPUSettings>("dlssg_enabled", &GPUSettings::dlssg_enabled),
+@@ -491,7 +493,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(GPUSettings, window_width, window_height, int
+                                    vblank_frequency, full_screen, full_screen_mode,
+                                    fullscreen_refresh_rate, present_mode,
+                                    hdr_allowed, fsr_enabled, rcas_enabled, rcas_attenuation,
+-                                   dlss_enabled, fsr3_enabled, framegen_enabled, dlssg_enabled,
++                                   dlss_enabled, dlss_quality, fsr3_enabled, framegen_enabled, dlssg_enabled,
+                                    precompile_shaders,
+                                    compile_freeze, compile_batch_ms, compile_mode,
+                                    particle_effects,
+@@ -761,6 +763,7 @@ public:
+     SETTING_FORWARD_BOOL(m_gpu, RcasEnabled, rcas_enabled)
+     SETTING_FORWARD(m_gpu, RcasAttenuation, rcas_attenuation)
+     SETTING_FORWARD_BOOL(m_gpu, DlssEnabled, dlss_enabled)
++    SETTING_FORWARD(m_gpu, DlssQuality, dlss_quality)
+     SETTING_FORWARD_BOOL(m_gpu, Fsr3Enabled, fsr3_enabled)
+     SETTING_FORWARD_BOOL(m_gpu, FrameGenEnabled, framegen_enabled)
+     SETTING_FORWARD_BOOL(m_gpu, DlssgEnabled, dlssg_enabled)
+diff --git a/src/video_core/renderer_vulkan/vk_presenter.cpp b/src/video_core/renderer_vulkan/vk_presenter.cpp
+index 57a2025c..861f128e 100644
+--- a/src/video_core/renderer_vulkan/vk_presenter.cpp
++++ b/src/video_core/renderer_vulkan/vk_presenter.cpp
+@@ -856,7 +856,7 @@ static vk::Format GetFrameViewFormat(const Libraries::VideoOut::PixelFormat form
+ 
+ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& attribute,
+                                VAddr cpu_address) {
+-    g_prepared_frames.fetch_add(1, std::memory_order_relaxed); // DIAG-137
++    const u64 guestFrame = g_prepared_frames.fetch_add(1, std::memory_order_relaxed);
+     rasterizer->FrameDumpFlip(); // NAT-116
+ #ifdef RYTY_GPU
+     if (auto* native = rasterizer->Native()) {
+@@ -902,9 +902,16 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup&
+ 
+     auto& image = texture_cache.GetImage(image_id);
+     auto image_view = *image.FindView(view_info).image_view;
+-    const vk::Extent2D image_size = {image.info.size.width, image.info.size.height};
++    vk::Extent2D image_size = {image.info.size.width, image.info.size.height};
+     expected_ratio = static_cast<float>(image_size.width) / static_cast<float>(image_size.height);
+ 
++#ifdef RYTY_GPU
++    auto& temporalDlss = rasterizer->GetTemporalDlss();
++    temporalDlss.SetOutputSize({frame->width, frame->height}, attribute.attrib.pixel_format ==
++        Libraries::VideoOut::PixelFormat::A2R10G10B10Bt2020Pq);
++    const auto temporalView = temporalDlss.PreparePresent(guestFrame, image, view_info.format);
++#endif
++
+     const u32 capture_game_only_count = VideoCore::ConsumeGameOnlyScreenshotRequests();
+     std::optional<ScreenshotReadback> pending_screenshot;
+ 
+@@ -955,6 +962,11 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup&
+     const vk::CommandBuffer pass_cmdbuf = draw_scheduler.DirectCommandBuffer();
+     bool scaled = false;
+ #ifdef RYTY_GPU
++    if (temporalView) {
++        image_view = temporalView;
++        image_size = temporalDlss.OutputSize();
++        scaled = true;
++    }
+     // ryGT: DLSS (when its plugin is on and can scale to the window size) replaces FSR.
+     if (const auto dlss_view =
+             dlss_pass.Render(pass_cmdbuf, image.GetImage(), image_view, view_info.format,
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index b163c2de..5809d9e3 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -67,7 +67,11 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
+       liverpool{liverpool_}, memory{Core::Memory::Instance()},
+       pipeline_cache{instance, scheduler, liverpool, buffer_cache.GetSparsePageShift()},
+       host_markers_enabled{EmulatorSettings.IsVkHostMarkersEnabled()},
+-      guest_markers_enabled{EmulatorSettings.IsVkGuestMarkersEnabled()} {
++      guest_markers_enabled{EmulatorSettings.IsVkGuestMarkersEnabled()}
++#ifdef RYTY_GPU
++      , temporalDlss{instance, scheduler, runtime}
++#endif
++{
+     // R5: buffer stage workers use their own rings.
+     AmdGpu::DrawPipe::worker_init = [](u32 index) { VideoCore::BufferCache::SetStageWorker(index); };
+     if (!EmulatorSettings.IsNullGPU()) {
+@@ -1729,6 +1733,85 @@ void NoteDrawKey(std::pair<u64, u64> key, int outcome) {
+ static void NoteMenuBarDraw(u64 vs, u64 ps); // FIX-127
+ static thread_local bool t_frosted_rt = false; // DIAG-139: the draw renders the bar's blur
+ 
++#ifdef RYTY_GPU
++bool RytyGtsInRace();
++
++void Rasterizer::applyTemporalDlss(const GraphicsPipeline* pipeline, const RenderState& state,
++                                 bool beforeDraw) {
++    if (!RytyGtsInRace() || Scheduler::ThreadRing() || ctx->dlssNativeDraw) return;
++    const u64 frame = g_prepared_frames.load(std::memory_order_relaxed);
++    const auto& regs = liverpool->DrawRegs();
++    if (regs.num_indices > 6 || regs.num_instances.NumInstances() != 1) return;
++    const auto* fragmentStage = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
++    if (!fragmentStage || state.num_color_attachments == 0) return;
++    const auto& fragment = *fragmentStage;
++    const auto parameterAddress = [&](u64 size) -> VAddr {
++        for (const auto& buffer : fragment.buffers) {
++            if (buffer.IsSpecial() || buffer.is_written) continue;
++            const auto sharp = buffer.GetSharp(fragment);
++            if (sharp.base_address && sharp.GetSize() == size && IsMappedStart(sharp.base_address)) {
++                return sharp.base_address;
++            }
++        }
++        return 0;
++    };
++    const auto imageAt = [&](u32 index) -> VideoCore::Image* {
++        const auto id = ctx->cb_descs[index].image_id;
++        return id ? &texture_cache.GetImage(id) : nullptr;
++    };
++    auto* target = imageAt(0);
++    if (!target) return;
++    const auto size = vk::Extent2D{target->info.size.width, target->info.size.height};
++    if (state.num_color_attachments == 2 && ctx->bound_textures.size() == 4 &&
++        target->info.pixel_format == vk::Format::eR16G16B16A16Sfloat) {
++        if (beforeDraw) return;
++        auto* resolved = imageAt(1);
++        if (!resolved || resolved->info.pixel_format != vk::Format::eB10G11R11UfloatPack32 ||
++            resolved->info.size.width != size.width || resolved->info.size.height != size.height) return;
++        VideoCore::Image *color{}, *depth{}, *motion{}, *history{};
++        for (const auto& binding : ctx->bound_textures) {
++            auto& image = texture_cache.GetImage(binding.image_id);
++            if (image.info.size.width != size.width || image.info.size.height != size.height ||
++                image.info.num_samples != 1 || image.info.resources.layers != 1) return;
++            if (image.info.props.is_depth || image.info.pixel_format == vk::Format::eR32Sfloat) depth = &image;
++            else if (image.info.pixel_format == vk::Format::eR16G16Sfloat) motion = &image;
++            else if (image.info.pixel_format == vk::Format::eB10G11R11UfloatPack32) color = &image;
++            else if (image.info.pixel_format == vk::Format::eR16G16B16A16Sfloat) history = &image;
++            else return;
++        }
++        if (!color || !depth || !motion || !history || color == resolved || history == target) return;
++        std::array<float, 28> constants{};
++        bool found = false;
++        if (const VAddr address = parameterAddress(sizeof(constants))) {
++            Common::CopyGuest(constants.data(), reinterpret_cast<const void*>(address),
++                              sizeof(constants));
++            if (!std::ranges::all_of(constants, [](float x) { return std::isfinite(x); })) return;
++            if (std::abs(constants[14] - size.width*.5f) > .01f ||
++                std::abs(constants[15] + size.height*.5f) > .01f ||
++                constants[16] != size.width || constants[17] != size.height ||
++                std::abs(constants[20]*constants[14]) > 1.f ||
++                std::abs(constants[21]*constants[15]) > 1.f) return;
++            found = true;
++        }
++        if (found) temporalDlss.Capture(frame, *color, *depth, *motion, *resolved, constants);
++        return;
++    }
++
++    if (state.num_color_attachments != 1 || !target->usage.vo_surface ||
++        ctx->db_desc.first || regs.blend_control[0].enable ||
++        target->info.pixel_format != vk::Format::eA2B10G10R10UnormPack32 ||
++        (!parameterAddress(304) && !parameterAddress(288))) return;
++    for (const auto& binding : ctx->bound_textures) {
++        auto& image = texture_cache.GetImage(binding.image_id);
++        if (temporalDlss.HasScene(frame, image.image_uid)) {
++            if (beforeDraw) temporalDlss.PrepareScene(frame, image);
++            else temporalDlss.Resolve(frame, *target);
++            return;
++        }
++    }
++}
++#endif
++
+ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
+     RENDERER_TRACE;
+     ++Common::GetWorkCounters().draws;
+@@ -1973,6 +2056,10 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
+         if (FrameDumpActive() || ExposureLogOn()) {
+             FrameDumpPass(regs, state, pipeline); // NAT-117
+         }
++#ifdef RYTY_GPU
++        if (RytyDlss::TemporalEnabled()) applyTemporalDlss(pipeline, state, true);
++        prepareNativeHud(state);
++#endif
+ 
+         if (ctx->needs_barrier) {
+             runtime.FlushBarriers();
+@@ -2012,6 +2099,9 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
+                     instance_offset);
+     }
+     DebugState.IncDrawCall();
++#ifdef RYTY_GPU
++    if (RytyDlss::TemporalEnabled()) applyTemporalDlss(pipeline, state);
++#endif
+ 
+     // DIAG-041: draws into GT Sport's car thumbnail (448x126 linear targets) and into the watched
+     // images of its chain: the shaders, every image and buffer they touch, and empty bindings.
+@@ -2274,6 +2364,9 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
+     }
+     auto state = BeginRendering(pipeline);
+     FinalizeTextureLayouts(&state);
++#ifdef RYTY_GPU
++    prepareNativeHud(state);
++#endif
+ 
+     if (ctx->needs_barrier) {
+         runtime.FlushBarriers();
+@@ -3592,6 +3685,19 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
+         Common::PhaseTimer t{Common::Phase::TextureRebind};
+         RebindTextures(pipeline->IsCompute(), num_color_targets);
+     }
++#ifdef RYTY_GPU
++    if (RytyDlss::TemporalEnabled()) {
++        const u64 frame = g_prepared_frames.load(std::memory_order_relaxed);
++        for (const auto& binding : ctx->bound_textures) {
++            auto& image = texture_cache.GetImage(binding.image_id);
++            if (binding.desc->type == VideoCore::TextureCache::BindingType::Storage) {
++                temporalDlss.FallbackHud(frame, image, image.backing->state.layout);
++            } else {
++                temporalDlss.SyncGuestRead(frame, image);
++            }
++        }
++    }
++#endif
+     if (pipeline->IsCompute()) {
+         FinalizeTextureLayouts();
+     }
+@@ -4397,6 +4503,10 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
+                     return !env || env[0] != '0';
+                 }();
+                 const bool read_in_place = [&] {
++#ifdef RYTY_GPU
++                    if (RytyDlss::TemporalEnabled() && stage.sw_stage == Shader::SwStage::Fragment &&
++                        stage.images.size() == 4 && size == 112) return false;
++#endif
+                     // DIAG-128 bisect: SHADGT_DIRECT_READS_STAGES=<hex mask of SwStage bits>,
+                     // SHADGT_DIRECT_READS_MAX=<bytes> (larger ranges take the usual path),
+                     // SHADGT_DIRECT_READS_MIN=<bytes> (smaller ranges take the usual path).
+@@ -5379,6 +5489,7 @@ void Rasterizer::FinalizeTextureLayouts(RenderState* render_state) {
+ }
+ 
+ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
++    ctx->dlssNativeDraw = false;
+     ctx->attachment_feedback_loop = {};
+     const auto& regs = liverpool->DrawRegs();
+     const auto& key = pipeline->GetGraphicsKey();
+@@ -5567,6 +5678,23 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
+     return state;
+ }
+ 
++#ifdef RYTY_GPU
++void Rasterizer::prepareNativeHud(RenderState& state) {
++    if (!RytyDlss::TemporalEnabled() || !ctx->cb_descs[0].image_id) return;
++    auto& display = texture_cache.GetImage(ctx->cb_descs[0].image_id);
++    const u64 frame = g_prepared_frames.load(std::memory_order_relaxed);
++    if (state.num_color_attachments == 1 && !ctx->db_desc.first) {
++        ctx->dlssNativeDraw = temporalDlss.OverrideHud(frame, display.image_uid, state);
++    } else {
++        temporalDlss.FallbackHud(frame, display, state.color_attachments[0].image_layout);
++    }
++    if (ctx->dlssNativeDraw) {
++        ctx->dlssNativeUid = display.image_uid;
++        ctx->attachment_feedback_loop &= ~vk::ImageAspectFlagBits::eColor;
++    }
++}
++#endif
++
+ void Rasterizer::Resolve() {
+     const auto& mrt0_hint = liverpool->DrawCbExtent(0);
+     const auto& mrt1_hint = liverpool->DrawCbExtent(1);
+@@ -6028,6 +6156,12 @@ void Rasterizer::UpdateViewportScissorState() const {
+     }
+ 
+     auto& dynamic_state = DynState(); // NAT-101
++#ifdef RYTY_GPU
++    if (ctx->dlssNativeDraw) {
++        temporalDlss.ScaleHud(g_prepared_frames.load(std::memory_order_relaxed),
++            ctx->dlssNativeUid, viewports, scissors);
++    }
++#endif
+     dynamic_state.SetViewports(viewports);
+     dynamic_state.SetScissors(scissors);
+ }
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.h b/src/video_core/renderer_vulkan/vk_rasterizer.h
+index 382aa522..d86f5b22 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.h
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.h
+@@ -22,6 +22,9 @@
+ #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
+ #include "video_core/renderer_vulkan/vk_scheduler.h"
+ #include "video_core/texture_cache/texture_cache.h"
++#ifdef RYTY_GPU
++#include "ryty_gpu/ryty_gts_dlss.h"
++#endif
+ 
+ namespace AmdGpu {
+ struct Liverpool;
+@@ -58,6 +61,9 @@ public:
+     [[nodiscard]] VideoCore::TextureCache& GetTextureCache() noexcept {
+         return texture_cache;
+     }
++#ifdef RYTY_GPU
++    GtsDlssPass& GetTemporalDlss() { return temporalDlss; }
++#endif
+ 
+     /// PERF-047: a direct draw's pipeline, selected on the command thread as it decodes the
+     /// draw, with the user data each stage's specialization was decided on.
+@@ -543,6 +549,8 @@ private:
+     /// MT-001: the per-draw state of one recording thread. The recorder thread uses main_ctx;
+     /// worker threads of the multithreaded recorder get their own.
+     struct DrawContext {
++        bool dlssNativeDraw{};
++        u64 dlssNativeUid{};
+         std::array<ImageBinding, Shader::NUM_IMAGES> image_bindings;
+         u32 image_binding_base = 0; // PERF-121: next free entry across the draw's stages
+         /// PERF-123: each hardware stage's last image bindings, reused when the next draw's
+@@ -576,6 +584,12 @@ private:
+         bool needs_barrier{};
+     };
+     DrawContext main_ctx;
++#ifdef RYTY_GPU
++    GtsDlssPass temporalDlss;
++    void applyTemporalDlss(const GraphicsPipeline* pipeline, const RenderState& state,
++                           bool beforeDraw = false);
++    void prepareNativeHud(RenderState& state);
++#endif
+     DrawContext* ctx = &main_ctx;
+     /// DIAG-041: buffers and images of the current draw that were bound empty.
+     /// DIAG-044: records the current draw or dispatch in the dependency history.
+diff --git a/src/video_core/texture_cache/blit_helper.cpp b/src/video_core/texture_cache/blit_helper.cpp
+index 03427b7d..ed685c9e 100644
+--- a/src/video_core/texture_cache/blit_helper.cpp
++++ b/src/video_core/texture_cache/blit_helper.cpp
+@@ -191,12 +191,23 @@ void BlitHelper::CopyBetweenMsImages(u32 width, u32 height, u32 num_samples,
+         device.destroyImageView(dst_view);
+     });
+ 
++    copyViews(width, height, {num_samples, pixel_format, src_msaa}, src_view, dst_view);
++}
++
++void BlitHelper::CopyColorViews(vk::Extent2D size, vk::Format destFormat,
++                               vk::ImageView source, vk::ImageView dest) {
++    copyViews(size.width, size.height, {1, destFormat, false}, source, dest);
++}
++
++void BlitHelper::copyViews(u32 width, u32 height, const MsPipelineKey& key,
++                          vk::ImageView sourceView, vk::ImageView destView) {
++
+     Vulkan::RenderState state{};
+     state.width = width;
+     state.height = height;
+     state.num_layers = 1;
+     state.num_color_attachments = 1;
+-    state.color_attachments[0].image_view = dst_view;
++    state.color_attachments[0].image_view = destView;
+     state.color_attachments[0].image_layout = vk::ImageLayout::eColorAttachmentOptimal;
+     state.color_attachments[0].is_clear = true;
+     scheduler.BeginRendering(state);
+@@ -204,7 +215,7 @@ void BlitHelper::CopyBetweenMsImages(u32 width, u32 height, u32 num_samples,
+     const auto cmdbuf = scheduler.CommandBuffer();
+     const vk::DescriptorImageInfo image_info = {
+         .sampler = VK_NULL_HANDLE,
+-        .imageView = src_view,
++        .imageView = sourceView,
+         .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+     };
+     const vk::WriteDescriptorSet texture_write = {
+@@ -218,7 +229,6 @@ void BlitHelper::CopyBetweenMsImages(u32 width, u32 height, u32 num_samples,
+     cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, *single_texture_pl_layout, 0U,
+                                 texture_write);
+ 
+-    const MsPipelineKey key{num_samples, pixel_format, src_msaa};
+     auto it = std::ranges::find(ms_image_copy_pl, key, &MsPipeline::first);
+     if (it == ms_image_copy_pl.end()) {
+         CreateMsCopyPipeline(key);
+diff --git a/src/video_core/texture_cache/blit_helper.h b/src/video_core/texture_cache/blit_helper.h
+index 5855a5c9..530c96ad 100644
+--- a/src/video_core/texture_cache/blit_helper.h
++++ b/src/video_core/texture_cache/blit_helper.h
+@@ -31,6 +31,9 @@ public:
+     void CopyBetweenMsImages(u32 width, u32 height, u32 num_samples, vk::Format pixel_format,
+                              bool src_msaa, vk::Image source, vk::Image dest);
+ 
++    void CopyColorViews(vk::Extent2D size, vk::Format destFormat,
++                        vk::ImageView source, vk::ImageView dest);
++
+ private:
+     void CreateShaders();
+     void CreatePipelineLayouts();
+@@ -44,6 +47,8 @@ private:
+     };
+     void CreateColorToMSDepthPipeline(const MsPipelineKey& key);
+     void CreateMsCopyPipeline(const MsPipelineKey& key);
++    void copyViews(u32 width, u32 height, const MsPipelineKey& key,
++                   vk::ImageView source, vk::ImageView dest);
+ 
+ private:
+     const Vulkan::Instance& instance;

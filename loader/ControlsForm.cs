@@ -100,26 +100,27 @@ namespace RyGT
             Text = "ryGT - Controls";
             Font = new Font("Segoe UI", 9f);
             StartPosition = FormStartPosition.CenterParent;
-            ClientSize = new Size(760, 720);
+            ClientSize = new Size(780, 760);
             MinimumSize = new Size(640, 480);
             FormBorderStyle = FormBorderStyle.Sizable;
             MinimizeBox = false;
             try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
 
-            var outer = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, Padding = new Padding(14, 10, 14, 10) };
+            var outer = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, Padding = new Padding(18, 14, 18, 14) };
             outer.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
             Controls.Add(outer);
+            outer.Controls.Add(new Label { Text = "Button bindings", AutoSize = true, Font = new Font("Segoe UI Semibold", 16f), Margin = new Padding(0, 0, 0, 4) });
 
             outer.Controls.Add(new Label
             {
-                AutoSize = true, MaximumSize = new Size(720, 0), Margin = new Padding(0, 0, 0, 8),
+                AutoSize = true, MaximumSize = new Size(720, 0), Margin = new Padding(0, 0, 0, 10), ForeColor = Dark.DimText, Tag = "heading",
                 Text = "Pick what each PS4 control is on your controller and keyboard. Every controller uses the " +
                        "controller bindings. Which controller is which player (splitscreen) is set under Controller ports."
             });
 
             var players = new FlowLayoutPanel { AutoSize = true, WrapContents = false, Margin = new Padding(0, 0, 0, 6) };
             players.Controls.Add(new Label { Text = "The keyboard controls", AutoSize = true, Margin = new Padding(0, 6, 8, 0) });
-            keyboardPlayer = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 120, FlatStyle = FlatStyle.Flat };
+            keyboardPlayer = new DarkComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 120, FlatStyle = FlatStyle.Flat };
             keyboardPlayer.Items.AddRange(new object[] { "Player 1", "Player 2" });
             keyboardPlayer.SelectedIndex = Math.Max(0, Math.Min(PortsForm.Players - 1, currentKeyboardPlayer - 1));
             players.Controls.Add(keyboardPlayer);
@@ -147,7 +148,10 @@ namespace RyGT
             }
             var scroll = new Panel { Dock = DockStyle.Fill, AutoScroll = true, Margin = new Padding(0) };
             scroll.Controls.Add(table);
-            outer.Controls.Add(scroll);
+            var bindings = new Card(Dark.Panel) { Dock = DockStyle.Fill, Padding = new Padding(16, 12, 6, 10), Margin = new Padding(0, 4, 0, 4) };
+            bindings.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            bindings.Controls.Add(scroll);
+            outer.Controls.Add(bindings);
 
             var deadzones = new FlowLayoutPanel { AutoSize = true, WrapContents = false, Margin = new Padding(0, 8, 0, 4) };
             deadzones.Controls.Add(new Label { Text = "Stick deadzone (1-127): left", AutoSize = true, Margin = new Padding(0, 6, 6, 0) });
@@ -174,6 +178,7 @@ namespace RyGT
 
             outer.RowStyles.Add(new RowStyle(SizeType.AutoSize));
             outer.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            outer.RowStyles.Add(new RowStyle(SizeType.AutoSize));
             outer.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
             outer.RowStyles.Add(new RowStyle(SizeType.AutoSize));
             outer.RowStyles.Add(new RowStyle(SizeType.AutoSize));
@@ -185,7 +190,7 @@ namespace RyGT
 
         static ComboBox Combo(string[] items)
         {
-            var box = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Dock = DockStyle.Fill, FlatStyle = FlatStyle.Flat, Margin = new Padding(0, 2, 6, 2) };
+            var box = new DarkComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Dock = DockStyle.Fill, FlatStyle = FlatStyle.Flat, Margin = new Padding(0, 2, 6, 2) };
             if (items == null) { box.Enabled = false; return box; }
             box.Items.Add(None);
             box.Items.AddRange(items);

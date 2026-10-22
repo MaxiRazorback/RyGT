@@ -36,6 +36,8 @@ Throughout the project, every function at every stage either **does exactly what
 
 ### Functional
 
+- The DLSS temporal renderer hook supports recognized SDR scene passes in the serial renderer. HDR/PQ output, the multithreaded command-ring path and the separate native renderer are not integrated. Explicit camera-cut notifications and the mirror's auxiliary temporal data still need validation. The game render resolution remains at most 1920x1080; NGX quality profiles do not resize guest render targets.
+
 - [Shader recompilation](../../core/shader/recompiler/Recompiler.cpp) currently occurs right before it was transferred to Vulkan with caching, but should be moved to the [relinker](../../core/relinker/main.cpp) stage. For this purpose, [shader/recompiler](../../core/shader/recompiler) was written completely independently from [libs/prx](../../core/libs/prx).
 - The executable file that [relinker](../../core/relinker/elfpatcher/src/windows/WindowsPeWriter.cpp) generates opens the console when launched, which is inconvenient for playability.
 - [libSceJpegEnc](../../core/libs/prx/libSceJpegEnc/Export.cpp) encodes 4:2:2 sampling requests with 4:2:0 chroma subsampling, and grayscale requests as a 3-component JPEG with neutral chroma instead of a single-component one: the [JPEG encoder](../../core/Decoder/Jpeg/src/Jpeg.cpp) (stb) only produces 3-component 4:2:0 and 4:4:4 images.

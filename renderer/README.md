@@ -20,6 +20,7 @@ commit `4371a500`):
 | `0011-ryGT-quality-preset-memory` | The reused-image pool size follows the launcher's quality preset (`GPU.image_recycle_mb`) |
 | `0012-ryGT-old-shader-fallback-direct-default` | The new renderer is the only renderer (`SHADGT_DIRECT=0` for comparisons); while its own shaders and pipelines are built in the background, draws use the old renderer's stored shaders, so switching causes no shader-compile freezes |
 | `0019-ghost-quad-sample-mask` | Per-quad sample coverage masks restore recorded ghost transparency; ordinary shader caches remain compatible |
+| `0020-fix-dlss-temporal-scene-reconstruction` | Temporal DLSS scene inputs, persistent history, RGB conversion and HUD composition in the serial renderer; full-rate mirror while temporal DLSS is selected |
 
 To build: check out shadGT at `29af7ca6`, apply the patches with
 `git am <RyGT>/renderer/shadGT-patches/*.patch`, then build the `ryty_gpu` target as in the main
@@ -61,6 +62,11 @@ on the native renderer:
 - Unconditionally binds compute pipelines in `DispatchDirect` and `DispatchIndirect` on the primary command stream.
 - Selects `HOST_CACHED` (Type 2) memory for host-imported buffers in `DirectMemory` and `ImportHostMemory`.
 
+Despite its number, 0042-intel-arc applies after 0053 and before 0054 (it was written later). The copy
+here is UTF-8 (the first one was UTF-16, which `git apply` can't read) and has two conflicts resolved:
+`log.cpp` keeps the leveled stdout without a renderer log file (0029/0048), and FIX-171's rectangle and
+packed texture probes get the same transfer-to-host barrier as the patch's general probe.
+
 `0019-ghost-quad-sample-mask` (Gabarsolon) is applied in shadGT after the native renderer, merged
 with its larger push block (the quad sample mask follows the four buffer-offset vectors).
 
@@ -72,3 +78,62 @@ log level include the renderer's Info lines (frame-time windows). 0049 (FIX-165)
 pipeline cache file (`RYGT_DRIVER_CACHE=1` turns it back on, saved only at exit): at 3.7 GB, its
 saves every 30 s made native races drop to 10 fps and back. 0050 (DIAG-166) attaches RenderDoc when its
 layer is on: F12 or a `capture.now` file in the RyGT folder captures a frame into `captures`.
+Patch 0057 (GTS-009) fills screens wider (or narrower) than 16:9: `GPU.aspect_ratio` ("auto", the
+launcher's Display > Screen shape > "Fill the screen", is the shape of the game's window or screen;
+also "21:9", "32:9", width:height or a number; `RYGT_ASPECT` overrides it) widens the race camera's
+16:9 aspect (eboot 0x5e717f) and stretches the picture over the whole window instead of black
+bars. The HUD and menus are stretched with the picture; 16:9, the default, changes nothing.
+
+Patches 0058-0061 are AMD fixes, tested on an RX 7600 (Windows 11, driver 26.8.1, 16 GB RAM) at
+Dragon Trail. They apply after 0057 (shadGT `ryty-gpu` at `7080bee5`).
+- 0058 (FIX-188) turns direct memory back on by default. 0042-intel-arc turned it off for every
+  GPU; without it the native renderer copies every buffer through host upload memory, and a 16 GB
+  PC ran out at the start of a race ("NAT-100: no upload memory"). `SHADGT_DIRECT=0` still turns
+  it off (Intel Arc).
+- 0059 (FIX-189): AMD's driver refuses storage use for BC6H images even with extended usage, so
+  the native renderer made no image for GT Sport's HDR sky and reflection maps (black sky, flat
+  car paint). Such images are now made without storage use; shaders only sample them.
+- 0060 (FIX-191): without manual interpolation (AMD's path), a fragment input that a shader reads
+  both blended (`V_INTERP_P2_F32`) and per vertex (`V_INTERP_MOV_F32`) was read at vertex 0 for the
+  blended read, so terrain and kerbs were drawn as flat-coloured triangles. The blend is now
+  computed from the barycentrics. Stored translations keep the old result: clear
+  `<RyGT folder>\shaders\<serial>-direct-sets` once after updating.
+- 0061 (FIX-187): with frame generation on, minimizing the window (a 0x0 surface) no longer
+  crashes the game; generation stays off until the window is restored.
+
+## Combined renderer enhancements
+
+Patch 0062 applies after the temporal DLSS patch 0020. For the tested source combination,
+check out shadGT `ryty-gpu` at `1d13c88d2e57bc63ce1586fe0b8f3342b6afdd19`, then apply the
+current 0020 and 0062 patches with `git apply`. Other patches in this directory are already
+included in that shadGT revision. Build the `ryty_gpu` target, the main-branch DLSS plugin,
+and the Windows launcher. The renderer/plugin DLSS interface headers must match.
+
+0062 adds smooth recorded-ghost blending and four GPU JSON settings: `ghost_body_opacity`,
+`ghost_rubber_opacity`, `ghost_rim_opacity`, and `ghost_rim_brightness` (0-100, default 25).
+They are read when the game starts. It also adds the PS4 Pro 1080p preset, output-resolution
+UI, optional fast flips, post-DLSS sharpening, experimental HDR, frame-generation gating,
+shader-allocation guards, and bounded texture-memory recovery and supported VRAM paging.
+
+Both renderers support smooth ghost blending, output-resolution UI and post-DLSS sharpening.
+The native renderer synchronizes UI proxy writes before guest texture reads, storage writes,
+copies and resolves, and captures the UI frame under its recording lock. Pro tiling specialization
+is shared between renderers; native pipeline keys distinguish base and alternate layouts.
+Native image/buffer allocation failures reclaim completed allocations and empty allocator blocks,
+then retry the identical allocation once. Live images are not discarded for recovery.
+Recognized SDR gameplay reconstructed by temporal DLSS in the default renderer uses its scene/HUD
+output; other supported frames use the separate UI proxy. Upstream temporal DLSS remains limited
+to the default renderer. Native rendering retains the legacy DLSS interface. HDR is experimental
+in both paths; the native HDR layer is connected, but live HDR gameplay is not validated.
+The Pro option selects the game's 1080p Neo preset; a higher host output size does not make
+every internal game pass render at that resolution.
+
+The launcher retains main's tabbed layout, renderer choice, ultrawide options, wheel support,
+and temporal DLSS behavior. The shader-pack preparation destination retains the upstream
+Hotfix 2 correction (`CUSA03220-direct-sets`).
+Patches 0058 and 0059 limit 0042-intel-arc to Intel GPUs. On NVIDIA its shader translation turned
+races red with magenta cars (memory-only compute barriers and 64-bit shared memory as 32-bit halves,
+with an empty shader store), and it also turned direct memory off and undid SanitizeCopyLayers for
+every GPU. 0058 reverts it; 0059 (FIX-188) brings its Intel Arc changes back behind
+`Instance::IsIntel()` (vendor 0x8086), so every other GPU runs what it ran before 0042-intel-arc.
+`ryty-gpu` and `linux-proton` have every patch through 0059 (commit `1d13c88d`).

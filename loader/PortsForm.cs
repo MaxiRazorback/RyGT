@@ -148,7 +148,7 @@ namespace RyGT
         {
             var g = e.Graphics;
             g.SmoothingMode = SmoothingMode.AntiAlias;
-            g.Clear(Dark.Back);
+            g.Clear(BackColor);
             // Drawn on a 400 x 260 canvas, scaled to fit.
             float scale = Math.Min(Width / 400f, (Height - 24) / 260f);
             g.TranslateTransform((Width - 400 * scale) / 2, 0);
@@ -444,29 +444,33 @@ namespace RyGT
             Text = "ryGT - Controller ports";
             Font = new Font("Segoe UI", 9f);
             StartPosition = FormStartPosition.CenterParent;
-            ClientSize = new Size(880, 470);
+            ClientSize = new Size(900, 540);
             MinimumSize = new Size(760, 420);
             MinimizeBox = false;
             try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
 
-            var outer = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 3, Padding = new Padding(14, 10, 14, 10) };
-            outer.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 380));
+            var outer = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 4, Padding = new Padding(18, 14, 18, 14) };
+            outer.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 400));
             outer.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            outer.RowStyles.Add(new RowStyle(SizeType.AutoSize));
             outer.RowStyles.Add(new RowStyle(SizeType.AutoSize));
             outer.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
             outer.RowStyles.Add(new RowStyle(SizeType.AutoSize));
             Controls.Add(outer);
+            var heading = new Label { Text = "Controller ports", AutoSize = true, Font = new Font("Segoe UI Semibold", 16f), Margin = new Padding(0, 0, 0, 4) };
+            outer.Controls.Add(heading, 0, 0);
+            outer.SetColumnSpan(heading, 2);
 
             var intro = new Label
             {
-                AutoSize = true, MaximumSize = new Size(840, 0), Margin = new Padding(0, 0, 0, 10),
+                AutoSize = true, MaximumSize = new Size(840, 0), Margin = new Padding(0, 0, 0, 12), ForeColor = Dark.DimText, Tag = "heading",
                 Text = "Pick each player's name and controller (GT Sport: Arcade, Split Screen for 2 players). " +
                        "Names go into new saves (GT Sport keeps the name a save was made with). " +
                        "In game, F3 or holding Share + Options (View + Menu) changes controllers. " +
                        "\"Next connected\" takes the controllers nobody picked, in the order Windows lists them. " +
                        "Press buttons to see them light up in the preview; click a player to preview their controller."
             };
-            outer.Controls.Add(intro, 0, 0);
+            outer.Controls.Add(intro, 0, 1);
             outer.SetColumnSpan(intro, 2);
 
             var table = new TableLayoutPanel { ColumnCount = 2, AutoSize = true, Dock = DockStyle.Top, Margin = new Padding(0) };
@@ -484,7 +488,7 @@ namespace RyGT
                 nameRow.Controls.Add(names[i]);
                 nameRow.Controls.Add(new Label { Text = i == 0 ? "empty: Player" : "empty: Player " + (i + 1), AutoSize = true, Margin = new Padding(6, 4, 0, 0), ForeColor = Dark.DimText, Tag = "heading" });
                 table.Controls.Add(nameRow, 1, i * 3);
-                ports[i] = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Dock = DockStyle.Fill, FlatStyle = FlatStyle.Flat, Margin = new Padding(0, 4, 0, 0) };
+                ports[i] = new DarkComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Dock = DockStyle.Fill, FlatStyle = FlatStyle.Flat, Margin = new Padding(0, 4, 0, 0) };
                 ports[i].SelectedIndexChanged += delegate { OnPick(player); };
                 ports[i].Enter += delegate { shownPlayer = player; };
                 ports[i].DropDown += delegate { shownPlayer = player; };
@@ -492,12 +496,18 @@ namespace RyGT
                 status[i] = new Label { AutoSize = true, ForeColor = Dark.DimText, Tag = "heading", Margin = new Padding(0, 2, 0, 10) };
                 table.Controls.Add(status[i], 1, i * 3 + 2);
             }
-            outer.Controls.Add(table, 0, 1);
+            var players = new Card(Dark.Panel) { Dock = DockStyle.Fill, Padding = new Padding(16, 12, 16, 10), Margin = new Padding(0) };
+            players.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            players.Controls.Add(table);
+            outer.Controls.Add(players, 0, 2);
 
-            preview = new ControllerPreview { Dock = DockStyle.Fill, Margin = new Padding(16, 0, 0, 0), MinimumSize = new Size(300, 220) };
-            outer.Controls.Add(preview, 1, 1);
+            preview = new ControllerPreview { Dock = DockStyle.Fill, Margin = new Padding(0), MinimumSize = new Size(300, 220) };
+            var previewCard = new Card(Dark.Panel) { Dock = DockStyle.Fill, Padding = new Padding(12, 16, 12, 8), Margin = new Padding(14, 0, 0, 0) };
+            previewCard.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            previewCard.Controls.Add(preview);
+            outer.Controls.Add(previewCard, 1, 2);
 
-            var buttons = new FlowLayoutPanel { AutoSize = true, WrapContents = false, Margin = new Padding(0, 8, 0, 0) };
+            var buttons = new FlowLayoutPanel { AutoSize = true, WrapContents = false, Margin = new Padding(0, 12, 0, 0) };
             var ok = new Button { Text = "Save", AutoSize = true, Tag = "accent" };
             var reset = new Button { Text = "All automatic", AutoSize = true };
             var cancel = new Button { Text = "Cancel", AutoSize = true, DialogResult = DialogResult.Cancel };
@@ -519,12 +529,12 @@ namespace RyGT
             };
             reset.Click += delegate { for (int i = 0; i < Players; ++i) chosen[i] = ""; Fill(); };
             buttons.Controls.AddRange(new Control[] { ok, reset, cancel });
-            outer.Controls.Add(buttons, 0, 2);
+            outer.Controls.Add(buttons, 0, 3);
             outer.SetColumnSpan(buttons, 2);
             CancelButton = cancel;
 
             Dark.Apply(this);
-            preview.BackColor = Dark.Back;
+            preview.BackColor = Dark.Panel;
             HandleCreated += delegate { Dark.TitleBar(this); };
 
             devices = Joysticks.Connected();

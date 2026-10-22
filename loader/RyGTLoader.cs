@@ -4,8 +4,10 @@
 
 using System;
 using System.Collections.Generic;
+using System.ComponentModel;
 using System.Diagnostics;
 using System.Drawing;
+using System.Drawing.Drawing2D;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
@@ -175,46 +177,57 @@ namespace RyGT
         }
     }
 
-    /// Dark colors for the loader window.
+    /// The launcher's look (after the Epic Games launcher): a charcoal window with rounded panels
+    /// and cards, white text with grey secondary text, white main buttons and grey rounded ones.
     static class Dark
     {
-        public static readonly Color Back = Color.FromArgb(30, 30, 30);
-        public static readonly Color Field = Color.FromArgb(45, 45, 48);
-        public static readonly Color Button = Color.FromArgb(58, 58, 61);
-        public static readonly Color ButtonHover = Color.FromArgb(75, 75, 80);
+        public static readonly Color Back = Color.FromArgb(18, 18, 18);       // the window
+        public static readonly Color Panel = Color.FromArgb(26, 26, 26);      // the large rounded areas
+        public static readonly Color Card = Color.FromArgb(34, 34, 34);       // cards on a panel
+        public static readonly Color Field = Color.FromArgb(44, 44, 44);
+        public static readonly Color Button = Color.FromArgb(50, 50, 50);
+        public static readonly Color ButtonHover = Color.FromArgb(64, 64, 64);
+        public static readonly Color ButtonDown = Color.FromArgb(42, 42, 42);
+        public static readonly Color Hover = Color.FromArgb(40, 40, 40);      // list rows under the mouse
         public static readonly Color Accent = Color.FromArgb(178, 24, 36);
         public static readonly Color AccentHover = Color.FromArgb(206, 40, 52);
-        public static readonly Color Heading = Color.FromArgb(240, 96, 96);
-        public static readonly Color Border = Color.FromArgb(70, 70, 74);
-        public static readonly Color Text = Color.FromArgb(230, 230, 230);
-        public static readonly Color DimText = Color.FromArgb(150, 150, 150);
+        public static readonly Color AccentText = Color.FromArgb(240, 92, 76);
+        public static readonly Color Heading = Color.FromArgb(154, 154, 154);
+        public static readonly Color Border = Color.FromArgb(46, 46, 46);
+        public static readonly Color Text = Color.FromArgb(245, 245, 245);
+        public static readonly Color DimText = Color.FromArgb(154, 154, 154);
+        public const int Radius = 10;
 
         public static void Apply(Control control)
         {
-            if (control.BackColor.A == 255) control.BackColor = Back;
+            // Other controls take their parent's color (a card's, the window's) unless they set one.
+            if (control is Form) control.BackColor = Back;
             if (control.Tag as string != "heading") control.ForeColor = Text;
             var button = control as Button;
-            if (button != null)
-            {
-                bool accent = button.Tag as string == "accent";
-                button.FlatStyle = FlatStyle.Flat;
-                button.BackColor = accent ? Accent : Button;
-                button.FlatAppearance.BorderColor = accent ? Accent : Border;
-                button.FlatAppearance.MouseOverBackColor = accent ? AccentHover : ButtonHover;
-                button.FlatAppearance.MouseDownBackColor = accent ? Accent : Border;
-                button.Padding = new Padding(10, 2, 10, 2);
-            }
+            if (button != null) Round(button);
             var box = control as TextBox;
             if (box != null)
             {
                 box.BackColor = Field;
-                box.BorderStyle = BorderStyle.FixedSingle;
+                if (box.BorderStyle == BorderStyle.Fixed3D) box.BorderStyle = BorderStyle.FixedSingle;
                 box.HandleCreated += delegate { Native.SetWindowTheme(box.Handle, "DarkMode_Explorer", null); };
+            }
+            var number = control as NumericUpDown;
+            if (number != null)
+            {
+                number.BackColor = Field;
+                number.BorderStyle = BorderStyle.None;
+                // The up and down buttons, drawn over in the field's colors.
+                var spin = number.Controls.Count > 0 ? number.Controls[0] : null;
+                if (spin != null && !(spin is TextBoxBase)) spin.Paint += (sender, e) => PaintSpin(spin, e.Graphics);
             }
             var check = control as CheckBox;
             if (check != null && !(check is DarkCheckBox)) check.FlatStyle = FlatStyle.Flat;
             var combo = control as ComboBox;
-            if (combo != null) combo.BackColor = Field;
+            if (combo != null) DarkCombo(combo);
+            var scroll = control as ScrollableControl;
+            if (scroll != null && scroll.AutoScroll)
+                scroll.HandleCreated += delegate { Native.SetWindowTheme(scroll.Handle, "DarkMode_Explorer", null); };
             foreach (Control child in control.Controls) Apply(child);
         }
 
@@ -225,9 +238,162 @@ namespace RyGT
             if (Native.DwmSetWindowAttribute(form.Handle, 20, ref on, sizeof(int)) != 0)
                 Native.DwmSetWindowAttribute(form.Handle, 19, ref on, sizeof(int));
         }
+
+        public static GraphicsPath RoundedRect(RectangleF r, float radius)
+        {
+            var path = new GraphicsPath();
+            float d = Math.Min(radius * 2, Math.Min(r.Width, r.Height));
+            if (d <= 0) { path.AddRectangle(r); return path; }
+            path.AddArc(r.X, r.Y, d, d, 180, 90);
+            path.AddArc(r.Right - d, r.Y, d, d, 270, 90);
+            path.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
+            path.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
+            path.CloseFigure();
+            return path;
+        }
+
+        public static void FillRounded(Graphics g, Color color, RectangleF r, float radius)
+        {
+            using (var path = RoundedRect(r, radius))
+            using (var brush = new SolidBrush(color))
+                g.FillPath(brush, path);
+        }
+
+        /// Paints what lies under `control`: the banner picture, or the nearest opaque parent's color.
+        public static void PaintUnder(Control control, Graphics g)
+        {
+            // See-through cards between the control and what is under them, innermost first.
+            var glass = new List<Card>();
+            for (var parent = control.Parent; parent != null; parent = parent.Parent)
+            {
+                var hero = parent as Hero;
+                if (hero != null) { hero.DrawUnder(control, g); FillGlass(glass, control, g); return; }
+                var card = parent as Card;
+                if (card != null && card.Fill.A < 255) { glass.Add(card); continue; }
+                var backdrop = parent as IBackdrop;
+                if (backdrop != null && backdrop.DrawBackdrop(control, g, false)) { FillGlass(glass, control, g); return; }
+                if (parent.BackColor.A == 255)
+                {
+                    using (var back = new SolidBrush(parent.BackColor)) g.FillRectangle(back, control.ClientRectangle);
+                    FillGlass(glass, control, g);
+                    return;
+                }
+            }
+            g.Clear(Back);
+            FillGlass(glass, control, g);
+        }
+
+        static void FillGlass(List<Card> glass, Control control, Graphics g)
+        {
+            for (int i = glass.Count - 1; i >= 0; --i)
+            {
+                using (var fill = new SolidBrush(glass[i].Fill)) g.FillRectangle(fill, control.ClientRectangle);
+            }
+        }
+
+        /// Gives the controls that take their parent's color a transparent one, so the window's
+        /// picture shows through them (the cards, fields, buttons and lists paint their own).
+        public static void SeeThrough(Control control)
+        {
+            foreach (Control child in control.Controls)
+            {
+                bool own = child is Card || child is Hero || child is TextBoxBase || child is ListControl || child is ButtonBase ||
+                           child is TrackBar || child is UpDownBase || child is ListItem || child is DarkBar;
+                if (!own && !TypeDescriptor.GetProperties(child)["BackColor"].ShouldSerializeValue(child))
+                    child.BackColor = Color.Transparent;
+                if (!(child is TextBoxBase) && !(child is ListControl) && !(child is UpDownBase)) SeeThrough(child);
+            }
+        }
+
+        /// Draws a button as a rounded rectangle: white with dark text for the main action (Tag
+        /// "accent"), grey otherwise; Tag "nav" is a top bar tab and "nav-on" the open one.
+        static void Round(Button button)
+        {
+            button.FlatStyle = FlatStyle.Flat;
+            button.FlatAppearance.BorderSize = 0;
+            button.UseVisualStyleBackColor = false;
+            button.Cursor = Cursors.Hand;
+            if (button.Padding == Padding.Empty) button.Padding = new Padding(14, 5, 14, 5);
+            bool hover = false, down = false;
+            button.MouseEnter += delegate { hover = true; button.Invalidate(); };
+            button.MouseLeave += delegate { hover = false; down = false; button.Invalidate(); };
+            button.MouseDown += delegate { down = true; button.Invalidate(); };
+            button.MouseUp += delegate { down = false; button.Invalidate(); };
+            button.Paint += (sender, e) => PaintButton(button, e.Graphics, hover, down);
+        }
+
+        static void PaintButton(Button button, Graphics g, bool hover, bool down)
+        {
+            PaintUnder(button, g);
+            string kind = button.Tag as string;
+            bool accent = kind == "accent", nav = kind == "nav" || kind == "nav-on";
+            Color fill, text = Text;
+            if (!button.Enabled)
+            {
+                fill = accent ? Color.FromArgb(64, 64, 64) : Color.FromArgb(36, 36, 36);
+                text = Color.FromArgb(112, 112, 112);
+            }
+            else if (accent)
+            {
+                fill = down ? Color.FromArgb(200, 200, 200) : hover ? Color.White : Color.FromArgb(236, 236, 236);
+                text = Color.FromArgb(18, 18, 18);
+            }
+            else if (nav)
+            {
+                fill = kind == "nav-on" ? Color.FromArgb(44, 44, 44) : hover ? Color.FromArgb(30, 30, 30) : Color.Empty;
+                text = kind == "nav-on" || hover ? Text : Color.FromArgb(190, 190, 190);
+            }
+            else fill = down ? ButtonDown : hover ? ButtonHover : Button;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            var r = new RectangleF(0.5f, 0.5f, button.Width - 1f, button.Height - 1f);
+            if (!fill.IsEmpty) FillRounded(g, fill, r, Radius - 2);
+            TextRenderer.DrawText(g, button.Text, button.Font, button.ClientRectangle, text,
+                                  TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix);
+        }
+
+        static void PaintSpin(Control spin, Graphics g)
+        {
+            using (var back = new SolidBrush(Button)) g.FillRectangle(back, spin.ClientRectangle);
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            float x = spin.Width / 2f, half = spin.Height / 2f;
+            using (var pen = new Pen(spin.Enabled ? Color.FromArgb(200, 200, 200) : Color.FromArgb(100, 100, 100), 1.5f))
+            {
+                g.DrawLines(pen, new[] { new PointF(x - 3.5f, half / 2 + 2), new PointF(x, half / 2 - 1.5f), new PointF(x + 3.5f, half / 2 + 2) });
+                g.DrawLines(pen, new[] { new PointF(x - 3.5f, half + half / 2 - 2), new PointF(x, half + half / 2 + 1.5f), new PointF(x + 3.5f, half + half / 2 - 2) });
+            }
+        }
+
+        /// A drop-down list drawn dark: the closed box and the open list both in the field color.
+        static void DarkCombo(ComboBox combo)
+        {
+            combo.BackColor = Field;
+            if (combo.DrawMode != DrawMode.Normal) return;
+            combo.DrawMode = DrawMode.OwnerDrawFixed;
+            combo.ItemHeight = 18;
+            combo.DrawItem += (sender, e) =>
+            {
+                bool edit = (e.State & DrawItemState.ComboBoxEdit) != 0;
+                bool selected = (e.State & DrawItemState.Selected) != 0 && !edit;
+                using (var back = new SolidBrush(selected ? ButtonHover : Field)) e.Graphics.FillRectangle(back, e.Bounds);
+                if (e.Index < 0) return;
+                var bounds = new Rectangle(e.Bounds.X + 4, e.Bounds.Y, e.Bounds.Width - 4, e.Bounds.Height);
+                TextRenderer.DrawText(e.Graphics, combo.GetItemText(combo.Items[e.Index]), combo.Font, bounds,
+                                      combo.Enabled ? Text : Color.FromArgb(112, 112, 112),
+                                      TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine |
+                                      TextFormatFlags.NoPrefix | TextFormatFlags.EndEllipsis);
+            };
+            combo.HandleCreated += delegate { Native.SetWindowTheme(combo.Handle, "DarkMode_CFD", null); };
+        }
     }
 
-    /// A check box drawn in the loader's colors: a dark square, red with a white tick when checked.
+    /// A window that paints a picture behind its controls (the launcher: launcher\background.png).
+    interface IBackdrop
+    {
+        /// The picture as it lies under `control`; `raw` without the darkening. False without one.
+        bool DrawBackdrop(Control control, Graphics g, bool raw);
+    }
+
+    /// A check box drawn in the loader's colors: a dark rounded square, red with a white tick when checked.
     class DarkCheckBox : CheckBox
     {
         public DarkCheckBox()
@@ -235,92 +401,308 @@ namespace RyGT
             SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer |
                      ControlStyles.SupportsTransparentBackColor, true);
             BackColor = Color.Transparent;
+            Cursor = Cursors.Hand;
         }
 
         public override Size GetPreferredSize(Size proposedSize)
         {
             var text = TextRenderer.MeasureText(Text, Font);
-            return new Size(text.Width + 24, Math.Max(text.Height, 16) + 2);
+            return new Size(text.Width + 26, Math.Max(text.Height, 18) + 4);
         }
 
         protected override void OnPaintBackground(PaintEventArgs e)
         {
-            PaintBehind(this, e.Graphics);
-        }
-
-        /// The window's picture under `control`, with the translucent layer of the panel it is on.
-        public static void PaintBehind(Control control, Graphics g)
-        {
-            var form = control.FindForm() as LoaderForm;
-            if (form == null || !form.PaintBackdrop(control, g))
-            {
-                using (var back = new SolidBrush(Dark.Back)) g.FillRectangle(back, control.ClientRectangle);
-            }
-            for (var parent = control.Parent; parent != null; parent = parent.Parent)
-            {
-                var glass = parent as GlassPanel;
-                if (glass != null)
-                {
-                    using (var overlay = new SolidBrush(glass.Overlay)) g.FillRectangle(overlay, control.ClientRectangle);
-                    break;
-                }
-            }
+            Dark.PaintUnder(this, e.Graphics);
         }
 
         protected override void OnPaint(PaintEventArgs e)
         {
             var g = e.Graphics;
             OnPaintBackground(e);
-            g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
-            int size = 14;
-            var box = new Rectangle(1, (Height - size) / 2, size, size);
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            int size = 16;
+            var box = new RectangleF(1.5f, (Height - size) / 2 + 0.5f, size - 1, size - 1);
             bool hover = ClientRectangle.Contains(PointToClient(Cursor.Position));
-            using (var fill = new SolidBrush(!Enabled ? Color.FromArgb(40, 40, 42) : Checked ? Dark.Accent : Color.FromArgb(32, 32, 34)))
-                g.FillRectangle(fill, box);
-            using (var border = new Pen(!Enabled ? Color.FromArgb(70, 70, 72) : Checked ? Dark.AccentHover : hover ? Color.FromArgb(150, 150, 155) : Color.FromArgb(105, 105, 110)))
-                g.DrawRectangle(border, box);
-            if (Checked)
+            Dark.FillRounded(g, !Enabled ? Color.FromArgb(36, 36, 36) : Checked ? (hover ? Dark.AccentHover : Dark.Accent) : Dark.Field, box, 4);
+            if (!Checked)
             {
-                using (var tick = new Pen(Enabled ? Color.White : Color.FromArgb(150, 150, 150), 2f))
+                using (var path = Dark.RoundedRect(box, 4))
+                using (var border = new Pen(!Enabled ? Color.FromArgb(58, 58, 58) : hover ? Color.FromArgb(140, 140, 140) : Color.FromArgb(88, 88, 88)))
+                    g.DrawPath(border, path);
+            }
+            else
+            {
+                using (var tick = new Pen(Enabled ? Color.White : Color.FromArgb(140, 140, 140), 2f))
                 {
                     g.DrawLines(tick, new[]
                     {
-                        new PointF(box.Left + 3f, box.Top + 7.5f),
-                        new PointF(box.Left + 6f, box.Top + 10.5f),
-                        new PointF(box.Left + 11f, box.Top + 4f)
+                        new PointF(box.Left + 3.5f, box.Top + 8f),
+                        new PointF(box.Left + 6.5f, box.Top + 11f),
+                        new PointF(box.Left + 11.5f, box.Top + 4.5f)
                     });
                 }
             }
-            TextRenderer.DrawText(g, Text, Font, new Point(box.Right + 7, (Height - TextRenderer.MeasureText(Text, Font).Height) / 2),
-                                  Enabled ? ForeColor : Dark.DimText, TextFormatFlags.NoPrefix);
+            TextRenderer.DrawText(g, Text, Font, new Point(size + 8, (Height - TextRenderer.MeasureText(Text, Font).Height) / 2),
+                                  Enabled ? ForeColor : Color.FromArgb(112, 112, 112), TextFormatFlags.NoPrefix);
         }
 
         protected override void OnMouseEnter(EventArgs e) { base.OnMouseEnter(e); Invalidate(); }
         protected override void OnMouseLeave(EventArgs e) { base.OnMouseLeave(e); Invalidate(); }
     }
 
-    /// A settings panel over the window's background picture: it paints the picture under it and
-    /// a translucent dark layer itself, so the controls on it (transparent) repaint cleanly. A
-    /// translucent BackColor left old text behind when a control on it was redrawn.
-    class GlassPanel : TableLayoutPanel
+    /// A drop-down list with a rounded dark frame and arrow, drawn over the flat combo box's
+    /// white border once Windows has painted it (its items are drawn by Dark.Apply).
+    class DarkComboBox : ComboBox
     {
-        public Color Overlay = Color.FromArgb(150, 12, 12, 14);
+        bool hover;
 
-        public GlassPanel()
+        protected override void OnMouseEnter(EventArgs e) { base.OnMouseEnter(e); hover = true; Invalidate(); }
+        protected override void OnMouseLeave(EventArgs e) { base.OnMouseLeave(e); hover = false; Invalidate(); }
+        // Windows redraws parts of the box for these without a full paint; paint the frame again.
+        protected override void OnGotFocus(EventArgs e) { base.OnGotFocus(e); Invalidate(); }
+        protected override void OnLostFocus(EventArgs e) { base.OnLostFocus(e); Invalidate(); }
+        protected override void OnSelectedIndexChanged(EventArgs e) { base.OnSelectedIndexChanged(e); Invalidate(); }
+        protected override void OnDropDownClosed(EventArgs e) { base.OnDropDownClosed(e); Invalidate(); }
+        protected override void OnEnabledChanged(EventArgs e) { base.OnEnabledChanged(e); Invalidate(); }
+
+        protected override void WndProc(ref Message m)
+        {
+            base.WndProc(ref m);
+            if (m.Msg != 0xF || !IsHandleCreated) return; // WM_PAINT
+            using (var g = Graphics.FromHwnd(Handle))
+            {
+                var r = new RectangleF(0.5f, 0.5f, Width - 1f, Height - 1f);
+                using (var outside = new Region(ClientRectangle))
+                using (var path = Dark.RoundedRect(r, 6))
+                {
+                    outside.Exclude(path);
+                    g.SetClip(outside, CombineMode.Replace);
+                    Dark.PaintUnder(this, g);
+                    g.ResetClip();
+                    g.SmoothingMode = SmoothingMode.AntiAlias;
+                    // The flat style's inner white line, then the arrow's area.
+                    using (var inner = new Pen(Dark.Field)) g.DrawRectangle(inner, 1, 1, Width - 3, Height - 3);
+                    var arrow = new RectangleF(Width - 22, 2, 20, Height - 4);
+                    using (var field = new SolidBrush(Dark.Field)) g.FillRectangle(field, arrow);
+                    using (var pen = new Pen(!Enabled ? Color.FromArgb(52, 52, 52) : Focused || DroppedDown ? Color.FromArgb(120, 120, 120) :
+                                             hover ? Color.FromArgb(96, 96, 96) : Color.FromArgb(62, 62, 62)))
+                        g.DrawPath(pen, path);
+                    float x = arrow.X + arrow.Width / 2 - 1, y = Height / 2f;
+                    using (var pen = new Pen(Enabled ? Color.FromArgb(200, 200, 200) : Color.FromArgb(100, 100, 100), 1.5f))
+                        g.DrawLines(pen, new[] { new PointF(x - 4, y - 2), new PointF(x, y + 2), new PointF(x + 4, y - 2) });
+                }
+            }
+        }
+    }
+
+    /// A rounded panel with a thin border; the controls on it take its color.
+    class Card : TableLayoutPanel
+    {
+        public float Radius = Dark.Radius;
+        public Color Edge = Dark.Border;
+        /// The card's color; a translucent one lets the window's picture show through it.
+        public readonly Color Fill;
+
+        public Card(Color fill)
         {
             SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer |
                      ControlStyles.ResizeRedraw | ControlStyles.SupportsTransparentBackColor, true);
-            BackColor = Color.Transparent;
+            Fill = fill;
+            BackColor = fill.A == 255 ? fill : Color.Transparent;
+            ColumnCount = 1;
+            ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         }
 
         protected override void OnPaintBackground(PaintEventArgs e)
         {
-            var form = FindForm() as LoaderForm;
-            if (form == null || !form.PaintBackdrop(this, e.Graphics))
+            var g = e.Graphics;
+            Dark.PaintUnder(this, g);
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            var r = new RectangleF(0.5f, 0.5f, Width - 1f, Height - 1f);
+            using (var path = Dark.RoundedRect(r, Radius))
             {
-                using (var back = new SolidBrush(Dark.Back)) e.Graphics.FillRectangle(back, ClientRectangle);
+                using (var fill = new SolidBrush(Fill)) g.FillPath(fill, path);
+                if (!Edge.IsEmpty) using (var pen = new Pen(Edge)) g.DrawPath(pen, path);
             }
-            using (var overlay = new SolidBrush(Overlay)) e.Graphics.FillRectangle(overlay, ClientRectangle);
+        }
+    }
+
+    /// The big rounded banner: the launcher picture (launcher\background.png next to RyGT.exe),
+    /// darkened on the left and at the bottom, where the title and the Play button sit.
+    class Hero : Panel
+    {
+        readonly Image picture;
+        Bitmap cache;
+
+        public Hero(Image picture)
+        {
+            this.picture = picture;
+            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer |
+                     ControlStyles.ResizeRedraw, true);
+            BackColor = Color.FromArgb(20, 20, 20);
+        }
+
+        Point cachedAt;
+
+        /// The banner at the current size and place, drawn once; its controls copy their part of it.
+        Bitmap Picture()
+        {
+            var size = new Size(Math.Max(1, Width), Math.Max(1, Height));
+            var form = FindForm();
+            var at = form != null && IsHandleCreated ? form.PointToClient(PointToScreen(Point.Empty)) : Point.Empty;
+            if (cache != null && cache.Size == size && at == cachedAt) return cache;
+            cachedAt = at;
+            if (cache != null) cache.Dispose();
+            cache = new Bitmap(size.Width, size.Height);
+            using (var art = new Bitmap(size.Width, size.Height))
+            {
+                var r = new Rectangle(Point.Empty, size);
+                using (var g = Graphics.FromImage(art))
+                {
+                    var backdrop = form as IBackdrop;
+                    if (backdrop != null && backdrop.DrawBackdrop(this, g, false))
+                    {
+                        // The window's own picture shows through, behind the same grey glass as the cards.
+                        using (var glass = new SolidBrush(Color.FromArgb(150, 32, 32, 32))) g.FillRectangle(glass, r);
+                    }
+                    else if (picture != null)
+                    {
+                        // Scaled to cover the banner, anchored right and near the top: the picture's
+                        // subject is on its right and its faces (helmets) in its upper part.
+                        float scale = Math.Max(size.Width / (float)picture.Width, size.Height / (float)picture.Height);
+                        int width = (int)Math.Ceiling(picture.Width * scale), height = (int)Math.Ceiling(picture.Height * scale);
+                        g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                        g.DrawImage(picture, size.Width - width, (size.Height - height) / 12, width, height);
+                    }
+                    else
+                    {
+                        using (var glow = new LinearGradientBrush(r, Color.FromArgb(24, 24, 24), Color.FromArgb(96, 16, 26), 0f))
+                            g.FillRectangle(glow, r);
+                    }
+                    using (var shade = new LinearGradientBrush(r, Color.FromArgb(235, 14, 14, 14), Color.FromArgb(0, 14, 14, 14), 0f))
+                    {
+                        shade.Blend = new Blend { Factors = new[] { 0f, 0.25f, 1f, 1f }, Positions = new[] { 0f, 0.35f, 0.8f, 1f } };
+                        g.FillRectangle(shade, r);
+                    }
+                    using (var bottom = new LinearGradientBrush(r, Color.FromArgb(0, 14, 14, 14), Color.FromArgb(170, 14, 14, 14), 90f))
+                    {
+                        bottom.Blend = new Blend { Factors = new[] { 0f, 0f, 1f }, Positions = new[] { 0f, 0.5f, 1f } };
+                        g.FillRectangle(bottom, r);
+                    }
+                }
+                using (var g = Graphics.FromImage(cache))
+                {
+                    Dark.PaintUnder(this, g);
+                    g.SmoothingMode = SmoothingMode.AntiAlias;
+                    using (var path = Dark.RoundedRect(new RectangleF(0, 0, size.Width - 0.5f, size.Height - 0.5f), 12))
+                    {
+                        using (var brush = new TextureBrush(art)) g.FillPath(brush, path);
+                        using (var pen = new Pen(Color.FromArgb(22, 255, 255, 255))) g.DrawPath(pen, path);
+                    }
+                }
+            }
+            return cache;
+        }
+
+        protected override void OnPaintBackground(PaintEventArgs e)
+        {
+            e.Graphics.DrawImageUnscaled(Picture(), 0, 0);
+        }
+
+        /// The banner under one of its controls (rounded buttons and transparent controls on it).
+        public void DrawUnder(Control control, Graphics g)
+        {
+            var at = PointToClient(control.PointToScreen(Point.Empty));
+            g.DrawImageUnscaled(Picture(), -at.X, -at.Y);
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing && cache != null) cache.Dispose();
+            base.Dispose(disposing);
+        }
+    }
+
+    /// A row of the launcher's lists: a round badge with a letter, a title and a grey line under it
+    /// (like a friends list), lighter under the mouse. Click (or Enter/Space) does its action.
+    class ListItem : Control
+    {
+        public string Subtitle = "", Letter = "";
+        public Color Badge = Dark.Accent;
+        bool hover;
+
+        public ListItem()
+        {
+            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer |
+                     ControlStyles.ResizeRedraw | ControlStyles.Selectable, true);
+            Height = 52;
+            Cursor = Cursors.Hand;
+            Font = new Font("Segoe UI", 9f);
+        }
+
+        protected override void OnMouseEnter(EventArgs e) { base.OnMouseEnter(e); hover = true; Invalidate(); }
+        protected override void OnMouseLeave(EventArgs e) { base.OnMouseLeave(e); hover = false; Invalidate(); }
+        protected override void OnGotFocus(EventArgs e) { base.OnGotFocus(e); Invalidate(); }
+        protected override void OnLostFocus(EventArgs e) { base.OnLostFocus(e); Invalidate(); }
+
+        protected override void OnKeyDown(KeyEventArgs e)
+        {
+            base.OnKeyDown(e);
+            if (e.KeyCode == Keys.Enter || e.KeyCode == Keys.Space) OnClick(EventArgs.Empty);
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            var g = e.Graphics;
+            Dark.PaintUnder(this, g);
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            if (hover || (Focused && ShowFocusCues)) Dark.FillRounded(g, Dark.Hover, new RectangleF(0, 0, Width, Height), 8);
+            int badge = 34, x = 9, y = (Height - badge) / 2;
+            using (var fill = new SolidBrush(Badge)) g.FillEllipse(fill, x, y, badge, badge);
+            using (var letter = new Font("Segoe UI Semibold", 11f))
+                TextRenderer.DrawText(g, Letter, letter, new Rectangle(x, y, badge, badge), Color.White,
+                                      TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
+            int left = x + badge + 12;
+            using (var title = new Font("Segoe UI Semibold", 9.75f))
+                TextRenderer.DrawText(g, Text, title, new Rectangle(left, Height / 2 - 19, Width - left - 6, 20), Dark.Text,
+                                      TextFormatFlags.Left | TextFormatFlags.Bottom | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
+            TextRenderer.DrawText(g, Subtitle, Font, new Rectangle(left, Height / 2 + 1, Width - left - 6, 18), Dark.DimText,
+                                  TextFormatFlags.Left | TextFormatFlags.Top | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
+        }
+    }
+
+    /// A level meter in the launcher's colors (the live input of the wheel window): a dark rounded
+    /// track, filled red up to Value.
+    class DarkBar : Control
+    {
+        int minimum, maximum = 100, value;
+
+        public DarkBar()
+        {
+            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer |
+                     ControlStyles.ResizeRedraw, true);
+        }
+
+        public int Minimum { get { return minimum; } set { minimum = value; Invalidate(); } }
+        public int Maximum { get { return maximum; } set { maximum = value; Invalidate(); } }
+
+        public int Value
+        {
+            get { return value; }
+            set { if (value != this.value) { this.value = value; Invalidate(); } }
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            var g = e.Graphics;
+            Dark.PaintUnder(this, g);
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            var track = new RectangleF(0, 0, Width - 0.5f, Height - 0.5f);
+            Dark.FillRounded(g, Dark.Field, track, Height / 2f);
+            int range = maximum - minimum;
+            float amount = range > 0 ? Math.Max(0, Math.Min(1, (value - minimum) / (float)range)) : 0;
+            if (amount > 0)
+                Dark.FillRounded(g, Dark.Accent, new RectangleF(0, 0, Math.Max(Height, (Width - 0.5f) * amount), Height - 0.5f), Height / 2f);
         }
     }
 
@@ -543,7 +925,7 @@ namespace RyGT
         }
     }
 
-    class LoaderForm : Form
+    class LoaderForm : Form, IBackdrop
     {
         static readonly string[] FirmwareModules = { "libSceFont", "libSceFontFt", "libSceFreeTypeOt", "libSceJson2", "libSceNgs2" };
         // Used when present: the JPEG decoder (Scapes thumbnails and backgrounds) and PNG encoder (photos).
@@ -556,8 +938,10 @@ namespace RyGT
         readonly string root = AppDomain.CurrentDomain.BaseDirectory.TrimEnd('\\');
         readonly Settings settings;
         readonly TextBox game, update, modules, fonts, log;
-        readonly Button setup, play;
+        readonly Button setup, play, addDlss;
         readonly Label status;
+        readonly Panel[] pages = new Panel[3];
+        readonly Button[] tabs = new Button[3];
         volatile bool busy;
 
         public LoaderForm()
@@ -566,44 +950,117 @@ namespace RyGT
             Text = "ryGT - Gran Turismo Sport";
             try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
             Font = new Font("Segoe UI", 9f);
-            ClientSize = new Size(1280, 760);
-            MinimumSize = new Size(1260, 640);
+            ClientSize = new Size(1280, 800);
+            MinimumSize = new Size(1120, 720);
             StartPosition = FormStartPosition.CenterScreen;
             DoubleBuffered = true;
-            // The background picture (launcher\background.png next to RyGT.exe) fills the window;
-            // the settings sit on translucent panels over its dark left side.
+
+            // The top bar: the logo and the page tabs (Home, Settings, Controls).
+            var top = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 62, Padding = new Padding(22, 15, 20, 0), WrapContents = false };
+            var logo = new PictureBox { Size = new Size(30, 30), SizeMode = PictureBoxSizeMode.Zoom, Margin = new Padding(0, 0, 8, 0) };
+            try { logo.Image = new Icon(Icon, 32, 32).ToBitmap(); } catch { }
+            top.Controls.Add(logo);
+            top.Controls.Add(new Label { Text = "ryGT", AutoSize = true, Font = new Font("Segoe UI Semibold", 14f), Margin = new Padding(0, 1, 28, 0) });
+            var tabNames = new[] { "Home", "Settings", "Controls" };
+            for (int i = 0; i < tabs.Length; ++i)
+            {
+                int page = i;
+                tabs[i] = new Button
+                {
+                    Text = tabNames[i], AutoSize = true, Tag = "nav", Padding = new Padding(12, 4, 12, 4), Margin = new Padding(0, 0, 4, 0),
+                    Font = new Font("Segoe UI Semibold", 9.75f)
+                };
+                tabs[i].Click += delegate { ShowPage(page); };
+                top.Controls.Add(tabs[i]);
+            }
+
+            // The status bar: what the launcher is doing on the left, the build on the right.
+            var footer = new TableLayoutPanel { Dock = DockStyle.Bottom, Height = 36, ColumnCount = 2, RowCount = 1, Padding = new Padding(26, 0, 26, 2) };
+            footer.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            footer.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            footer.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            status = new Label { AutoSize = true, Anchor = AnchorStyles.Left, ForeColor = Dark.DimText, Tag = "heading", Margin = new Padding(0) };
+            footer.Controls.Add(status, 0, 0);
+            footer.Controls.Add(new Label
+            {
+                Text = "ryGT for Windows " + (char)183 + " GT Sport 1.69", AutoSize = true, Anchor = AnchorStyles.Right, ForeColor = Dark.AccentText,
+                Tag = "heading", Font = new Font("Segoe UI Semibold", 8.5f), Margin = new Padding(0)
+            }, 1, 0);
+
+            // The page on a large rounded panel, the quick-access list on a narrower one beside it.
+            var body = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 1, Padding = new Padding(16, 0, 16, 0) };
+            body.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            body.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 320));
+            body.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            // The launcher picture (launcher\background.png) behind the whole window, the panels and
+            // cards see-through over it; without a picture they are solid.
             background = LoadBackground();
             if (background != null) ResizeRedraw = true;
+            var glass = background != null;
+            var main = new Card(glass ? Color.FromArgb(190, 20, 20, 20) : Dark.Panel) { Dock = DockStyle.Fill, Padding = new Padding(20), Margin = new Padding(0, 0, 12, 0), Radius = 12 };
+            main.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            body.Controls.Add(main, 0, 0);
+            var side = new Card(glass ? Color.FromArgb(190, 20, 20, 20) : Dark.Panel) { Dock = DockStyle.Fill, Padding = new Padding(14, 16, 14, 14), Margin = new Padding(0), Radius = 12 };
+            body.Controls.Add(side, 1, 0);
+            Controls.Add(body);
+            Controls.Add(footer);
+            Controls.Add(top);
 
-            var scroll = new Panel
+            var host = new Panel { Dock = DockStyle.Fill, Margin = new Padding(0) };
+            main.Controls.Add(host, 0, 0);
+            for (int i = 0; i < pages.Length; ++i)
             {
-                Name = "launcherScroll", Dock = DockStyle.Fill, AutoScroll = true,
-                BackColor = Color.Transparent, AutoScrollMargin = new Size(0, 12)
-            };
-            Controls.Add(scroll);
-            var column = new TableLayoutPanel
-            {
-                Name = "launcherContent", Dock = DockStyle.Top, AutoSize = true,
-                AutoSizeMode = AutoSizeMode.GrowAndShrink, MinimumSize = new Size(1220, 0),
-                ColumnCount = 1, Padding = new Padding(24, 18, 10, 14),
-                BackColor = Color.Transparent
-            };
-            column.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-            scroll.Controls.Add(column);
+                pages[i] = new Panel { Dock = DockStyle.Fill, Visible = i == 0 };
+                host.Controls.Add(pages[i]);
+            }
 
-            var title = new Label { Text = "ryGT", AutoSize = true, BackColor = Color.Transparent, Font = new Font("Segoe UI Semibold", 22f), Margin = new Padding(0, 0, 0, 0) };
-            var subtitle = new Label
+            // Home: the banner with Play, the game files and the set up log.
+            var home = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, Margin = new Padding(0) };
+            home.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            home.RowStyles.Add(new RowStyle(SizeType.Absolute, 300));
+            home.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            home.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            pages[0].Controls.Add(home);
+
+            // The background picture (launcher\background.png next to RyGT.exe) fills the banner.
+            var hero = new Hero(background) { Dock = DockStyle.Fill, Margin = new Padding(0, 0, 0, 14) };
+            home.Controls.Add(hero, 0, 0);
+            var heroText = new FlowLayoutPanel
             {
-                Text = "Gran Turismo Sport on Windows. Pick your own decrypted dump (CUSA03220), its 1.69 update, " +
-                       "your PS4 firmware's system modules and fonts; Set up converts the game, Play starts it.",
-                AutoSize = true, MaximumSize = new Size(1160, 0), BackColor = Color.Transparent, Margin = new Padding(2, 0, 0, 12)
+                Dock = DockStyle.Bottom, AutoSize = true, FlowDirection = FlowDirection.TopDown, WrapContents = false,
+                BackColor = Color.Transparent, Padding = new Padding(34, 0, 0, 30)
             };
-            column.Controls.Add(title);
-            column.Controls.Add(subtitle);
+            hero.Controls.Add(heroText);
+            heroText.Controls.Add(new Label
+            {
+                Text = "CUSA03220  " + (char)183 + "  UPDATE 1.69", AutoSize = true, BackColor = Color.Transparent,
+                Font = new Font("Segoe UI Semibold", 8.5f), Margin = new Padding(3, 0, 0, 4)
+            });
+            heroText.Controls.Add(new Label
+            {
+                Text = "Gran Turismo Sport", AutoSize = true, BackColor = Color.Transparent,
+                Font = new Font("Segoe UI Semibold", 26f), Margin = new Padding(0, 0, 0, 4)
+            });
+            heroText.Controls.Add(new Label
+            {
+                Text = "On Windows, from your own decrypted dump (CUSA03220), its 1.69 update and your PS4 firmware's " +
+                       "system modules and fonts. Set up converts the game once; Play starts it.",
+                AutoSize = true, MaximumSize = new Size(520, 0), BackColor = Color.Transparent, ForeColor = Color.FromArgb(214, 214, 214),
+                Tag = "heading", Font = new Font("Segoe UI", 10f), Margin = new Padding(2, 0, 0, 18)
+            });
+            var buttons = new FlowLayoutPanel { AutoSize = true, BackColor = Color.Transparent, Margin = new Padding(0), WrapContents = false };
+            play = new Button { Text = "Play", AutoSize = true, Tag = "accent", Font = new Font("Segoe UI Semibold", 10.5f), Padding = new Padding(34, 8, 34, 8), Margin = new Padding(0, 0, 10, 0) };
+            setup = new Button { Text = "Set up", AutoSize = true, Font = new Font("Segoe UI Semibold", 10f), Padding = new Padding(20, 8, 20, 8), Margin = new Padding(0, 0, 10, 0) };
+            var open = new Button { Text = "Open folder", AutoSize = true, Font = new Font("Segoe UI Semibold", 10f), Padding = new Padding(20, 8, 20, 8), Margin = new Padding(0) };
+            setup.Click += delegate { StartSetup(); };
+            play.Click += delegate { Play(); };
+            open.Click += delegate { OpenFolder(); };
+            buttons.Controls.AddRange(new Control[] { play, setup, open });
+            heroText.Controls.Add(buttons);
 
             // Game files.
-            var files = Section(column, "Game files");
-            var fileTable = new TableLayoutPanel { ColumnCount = 3, AutoSize = true, Dock = DockStyle.Fill, BackColor = Color.Transparent };
+            var files = Section(home, "Game files");
+            var fileTable = new TableLayoutPanel { ColumnCount = 3, AutoSize = true, Dock = DockStyle.Fill, Margin = new Padding(0) };
             fileTable.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
             fileTable.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
             fileTable.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
@@ -613,30 +1070,42 @@ namespace RyGT
             modules = AddRow(fileTable, 2, "System modules", settings.Modules);
             fonts = AddRow(fileTable, 3, "Fonts", settings.Fonts);
 
-            // Display on the left, graphics and controls in the middle, shaders on the right.
-            var grid = new TableLayoutPanel { ColumnCount = 3, AutoSize = true, Dock = DockStyle.Fill, BackColor = Color.Transparent, Margin = new Padding(0) };
-            grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33));
-            grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 34));
-            grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33));
-            var left = new TableLayoutPanel { ColumnCount = 1, AutoSize = true, Dock = DockStyle.Fill, BackColor = Color.Transparent, Margin = new Padding(0, 0, 5, 0) };
-            var right = new TableLayoutPanel { ColumnCount = 1, AutoSize = true, Dock = DockStyle.Fill, BackColor = Color.Transparent, Margin = new Padding(5, 0, 5, 0) };
-            var third = new TableLayoutPanel { ColumnCount = 1, AutoSize = true, Dock = DockStyle.Fill, BackColor = Color.Transparent, Margin = new Padding(5, 0, 0, 0) };
+            var logCard = Section(home, "Set up log", Dark.Card); // solid: its text box cannot be see-through
+            logCard.Margin = new Padding(0);
+            logCard.AutoSize = false;
+            log = new TextBox
+            {
+                Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Vertical, Dock = DockStyle.Fill, BorderStyle = BorderStyle.None,
+                Font = new Font("Consolas", 8.5f), Margin = new Padding(0)
+            };
+            logCard.Controls.Add(log);
+            logCard.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            logCard.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+
+            // Settings: display and shaders on the left, graphics on the right.
+            var settingsPage = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, AutoScroll = true, Margin = new Padding(0) };
+            settingsPage.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
+            settingsPage.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
+            pages[1].Controls.Add(settingsPage);
+            var settingsTitle = PageTitle("Settings", "Saved as you change them; the game reads them when it starts.");
+            settingsPage.Controls.Add(settingsTitle, 0, 0);
+            settingsPage.SetColumnSpan(settingsTitle, 2);
+            var left = new TableLayoutPanel { ColumnCount = 1, AutoSize = true, Dock = DockStyle.Fill, Margin = new Padding(0, 0, 7, 0) };
+            var right = new TableLayoutPanel { ColumnCount = 1, AutoSize = true, Dock = DockStyle.Fill, Margin = new Padding(7, 0, 0, 0) };
             left.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
             right.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-            third.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-            grid.Controls.Add(left, 0, 0);
-            grid.Controls.Add(right, 1, 0);
-            grid.Controls.Add(third, 2, 0);
+            settingsPage.Controls.Add(left, 0, 1);
+            settingsPage.Controls.Add(right, 1, 1);
 
             var display = Section(left, "Display");
             AddScreenSettings(display);
+            AddShapeSetting(display);
             AddOption(display, "Show an FPS counter", "General", "show_fps_counter", false);
             AddOption(display, "Show the splash screen while the game starts", "General", "show_splash", false);
             AddOption(display, "Show the game on Discord (Rich Presence)", "General", "discord_rpc_enabled", true);
             // The game's opening movie (when its own option plays it); off: skipped at once.
             AddOption(display, "Play the opening movie", "General", "opening_movie", true);
             AddMemorySetting(display);
-
 
             // Graphics.
             var graphics = Section(right, "Graphics");
@@ -672,6 +1141,13 @@ namespace RyGT
             // button below (NVIDIA's DLSS SDK and Streamline SDK, or another game's copies).
             string dlssDir = Path.Combine(root, "dlss");
             var dlss = AddOption(graphics, "", "GPU", "dlss_enabled", false);
+            // DLSS's input is the game's own picture, at most 1920 x 1080 (#61).
+            graphics.Controls.Add(new Label
+            {
+                Text = "Internal resolution: up to 1920 x 1080.\nAt 4K output, DLSS corresponds to Performance mode.",
+                AutoSize = true, MaximumSize = new Size(330, 0), BackColor = Color.Transparent, ForeColor = Dark.DimText,
+                Tag = "heading", Margin = new Padding(22, 2, 0, 6)
+            });
             var dlssg = AddOption(graphics, "", "GPU", "dlssg_enabled", false);
             dlssg.Margin = new Padding(22, 2, 0, 2);
             Action refreshDlss = delegate
@@ -688,9 +1164,18 @@ namespace RyGT
                 dlssg.Enabled = dlssgInstalled;
             };
             refreshDlss();
-            var dlssFiles = new Button { Text = "Add DLSS files...", AutoSize = true, Margin = new Padding(22, 2, 0, 4) };
-            dlssFiles.Click += delegate
+            addDlss = new Button { Text = "Add DLSS files...", AutoSize = true, Margin = new Padding(22, 2, 0, 4) };
+            addDlss.Click += delegate
             {
+                // The game keeps the DLSS files open while it runs (#61).
+                var games = Process.GetProcessesByName("GTSport");
+                bool gameRunning = games.Length != 0;
+                foreach (var process in games) process.Dispose();
+                if (gameRunning)
+                {
+                    MessageBox.Show(this, "Close GT Sport before adding or replacing the DLSS files.");
+                    return;
+                }
                 using (var dialog = new FolderBrowserDialog
                 {
                     Description = "Pick the folder with your NVIDIA DLSS files: nvngx_dlss.dll for upscaling; " +
@@ -710,7 +1195,10 @@ namespace RyGT
                             // Found anywhere under the picked folder (the SDKs keep them in bin\x64).
                             var found = Directory.GetFiles(dialog.SelectedPath, name, SearchOption.AllDirectories);
                             if (found.Length == 0) continue;
-                            File.Copy(found[0], Path.Combine(dlssDir, name), true);
+                            // The upscaler is checked to be NVIDIA's 64-bit DLSS library, and the one
+                            // it replaces is kept as a .bak (#61).
+                            if (name == "nvngx_dlss.dll") InstallDlssLibrary(found[0], dlssDir);
+                            else File.Copy(found[0], Path.Combine(dlssDir, name), true);
                             ++copied;
                         }
                     }
@@ -724,7 +1212,23 @@ namespace RyGT
                         : "Copied " + copied + " DLSS file(s) into the dlss folder.");
                 }
             };
-            graphics.Controls.Add(dlssFiles);
+            graphics.Controls.Add(addDlss);
+            AddDlssSharpening(graphics, dlss);
+            // DLSS and FSR both upscale, so one at a time; DLSS runs in Performance mode (#61).
+            fsr.CheckedChanged += delegate { if (fsr.Checked && dlss.Checked) dlss.Checked = false; };
+            Action updateDlss = delegate
+            {
+                if (!dlss.Checked) return;
+                if (fsr.Checked) fsr.Checked = false;
+                try
+                {
+                    if (ReadStringSetting("GPU", "dlss_quality", "performance") != "performance")
+                        WriteSetting("GPU", "dlss_quality", "performance");
+                }
+                catch (Exception e) { MessageBox.Show(this, "Could not save the DLSS setting: " + e.Message); }
+            };
+            dlss.CheckedChanged += delegate { updateDlss(); };
+            updateDlss();
             framegen.CheckedChanged += delegate { if (framegen.Checked && dlssg.Checked) dlssg.Checked = false; };
             dlssg.CheckedChanged += delegate { if (dlssg.Checked && framegen.Checked) framegen.Checked = false; };
             // GTS-007: in the rain the game renders the scene a second time for the wet track's
@@ -734,53 +1238,95 @@ namespace RyGT
             // GTS-008: the rear-view mirror is redrawn every second frame (its picture is kept).
             var mirror = AddOption(graphics, "Rear-view mirror at half rate (a little faster)", "GPU",
                                    "mirror_half_rate", false);
-            // Controls: which controller is which player (splitscreen) with a live preview, and the
-            // controller and keyboard bindings.
-            // Under Shaders (moved there below), so the columns end at about the same height.
-            var controls = Section(third, "Controls");
-            controls.Controls.Add(new Label
+            // The half-rate mirror is off while temporal DLSS is on, to keep its motion data (#61).
+            Action updateMirror = delegate
             {
-                Text = "2 players for Arcade's Split Screen: pick each player's name and controller, " +
-                       "and what each button does. In game, F3 or holding Share + Options " +
-                       "(View + Menu) changes controllers.",
-                AutoSize = true, MaximumSize = new Size(360, 0), BackColor = Color.Transparent, Margin = new Padding(0, 0, 0, 6)
-            });
-            var controlButtons = new FlowLayoutPanel { AutoSize = true, BackColor = Color.Transparent, Margin = new Padding(0), WrapContents = true };
-            var portsButton = new Button { Text = "Controller ports...", AutoSize = true };
-            portsButton.Click += delegate
-            {
-                using (var form = new PortsForm(ReadStringSetting("Input", "controller_ports", ""),
-                                                ReadStringSetting("General", "player_names", "").Split(','),
-                                                (ports, names) =>
-                                                {
-                                                    WriteSetting("Input", "controller_ports", ports);
-                                                    // Read by the game's user service (libSceUserService).
-                                                    WriteSetting("General", "player_names",
-                                                                 string.Join(",", names.Select(n => n.Replace(",", ""))));
-                                                }))
-                {
-                    form.ShowDialog(this);
-                }
+                mirror.Enabled = !dlss.Checked;
+                mirror.Text = dlss.Checked ? "Half-rate rear-view mirror (disabled by DLSS)"
+                                          : "Rear-view mirror at half rate (a little faster)";
             };
-            var bindingsButton = new Button { Text = "Button bindings...", AutoSize = true };
-            bindingsButton.Click += delegate
+            dlss.CheckedChanged += delegate { updateMirror(); };
+            updateMirror();
+
+            // The direct renderer (shaders read game memory in place; Tokyo rain 42.7 fps vs 32.1)
+            // is the only renderer since 2026-10-16; the old renderer's stored shaders stand in
+            // while its own are built (D10), so it has no option any more.
+
+            var extras = Section(right, "Enhancements");
+            AddOption(extras, "PS4 Pro mode", "GPU", "ps4_pro", false);
+            AddOption(extras, "Draw the UI at screen resolution", "GPU", "ui_hires", false);
+            AddOption(extras, "Fast flips (no 30 fps snapping)", "GPU", "fast_flips", false);
+            AddOption(extras, "HDR (experimental; needs Windows HDR on)", "GPU", "hdr_allowed", false);
+
+            // Shaders: the stored ones are built while the splash screen shows; a new one pauses
+            // the game until it is compiled (instead of a stutter and missing objects).
+            var shaders = Section(left, "Shaders");
+            AddOption(shaders, "Precompile shaders on the splash screen", "GPU", "precompile_shaders", true);
+            // What the game does while a new shader compiles during play (GPU.compile_mode).
+            var modeRow = new FlowLayoutPanel { AutoSize = true, BackColor = Color.Transparent, Margin = new Padding(0, 4, 0, 2), WrapContents = false };
+            var modeLabel = new Label { Text = "When new shaders compile", AutoSize = false, Width = 196, Height = 20, BackColor = Color.Transparent, Margin = new Padding(0, 6, 8, 0) };
+            var mode = new DarkComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 160, FlatStyle = FlatStyle.Flat };
+            mode.Items.AddRange(new object[] { "Pause the game", "Slow motion", "Keep going (objects pop in)" });
+            mode.SelectedIndex = Math.Max(0, Math.Min(2, ReadIntSetting("GPU", "compile_mode", 1)));
+            modeRow.Controls.Add(modeLabel);
+            modeRow.Controls.Add(mode);
+            shaders.Controls.Add(modeRow);
+            var batchRow = new FlowLayoutPanel { AutoSize = true, BackColor = Color.Transparent, Margin = new Padding(0, 4, 0, 2), WrapContents = false };
+            var batchLabel = new Label { Text = "Compile batching (when pausing)", AutoSize = false, Width = 196, Height = 20, BackColor = Color.Transparent, Margin = new Padding(0, 6, 8, 0) };
+            // How long one pause may go on compiling the shaders of what comes next: longer pauses,
+            // fewer of them (GPU.compile_batch_ms).
+            var batch = new DarkComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 160, FlatStyle = FlatStyle.Flat };
+            var batchValues = new[] { 0, 100, 300, 1000 };
+            batch.Items.AddRange(new object[] { "Off (only what is needed)", "Short (up to 0.1 s)", "Medium (up to 0.3 s)", "Long (up to 1 s)" });
+            int current = ReadIntSetting("GPU", "compile_batch_ms", 0);
+            int index = Array.IndexOf(batchValues, current);
+            batch.SelectedIndex = index >= 0 ? index : 0;
+            batch.SelectedIndexChanged += delegate
             {
-                using (var form = new ControlsForm(root, Math.Max(1, ReadIntSetting("Input", "keyboard_player", 1)),
-                                                   player => WriteSetting("Input", "keyboard_player", player)))
-                {
-                    form.ShowDialog(this);
-                }
+                try { WriteSetting("GPU", "compile_batch_ms", batchValues[batch.SelectedIndex]); }
+                catch (Exception e) { MessageBox.Show(this, "Could not save the setting: " + e.Message); }
             };
-            // Racing wheels and pedals (ryty-input.ini / ryty-wheel.ini, read by libScePad).
-            var wheelButton = new Button { Text = "Steering wheel...", AutoSize = true };
-            wheelButton.Click += delegate
+            batchRow.Controls.Add(batchLabel);
+
+            var logging = Section(right, "Logging"); // under Graphics, where there is room
+            logging.Controls.Add(new Label { Text = "stdout.log minimum level", AutoSize = true,
+                BackColor = Color.Transparent, Margin = new Padding(0, 0, 0, 4) });
+            var logLevel = new DarkComboBox { Width = 170, DropDownStyle = ComboBoxStyle.DropDownList,
+                FlatStyle = FlatStyle.Flat, BackColor = Dark.Field, ForeColor = Dark.Text };
+            logLevel.Items.AddRange(LogFiles.Levels);
+            logLevel.SelectedIndex = LogFiles.LevelIndex(settings.StdoutLevel);
+            logLevel.SelectedIndexChanged += delegate
             {
-                using (var form = new WheelForm(root)) form.ShowDialog(this);
+                if (logLevel.SelectedIndex < 0) return;
+                settings.StdoutLevel = LogFiles.Levels[logLevel.SelectedIndex];
+                try { settings.Save(); }
+                catch (Exception e) { MessageBox.Show(this, "Could not save the logging level: " + e.Message); }
             };
-            controlButtons.Controls.Add(portsButton);
-            controlButtons.Controls.Add(bindingsButton);
-            controlButtons.Controls.Add(wheelButton);
-            controls.Controls.Add(controlButtons);
+            logging.Controls.Add(logLevel);
+            logging.Controls.Add(new Label { Text = "Selected level and below, on the next launch.\nAll logs are in the logs folder; previous logs are timestamped.",
+                AutoSize = true, MaximumSize = new Size(360, 0), BackColor = Color.Transparent, Margin = new Padding(0, 4, 0, 0) });
+            batchRow.Controls.Add(batch);
+            shaders.Controls.Add(batchRow);
+            batch.Enabled = mode.SelectedIndex == 0;
+            mode.SelectedIndexChanged += delegate
+            {
+                batch.Enabled = mode.SelectedIndex == 0;
+                try { WriteSetting("GPU", "compile_mode", mode.SelectedIndex); }
+                catch (Exception e) { MessageBox.Show(this, "Could not save the setting: " + e.Message); }
+            };
+
+            // Controls: which controller is which player (splitscreen) with a live preview, the
+            // controller and keyboard bindings, and racing wheels and pedals (ryty-input.ini /
+            // ryty-wheel.ini, read by libScePad).
+            var controlsPage = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, AutoScroll = true, Margin = new Padding(0) };
+            controlsPage.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            pages[2].Controls.Add(controlsPage);
+            controlsPage.Controls.Add(PageTitle("Controls", "2 players for Arcade's Split Screen: pick each player's name and controller, and what each " +
+                                                            "button does. In game, F3 or holding Share + Options (View + Menu) changes controllers."));
+            var controls = Section(controlsPage, "Controllers and wheels");
+            controls.Controls.Add(Item("Controller ports...", "Which controller plays as each player, with a live preview", "P", Badges[0], OpenPorts));
+            controls.Controls.Add(Item("Button bindings...", "What each PS4 button is on your controller and keyboard", "B", Badges[1], OpenBindings));
+            controls.Controls.Add(Item("Steering wheel...", "Map your wheel and pedals; force feedback strength and feel", "W", Badges[2], OpenWheel));
             var triggerLabel = new Label
             {
                 AutoSize = true, BackColor = Color.Transparent, Margin = new Padding(0, 8, 0, 0),
@@ -814,115 +1360,125 @@ namespace RyGT
                 ForeColor = Dark.DimText, Tag = "heading", Margin = new Padding(0, 0, 0, 2)
             });
 
-            // Shaders: the stored ones are built while the splash screen shows; a new one pauses
-            // the game until it is compiled (instead of a stutter and missing objects).
-            var shaders = Section(third, "Shaders");
-            AddOption(shaders, "Precompile shaders on the splash screen", "GPU", "precompile_shaders", true);
-            // What the game does while a new shader compiles during play (GPU.compile_mode).
-            var modeRow = new FlowLayoutPanel { AutoSize = true, BackColor = Color.Transparent, Margin = new Padding(0, 4, 0, 2), WrapContents = false };
-            var modeLabel = new Label { Text = "When new shaders compile", AutoSize = false, Width = 196, Height = 20, BackColor = Color.Transparent, Margin = new Padding(0, 6, 8, 0) };
-            var mode = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 160, FlatStyle = FlatStyle.Flat };
-            mode.Items.AddRange(new object[] { "Pause the game", "Slow motion", "Keep going (objects pop in)" });
-            mode.SelectedIndex = Math.Max(0, Math.Min(2, ReadIntSetting("GPU", "compile_mode", 1)));
-            modeRow.Controls.Add(modeLabel);
-            modeRow.Controls.Add(mode);
-            shaders.Controls.Add(modeRow);
-            var batchRow = new FlowLayoutPanel { AutoSize = true, BackColor = Color.Transparent, Margin = new Padding(0, 4, 0, 2), WrapContents = false };
-            var batchLabel = new Label { Text = "Compile batching (when pausing)", AutoSize = false, Width = 196, Height = 20, BackColor = Color.Transparent, Margin = new Padding(0, 6, 8, 0) };
-            // How long one pause may go on compiling the shaders of what comes next: longer pauses,
-            // fewer of them (GPU.compile_batch_ms).
-            var batch = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 160, FlatStyle = FlatStyle.Flat };
-            var batchValues = new[] { 0, 100, 300, 1000 };
-            batch.Items.AddRange(new object[] { "Off (only what is needed)", "Short (up to 0.1 s)", "Medium (up to 0.3 s)", "Long (up to 1 s)" });
-            int current = ReadIntSetting("GPU", "compile_batch_ms", 0);
-            int index = Array.IndexOf(batchValues, current);
-            batch.SelectedIndex = index >= 0 ? index : 0;
-            batch.SelectedIndexChanged += delegate
-            {
-                try { WriteSetting("GPU", "compile_batch_ms", batchValues[batch.SelectedIndex]); }
-                catch (Exception e) { MessageBox.Show(this, "Could not save the setting: " + e.Message); }
-            };
-            batchRow.Controls.Add(batchLabel);
-            batchRow.Controls.Add(batch);
-            shaders.Controls.Add(batchRow);
-            batch.Enabled = mode.SelectedIndex == 0;
-            mode.SelectedIndexChanged += delegate
-            {
-                batch.Enabled = mode.SelectedIndex == 0;
-                try { WriteSetting("GPU", "compile_mode", mode.SelectedIndex); }
-                catch (Exception e) { MessageBox.Show(this, "Could not save the setting: " + e.Message); }
-            };
+            // Quick access, beside every page.
+            side.Controls.Add(new Label { Text = "Quick access", AutoSize = true, Font = new Font("Segoe UI Semibold", 12f), Margin = new Padding(4, 0, 0, 8) });
+            side.Controls.Add(GroupLabel("Controls"));
+            side.Controls.Add(Item("Controller ports", "Who plays as which player", "P", Badges[0], OpenPorts));
+            side.Controls.Add(Item("Button bindings", "Controller and keyboard", "B", Badges[1], OpenBindings));
+            side.Controls.Add(Item("Steering wheel", "Wheel, pedals, force feedback", "W", Badges[2], OpenWheel));
+            side.Controls.Add(GroupLabel("Settings"));
+            side.Controls.Add(Item("Display", "Screen, resolution, refresh rate", "D", Badges[3], delegate { ShowPage(1); }));
+            side.Controls.Add(Item("Graphics", "FSR, DLSS, frame generation", "G", Badges[4], delegate { ShowPage(1); }));
+            side.Controls.Add(Item("Shaders", "Precompiling and compile pauses", "S", Badges[5], delegate { ShowPage(1); }));
+            side.Controls.Add(GroupLabel("Game"));
+            side.Controls.Add(Item("Set up", "Convert the game from your dump", "U", Badges[6], delegate { if (setup.Enabled) StartSetup(); }));
+            side.Controls.Add(Item("Open folder", "The RyGT folder in Explorer", "F", Badges[7], OpenFolder));
 
-            var logging = Section(left, "Logging"); // under Display, where there is room
-            logging.Controls.Add(new Label { Text = "stdout.log minimum level", AutoSize = true,
-                BackColor = Color.Transparent, Margin = new Padding(0, 0, 0, 4) });
-            var logLevel = new ComboBox { Width = 170, DropDownStyle = ComboBoxStyle.DropDownList,
-                FlatStyle = FlatStyle.Flat, BackColor = Dark.Field, ForeColor = Dark.Text };
-            logLevel.Items.AddRange(LogFiles.Levels);
-            logLevel.SelectedIndex = LogFiles.LevelIndex(settings.StdoutLevel);
-            logLevel.SelectedIndexChanged += delegate
-            {
-                if (logLevel.SelectedIndex < 0) return;
-                settings.StdoutLevel = LogFiles.Levels[logLevel.SelectedIndex];
-                try { settings.Save(); }
-                catch (Exception e) { MessageBox.Show(this, "Could not save the logging level: " + e.Message); }
-            };
-            logging.Controls.Add(logLevel);
-            logging.Controls.Add(new Label { Text = "Selected level and below, on the next launch.\nAll logs are in the logs folder; previous logs are timestamped.",
-                AutoSize = true, MaximumSize = new Size(360, 0), BackColor = Color.Transparent, Margin = new Padding(0, 4, 0, 0) });
-            third.Controls.SetChildIndex(controls, third.Controls.Count - 1);
-            column.Controls.Add(grid);
-
-            // Actions on the left; the status line and the log to their right. Pinned under the
-            // settings (not scrolled with them), so Play is always in view and focusing it at start
-            // does not scroll the window's top out of view.
-            var bottom = new TableLayoutPanel { Dock = DockStyle.Bottom, Height = 128, ColumnCount = 2, RowCount = 2, BackColor = Color.Transparent, Padding = new Padding(24, 6, 26, 12) };
-            bottom.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-            bottom.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-            bottom.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-            bottom.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-            var buttons = new FlowLayoutPanel { AutoSize = true, BackColor = Color.Transparent, Margin = new Padding(0, 0, 12, 4), WrapContents = false };
-            setup = new Button { Text = "Set up", AutoSize = true };
-            play = new Button { Text = "Play", AutoSize = true, Tag = "accent", Font = new Font("Segoe UI Semibold", 10f) };
-            var open = new Button { Text = "Open folder", AutoSize = true };
-            setup.Click += delegate { StartSetup(); };
-            play.Click += delegate { Play(); };
-            open.Click += delegate { Process.Start("explorer.exe", "\"" + root + "\""); };
-            buttons.Controls.AddRange(new Control[] { play, setup, open });
-            bottom.Controls.Add(buttons, 0, 0);
-            bottom.SetRowSpan(buttons, 2);
-
-            status = new Label { AutoSize = true, BackColor = Color.Transparent, Margin = new Padding(2, 0, 0, 4) };
-            bottom.Controls.Add(status, 1, 0);
-
-            log = new TextBox { Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Vertical, Height = 110, Dock = DockStyle.Fill, Font = new Font("Consolas", 8.5f) };
-            bottom.Controls.Add(log, 1, 1);
-            Controls.Add(bottom);
-            scroll.BringToFront(); // fills what the pinned bar leaves
-            foreach (Control control in column.Controls) column.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-            // As tall as the settings need, as far as the screen allows.
-            Load += delegate
-            {
-                column.PerformLayout();
-                int want = column.Height + scroll.AutoScrollMargin.Height + bottom.Height + 2;
-                int room = Screen.FromControl(this).WorkingArea.Height - (Height - ClientSize.Height) - 16;
-                ClientSize = new Size(ClientSize.Width, Math.Max(MinimumSize.Height - (Height - ClientSize.Height), Math.Min(want, room)));
-                CenterToScreen();
-            };
-
+            foreach (var column in new[] { settingsPage, controlsPage, side }) Stack(column);
+            ShowPage(0);
             Dark.Apply(this);
-            subtitle.ForeColor = Dark.DimText;
-            title.ForeColor = Color.White;
-            HandleCreated += delegate { Dark.TitleBar(this); };
-            Shown += delegate
+            if (glass)
             {
-                ActiveControl = play.Enabled ? (Control)play : setup;
-                scroll.AutoScrollPosition = new Point(0, 0);
-            };
+                Dark.SeeThrough(this);
+                // A track bar cannot be see-through: about the color of its card over the picture.
+                foreach (var bar in Controls.Find("triggerStrength", true)) bar.BackColor = Color.FromArgb(30, 26, 26);
+            }
+            log.BackColor = Dark.Card;
+            log.ForeColor = Color.FromArgb(190, 190, 190);
+            HandleCreated += delegate { Dark.TitleBar(this); };
+            Shown += delegate { ActiveControl = play.Enabled ? (Control)play : setup; };
             RefreshState();
         }
 
+        // The side list's badge colors.
+        static readonly Color[] Badges =
+        {
+            Color.FromArgb(232, 140, 48), Color.FromArgb(214, 84, 132), Color.FromArgb(70, 176, 120), Color.FromArgb(82, 128, 226),
+            Color.FromArgb(140, 104, 222), Color.FromArgb(40, 160, 170), Color.FromArgb(178, 24, 36), Color.FromArgb(110, 110, 118)
+        };
+
+        /// Shows Home (0), Settings (1) or Controls (2), and marks its tab.
+        public void ShowPage(int index)
+        {
+            for (int i = 0; i < pages.Length; ++i)
+            {
+                pages[i].Visible = i == index;
+                tabs[i].Tag = i == index ? "nav-on" : "nav";
+                tabs[i].Invalidate();
+            }
+        }
+
+        void OpenPorts()
+        {
+            using (var form = new PortsForm(ReadStringSetting("Input", "controller_ports", ""),
+                                            ReadStringSetting("General", "player_names", "").Split(','),
+                                            (ports, names) =>
+                                            {
+                                                WriteSetting("Input", "controller_ports", ports);
+                                                // Read by the game's user service (libSceUserService).
+                                                WriteSetting("General", "player_names",
+                                                             string.Join(",", names.Select(n => n.Replace(",", ""))));
+                                            }))
+            {
+                form.ShowDialog(this);
+            }
+        }
+
+        void OpenBindings()
+        {
+            using (var form = new ControlsForm(root, Math.Max(1, ReadIntSetting("Input", "keyboard_player", 1)),
+                                               player => WriteSetting("Input", "keyboard_player", player)))
+            {
+                form.ShowDialog(this);
+            }
+        }
+
+        void OpenWheel()
+        {
+            using (var form = new WheelForm(root)) form.ShowDialog(this);
+        }
+
+        void OpenFolder()
+        {
+            Process.Start("explorer.exe", "\"" + root + "\"");
+        }
+
         readonly Image background;
+        Bitmap backdropRaw, backdropDim;
+
+        /// The launcher picture covering the window (anchored right and near the top: its subject is
+        /// on the right and its faces in its upper part), plain and darkened.
+        public bool DrawBackdrop(Control control, Graphics g, bool raw)
+        {
+            if (background == null) return false;
+            var client = ClientSize;
+            if (client.Width <= 0 || client.Height <= 0) return false;
+            if (backdropRaw == null || backdropRaw.Size != client)
+            {
+                if (backdropRaw != null) { backdropRaw.Dispose(); backdropDim.Dispose(); }
+                backdropRaw = new Bitmap(client.Width, client.Height);
+                using (var bg = Graphics.FromImage(backdropRaw))
+                {
+                    float scale = Math.Max(client.Width / (float)background.Width, client.Height / (float)background.Height);
+                    int width = (int)Math.Ceiling(background.Width * scale), height = (int)Math.Ceiling(background.Height * scale);
+                    bg.Clear(Dark.Back);
+                    bg.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                    bg.DrawImage(background, client.Width - width, (client.Height - height) / 12, width, height);
+                }
+                backdropDim = new Bitmap(backdropRaw);
+                using (var bg = Graphics.FromImage(backdropDim))
+                using (var dim = new SolidBrush(Color.FromArgb(120, 8, 8, 8)))
+                    bg.FillRectangle(dim, 0, 0, client.Width, client.Height);
+            }
+            var offset = control == this ? Point.Empty : PointToClient(control.PointToScreen(Point.Empty));
+            g.DrawImageUnscaled(raw ? backdropRaw : backdropDim, -offset.X, -offset.Y);
+            return true;
+        }
+
+        protected override void OnPaintBackground(PaintEventArgs e)
+        {
+            if (!DrawBackdrop(this, e.Graphics, false)) base.OnPaintBackground(e);
+        }
 
         Image LoadBackground()
         {
@@ -934,63 +1490,71 @@ namespace RyGT
             return null;
         }
 
-        protected override void OnPaintBackground(PaintEventArgs e)
-        {
-            if (!PaintBackdrop(this, e.Graphics)) base.OnPaintBackground(e);
-        }
-
-        Bitmap backdrop;
-
-        /// The background picture as it lies under `control` (scaled to cover the window, anchored
-        /// right: the picture's subject is on its right). False without a picture.
-        public bool PaintBackdrop(Control control, Graphics g)
-        {
-            if (background == null) return false;
-            var client = ClientRectangle;
-            if (client.Width <= 0 || client.Height <= 0) return false;
-            if (backdrop == null || backdrop.Size != client.Size)
-            {
-                // Scaled once per window size; panels copy their part of it.
-                if (backdrop != null) backdrop.Dispose();
-                backdrop = new Bitmap(client.Width, client.Height);
-                using (var bg = Graphics.FromImage(backdrop))
-                {
-                    float scale = Math.Max(client.Width / (float)background.Width, client.Height / (float)background.Height);
-                    int width = (int)Math.Ceiling(background.Width * scale), height = (int)Math.Ceiling(background.Height * scale);
-                    bg.Clear(Dark.Back);
-                    bg.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
-                    bg.DrawImage(background, client.Right - width, (client.Height - height) / 2, width, height);
-                }
-            }
-            var offset = control == this ? Point.Empty : PointToClient(control.PointToScreen(Point.Empty));
-            g.DrawImage(backdrop, new Rectangle(-offset.X, -offset.Y, backdrop.Width, backdrop.Height));
-            return true;
-        }
-
-        /// A titled group on a translucent dark panel.
+        /// A titled group on a rounded card.
         TableLayoutPanel Section(TableLayoutPanel parent, string heading)
         {
-            var panel = new GlassPanel
+            return Section(parent, heading, background != null ? Color.FromArgb(200, 32, 32, 32) : Dark.Card);
+        }
+
+        TableLayoutPanel Section(TableLayoutPanel parent, string heading, Color fill)
+        {
+            var panel = new Card(fill)
             {
-                ColumnCount = 1, AutoSize = true, Dock = DockStyle.Fill,
-                Padding = new Padding(12, 8, 12, 10), Margin = new Padding(0, 0, 0, 10)
+                AutoSize = true, Dock = DockStyle.Fill, Padding = new Padding(16, 12, 16, 14), Margin = new Padding(0, 0, 0, 14)
             };
-            panel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
             panel.Controls.Add(new Label
             {
-                Text = heading.ToUpperInvariant(), AutoSize = true, BackColor = Color.Transparent,
-                Font = new Font("Segoe UI Semibold", 8.5f), ForeColor = Dark.Heading, Margin = new Padding(0, 0, 0, 4), Tag = "heading"
+                Text = heading, AutoSize = true, Font = new Font("Segoe UI Semibold", 11f), Margin = new Padding(0, 0, 0, 8)
             });
             parent.Controls.Add(panel);
             return panel;
         }
 
+        /// A page's large title and the grey line under it.
+        static Control PageTitle(string title, string subtitle)
+        {
+            var panel = new FlowLayoutPanel { AutoSize = true, FlowDirection = FlowDirection.TopDown, WrapContents = false, Margin = new Padding(0, 0, 0, 12) };
+            panel.Controls.Add(new Label { Text = title, AutoSize = true, Font = new Font("Segoe UI Semibold", 18f), Margin = new Padding(0, 0, 0, 2) });
+            panel.Controls.Add(new Label { Text = subtitle, AutoSize = true, MaximumSize = new Size(820, 0), ForeColor = Dark.DimText, Tag = "heading", Margin = new Padding(2, 0, 0, 0) });
+            return panel;
+        }
+
+        /// Rows as tall as their controls, with the space left over below the last one.
+        static void Stack(TableLayoutPanel table)
+        {
+            int rows = 0;
+            foreach (Control control in table.Controls) rows = Math.Max(rows, table.GetPositionFromControl(control).Row + 1);
+            table.RowStyles.Clear();
+            table.RowCount = rows + 1;
+            for (int i = 0; i < rows; ++i) table.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            table.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        }
+
+        static Label GroupLabel(string text)
+        {
+            return new Label
+            {
+                Text = text.ToUpperInvariant(), AutoSize = true, ForeColor = Dark.Heading, Tag = "heading",
+                Font = new Font("Segoe UI Semibold", 8f), Margin = new Padding(6, 10, 0, 4)
+            };
+        }
+
+        static ListItem Item(string title, string subtitle, string letter, Color badge, Action action)
+        {
+            var item = new ListItem { Text = title, Subtitle = subtitle, Letter = letter, Badge = badge, Dock = DockStyle.Fill, Margin = new Padding(0, 1, 0, 1) };
+            item.Click += delegate { action(); };
+            return item;
+        }
+
         TextBox AddRow(TableLayoutPanel table, int row, string label, string value)
         {
-            table.Controls.Add(new Label { Text = label, AutoSize = true, Anchor = AnchorStyles.Left, BackColor = Color.Transparent, Margin = new Padding(0, 6, 10, 0) }, 0, row);
-            var box = new TextBox { Text = value, Dock = DockStyle.Fill };
-            table.Controls.Add(box, 1, row);
-            var browse = new Button { Text = "Browse...", AutoSize = true };
+            table.Controls.Add(new Label { Text = label, AutoSize = true, Anchor = AnchorStyles.Left, ForeColor = Dark.DimText, Tag = "heading", Margin = new Padding(0, 4, 16, 4) }, 0, row);
+            // A borderless text box on a rounded field.
+            var field = new Card(Dark.Field) { AutoSize = true, Dock = DockStyle.Fill, Radius = 8, Edge = Color.Empty, Padding = new Padding(10, 7, 10, 6), Margin = new Padding(0, 4, 8, 4) };
+            var box = new TextBox { Text = value, Dock = DockStyle.Fill, BorderStyle = BorderStyle.None, Margin = new Padding(0) };
+            field.Controls.Add(box);
+            table.Controls.Add(field, 1, row);
+            var browse = new Button { Text = "Browse...", AutoSize = true, Margin = new Padding(0, 4, 0, 4) };
             browse.Click += delegate
             {
                 using (var dialog = new FolderBrowserDialog { Description = label, SelectedPath = box.Text })
@@ -1147,7 +1711,7 @@ namespace RyGT
             var modes = DisplayModes(out desktopWidth, out desktopHeight, out desktopHz);
 
             var screenRow = new FlowLayoutPanel { AutoSize = true, BackColor = Color.Transparent, Margin = new Padding(0, 2, 0, 2), WrapContents = false };
-            var screen = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 160, FlatStyle = FlatStyle.Flat };
+            var screen = new DarkComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 160, FlatStyle = FlatStyle.Flat };
             screen.Items.AddRange(new object[] { "Windowed", "Borderless fullscreen", "Exclusive fullscreen" });
             bool full = ReadSetting("GPU", "full_screen", false);
             bool exclusive = ReadStringSetting("GPU", "full_screen_mode", "Windowed") == "Fullscreen";
@@ -1157,7 +1721,7 @@ namespace RyGT
             panel.Controls.Add(screenRow);
 
             var resolutionRow = new FlowLayoutPanel { AutoSize = true, BackColor = Color.Transparent, Margin = new Padding(0, 2, 0, 2), WrapContents = false };
-            var resolution = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 160, FlatStyle = FlatStyle.Flat };
+            var resolution = new DarkComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 160, FlatStyle = FlatStyle.Flat };
             var keys = modes.Keys.ToList();
             int width = ReadIntSetting("GPU", "window_width", 0), height = ReadIntSetting("GPU", "window_height", 0);
             if (width < 640 || height < 360)
@@ -1174,7 +1738,7 @@ namespace RyGT
             panel.Controls.Add(resolutionRow);
 
             var refreshRow = new FlowLayoutPanel { AutoSize = true, BackColor = Color.Transparent, Margin = new Padding(0, 2, 0, 2), WrapContents = false };
-            var refresh = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 160, FlatStyle = FlatStyle.Flat };
+            var refresh = new DarkComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 160, FlatStyle = FlatStyle.Flat };
             refreshRow.Controls.Add(new Label { Text = "Refresh rate", AutoSize = false, Width = 196, Height = 20, BackColor = Color.Transparent, Margin = new Padding(0, 6, 8, 0) });
             refreshRow.Controls.Add(refresh);
             panel.Controls.Add(refreshRow);
@@ -1234,11 +1798,32 @@ namespace RyGT
         // whole, then copied again when saved) is off and fewer freed GPU images are kept for
         // reuse. Tokyo rain race, committed memory: 32 GB setting ~11 GB average / 13.5 GB peak,
         // 16 GB setting ~8.6 / 9.0 GB. Picked from the installed RAM the first time.
+        // Screen shape (GPU.aspect_ratio, GTS-009 in renderer patch 0051): GT Sport draws a 16:9
+        // picture. "Fill the screen" widens the race camera to the shape of the game's window or
+        // screen and stretches the picture over it (ultrawide without black bars; the HUD and menus
+        // are stretched too). Read when the game starts.
+        void AddShapeSetting(TableLayoutPanel panel)
+        {
+            var row = new FlowLayoutPanel { AutoSize = true, BackColor = Color.Transparent, Margin = new Padding(0, 2, 0, 2), WrapContents = false };
+            var label = new Label { Text = "Screen shape", AutoSize = false, Width = 196, Height = 20, BackColor = Color.Transparent, Margin = new Padding(0, 6, 8, 0) };
+            var shape = new DarkComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 160, FlatStyle = FlatStyle.Flat };
+            shape.Items.AddRange(new object[] { "16:9 (the game's own)", "Fill the screen (wide)" });
+            shape.SelectedIndex = ReadStringSetting("GPU", "aspect_ratio", "16:9") == "auto" ? 1 : 0;
+            shape.SelectedIndexChanged += delegate
+            {
+                try { WriteSetting("GPU", "aspect_ratio", shape.SelectedIndex == 1 ? "auto" : "16:9"); }
+                catch (Exception e) { MessageBox.Show(this, "Could not save the setting: " + e.Message); }
+            };
+            row.Controls.Add(label);
+            row.Controls.Add(shape);
+            panel.Controls.Add(row);
+        }
+
         void AddMemorySetting(TableLayoutPanel panel)
         {
             var row = new FlowLayoutPanel { AutoSize = true, BackColor = Color.Transparent, Margin = new Padding(0, 4, 0, 2), WrapContents = false };
             var label = new Label { Text = "System memory (RAM)", AutoSize = false, Width = 196, Height = 20, BackColor = Color.Transparent, Margin = new Padding(0, 6, 8, 0) };
-            var ram = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 160, FlatStyle = FlatStyle.Flat };
+            var ram = new DarkComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 160, FlatStyle = FlatStyle.Flat };
             ram.Items.AddRange(new object[] { "16 GB (minimum)", "32 GB+ (recommended)" });
             int stored = ReadIntSetting("GPU", "system_ram_gb", 0);
             int gb = stored > 0 ? stored : InstalledRamGb();
@@ -1271,7 +1856,7 @@ namespace RyGT
         {
             var row = new FlowLayoutPanel { AutoSize = true, BackColor = Color.Transparent, Margin = new Padding(0, 2, 0, 4), WrapContents = false };
             var label = new Label { Text = "Renderer", AutoSize = false, Width = 110, Height = 20, BackColor = Color.Transparent, Margin = new Padding(0, 6, 8, 0) };
-            var renderer = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 230, FlatStyle = FlatStyle.Flat };
+            var renderer = new DarkComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 230, FlatStyle = FlatStyle.Flat };
             renderer.Items.AddRange(new object[] { "Old renderer (default)", "Native renderer (experimental)" });
             renderer.SelectedIndex = ReadSetting("GPU", "native_renderer", false) ? 1 : 0;
             renderer.SelectedIndexChanged += delegate
@@ -1281,6 +1866,56 @@ namespace RyGT
             };
             row.Controls.Add(label);
             row.Controls.Add(renderer);
+            panel.Controls.Add(row);
+        }
+
+        void AddDlssSharpening(TableLayoutPanel panel, CheckBox dlss)
+        {
+            var row = new TableLayoutPanel
+            {
+                ColumnCount = 3, AutoSize = true, Dock = DockStyle.Fill,
+                Margin = new Padding(22, 2, 0, 4), MinimumSize = new Size(0, 30)
+            };
+            row.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            row.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            row.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 65));
+            var label = new Label
+            {
+                Text = "DLSS sharpening", AutoSize = true, Anchor = AnchorStyles.Left,
+                Margin = new Padding(0, 0, 4, 0)
+            };
+            var slider = new TrackBar
+            {
+                Name = "dlssSharpeningSlider", Minimum = 0, Maximum = 100,
+                BackColor = Dark.Field,
+                Value = Math.Max(0, Math.Min(100, ReadIntSetting("GPU", "dlss_sharpening", 0))),
+                SmallChange = 1, LargeChange = 10, TickStyle = TickStyle.None,
+                AutoSize = false, Height = 28, Dock = DockStyle.Fill,
+                Margin = new Padding(0), MinimumSize = new Size(80, 28),
+                AccessibleName = "DLSS sharpening"
+            };
+            var value = new Label
+            {
+                Name = "dlssSharpeningValue", AutoSize = true, Anchor = AnchorStyles.Left,
+                Margin = new Padding(4, 0, 0, 0)
+            };
+            Action refresh = delegate
+            {
+                value.Text = slider.Value == 0 ? "0% (off)" : slider.Value + "%";
+                row.Enabled = dlss.Checked && dlss.Enabled;
+            };
+            slider.ValueChanged += delegate
+            {
+                refresh();
+                try { WriteSetting("GPU", "dlss_sharpening", slider.Value); }
+                catch (Exception e) { MessageBox.Show(this, "Could not save the setting: " + e.Message); }
+            };
+            dlss.CheckedChanged += delegate { refresh(); };
+            dlss.EnabledChanged += delegate { refresh(); };
+            refresh();
+            row.Controls.Add(label, 0, 0);
+            row.Controls.Add(slider, 1, 0);
+            row.Controls.Add(value, 2, 0);
             panel.Controls.Add(row);
         }
 
@@ -1303,11 +1938,53 @@ namespace RyGT
             return parsed as Dictionary<string, object> ?? new Dictionary<string, object>();
         }
 
+        internal static void InstallDlssLibrary(string source, string directory)
+        {
+            if (!string.Equals(Path.GetFileName(source), "nvngx_dlss.dll", StringComparison.OrdinalIgnoreCase))
+                throw new InvalidDataException("Select the NVIDIA Super Resolution file named nvngx_dlss.dll.");
+            using (var reader = new BinaryReader(File.OpenRead(source)))
+            {
+                if (reader.BaseStream.Length < 64 || reader.ReadUInt16() != 0x5a4d)
+                    throw new InvalidDataException("The selected file is not a Windows DLL.");
+                reader.BaseStream.Position = 0x3c;
+                int pe = reader.ReadInt32();
+                if (pe < 64 || pe > reader.BaseStream.Length - 26)
+                    throw new InvalidDataException("The selected DLL has an invalid PE header.");
+                reader.BaseStream.Position = pe;
+                if (reader.ReadUInt32() != 0x4550 || reader.ReadUInt16() != 0x8664)
+                    throw new InvalidDataException("DLSS requires a 64-bit Windows DLL.");
+                reader.BaseStream.Position = pe + 22;
+                if ((reader.ReadUInt16() & 0x2000) == 0 || reader.ReadUInt16() != 0x20b)
+                    throw new InvalidDataException("DLSS requires a 64-bit Windows DLL.");
+            }
+            var version = FileVersionInfo.GetVersionInfo(source);
+            if ((version.CompanyName ?? "").IndexOf("NVIDIA", StringComparison.OrdinalIgnoreCase) < 0 ||
+                (version.FileDescription ?? "").IndexOf("DLSS", StringComparison.OrdinalIgnoreCase) < 0)
+                throw new InvalidDataException("The selected file is not an NVIDIA DLSS library.");
+            string destination = Path.Combine(directory, "nvngx_dlss.dll");
+            if (string.Equals(Path.GetFullPath(source), Path.GetFullPath(destination), StringComparison.OrdinalIgnoreCase)) return;
+            Directory.CreateDirectory(directory);
+            string temporary = destination + ".install-" + Guid.NewGuid().ToString("N");
+            try
+            {
+                File.Copy(source, temporary);
+                if (File.Exists(destination))
+                    File.Replace(temporary, destination, destination + "." + DateTime.UtcNow.ToString("yyyyMMdd-HHmmss-fffffff") + ".bak");
+                else
+                    File.Move(temporary, destination);
+            }
+            finally
+            {
+                if (File.Exists(temporary)) File.Delete(temporary);
+            }
+        }
+
         void RefreshState()
         {
             bool ready = File.Exists(Exe) && Directory.Exists(Path.Combine(root, "app0", "sce_module"));
             play.Enabled = ready && !busy;
             setup.Enabled = !busy;
+            addDlss.Enabled = !busy;
             if (!busy) status.Text = ready ? "Ready. Press Play." : "Not set up yet. Pick the folders and press Set up.";
         }
 
@@ -2069,20 +2746,27 @@ namespace RyGT
                 try { GameExe.Prepare(Path.GetFullPath(args[1])); return 0; }
                 catch (Exception e) { Console.Error.WriteLine(e.Message); return 1; }
             }
-            if (args.Length == 2 && args[0] == "--snapshot")
+            if ((args.Length == 2 || args.Length == 3) && args[0] == "--snapshot")
             {
-                // Renders the window's contents to a PNG (for checking the layout).
+                // Renders the window's contents to a PNG (for checking the layout); a third argument
+                // picks the page: home, settings or controls.
                 using (var form = new LoaderForm())
                 {
                     form.StartPosition = FormStartPosition.Manual;
                     form.Location = new Point(-4000, -4000);
                     form.ShowInTaskbar = false;
                     form.Show();
+                    if (args.Length == 3) form.ShowPage(Math.Max(0, Array.IndexOf(new[] { "home", "settings", "controls" }, args[2])));
                     Application.DoEvents();
-                    // The scrolled settings and the pinned bar under them.
+                    // The client area only: each part of the window drawn where it sits.
                     using (var image = new Bitmap(form.ClientSize.Width, form.ClientSize.Height))
                     {
-                        foreach (Control control in form.Controls) control.DrawToBitmap(image, control.Bounds);
+                        using (var g = Graphics.FromImage(image)) g.Clear(Dark.Back);
+                        for (int i = form.Controls.Count - 1; i >= 0; --i)
+                        {
+                            var part = form.Controls[i];
+                            part.DrawToBitmap(image, part.Bounds);
+                        }
                         image.Save(args[1], System.Drawing.Imaging.ImageFormat.Png);
                     }
                     form.Close();
@@ -2132,7 +2816,12 @@ namespace RyGT
                     while (DateTime.Now < settle) { Application.DoEvents(); Thread.Sleep(20); }
                     using (var image = new Bitmap(form.ClientSize.Width, form.ClientSize.Height))
                     {
-                        form.DrawToBitmap(image, new Rectangle(Point.Empty, form.ClientSize));
+                        using (var g = Graphics.FromImage(image)) g.Clear(Dark.Back);
+                        for (int i = form.Controls.Count - 1; i >= 0; --i)
+                        {
+                            var part = form.Controls[i];
+                            part.DrawToBitmap(image, part.Bounds);
+                        }
                         image.Save(args[1], System.Drawing.Imaging.ImageFormat.Png);
                     }
                     form.Close();

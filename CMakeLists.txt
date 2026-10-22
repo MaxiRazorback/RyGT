@@ -131,6 +131,10 @@ endif()
 
 add_subdirectory(core/relinker)
 
+if(BUILD_TESTING)
+    add_subdirectory(plugins/dlss/tests)
+endif()
+
 find_package(Qt6 QUIET COMPONENTS Widgets)
 
 if(RTY_BUILD_GUI AND Qt6_FOUND)

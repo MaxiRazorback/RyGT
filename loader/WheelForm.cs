@@ -39,7 +39,7 @@ namespace RyGT
             public string DeviceName;    // null: the wheel
             public bool Invert;
             public Label Value;
-            public ProgressBar Bar;
+            public DarkBar Bar;
             public CheckBox InvertBox;
             public Button Detect;
         }
@@ -100,21 +100,23 @@ namespace RyGT
             Text = "ryGT - Steering wheel";
             Font = new Font("Segoe UI", 9f);
             StartPosition = FormStartPosition.CenterParent;
-            ClientSize = new Size(780, 800);
+            ClientSize = new Size(800, 840);
             MinimumSize = new Size(640, 520);
             FormBorderStyle = FormBorderStyle.Sizable;
             MinimizeBox = false;
             try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
 
-            var outer = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, Padding = new Padding(14, 10, 14, 0) };
+            var outer = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, Padding = new Padding(18, 14, 18, 0) };
             outer.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
             Controls.Add(outer);
+            outer.Controls.Add(new Label { Text = "Steering wheel", AutoSize = true, Font = new Font("Segoe UI Semibold", 16f), Margin = new Padding(0, 0, 0, 4) });
 
             outer.Controls.Add(new Label
             {
                 AutoSize = true, MaximumSize = new Size(720, 0), Margin = new Padding(0, 0, 0, 6),
+                ForeColor = Dark.DimText, Tag = "heading",
                 Text = "Map your racing wheel and pedals. Press Detect, then turn the wheel, press the pedal or press the " +
-                       "button you want for that control. The game sees the wheel as a Logitech G29."
+                       "button you want for that control. The game sees the wheel as the model picked below."
             });
             deviceList = new Label { AutoSize = true, MaximumSize = new Size(720, 0), ForeColor = Dark.DimText, Margin = new Padding(0, 0, 0, 6) };
             outer.Controls.Add(deviceList);
@@ -138,7 +140,7 @@ namespace RyGT
                 table.Controls.Add(new Label { Text = r.Label, AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(0, 6, 6, 0) });
                 r.Value = new Label { AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(0, 6, 6, 0) };
                 table.Controls.Add(r.Value);
-                r.Bar = new ProgressBar { Minimum = 0, Maximum = 1000, Dock = DockStyle.Fill, Height = 14, Margin = new Padding(0, 6, 8, 6) };
+                r.Bar = new DarkBar { Minimum = 0, Maximum = 1000, Anchor = AnchorStyles.Left | AnchorStyles.Right, Height = 10, Margin = new Padding(0, 6, 12, 6) };
                 table.Controls.Add(r.Bar);
                 if (r.Analog)
                 {
@@ -161,9 +163,12 @@ namespace RyGT
             }
             var scroll = new Panel { Dock = DockStyle.Fill, AutoScroll = true, Margin = new Padding(0) };
             scroll.Controls.Add(table);
-            outer.Controls.Add(scroll);
+            var mapping = new Card(Dark.Panel) { Dock = DockStyle.Fill, Padding = new Padding(16, 12, 6, 10), Margin = new Padding(0, 6, 0, 10) };
+            mapping.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            mapping.Controls.Add(scroll);
+            outer.Controls.Add(mapping);
 
-            var settings = new TableLayoutPanel { ColumnCount = 2, AutoSize = true, Margin = new Padding(0, 8, 0, 4) };
+            var settings = new TableLayoutPanel { ColumnCount = 2, AutoSize = true, Dock = DockStyle.Fill, Margin = new Padding(0) };
             settings.Controls.Add(new Label { Text = "Wheel rotation (degrees, as set in your wheel's software)", AutoSize = true, Margin = new Padding(0, 6, 8, 0) });
             rotation = new NumericUpDown { Minimum = 90, Maximum = 2880, Increment = 10, Value = 900, Width = 80 };
             settings.Controls.Add(rotation);
@@ -183,14 +188,17 @@ namespace RyGT
             settings.Controls.Add(gameWheelMode);
             settings.SetColumnSpan(gameWheelMode, 2);
             settings.Controls.Add(new Label { Text = "Game sees the wheel as (its force feedback driver)", AutoSize = true, Margin = new Padding(0, 6, 8, 0) });
-            presentAs = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 180, FlatStyle = FlatStyle.Flat };
+            presentAs = new DarkComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 180, FlatStyle = FlatStyle.Flat };
             presentAs.Items.AddRange(PresentNames);
             presentAs.SelectedIndex = 0;
             settings.Controls.Add(presentAs);
-            outer.Controls.Add(settings);
+            var feel = new Card(Dark.Panel) { AutoSize = true, Dock = DockStyle.Fill, Padding = new Padding(16, 10, 16, 12), Margin = new Padding(0, 0, 0, 4) };
+            feel.Controls.Add(new Label { Text = "Force feedback and wheel", AutoSize = true, Font = new Font("Segoe UI Semibold", 11f), Margin = new Padding(0, 0, 0, 4) });
+            feel.Controls.Add(settings);
+            outer.Controls.Add(feel);
 
             // Status and Save/Cancel stay pinned to the bottom, below the scrolling list.
-            var bottom = new FlowLayoutPanel { Dock = DockStyle.Bottom, AutoSize = true, FlowDirection = FlowDirection.TopDown, WrapContents = false, Padding = new Padding(14, 0, 14, 10) };
+            var bottom = new FlowLayoutPanel { Dock = DockStyle.Bottom, AutoSize = true, FlowDirection = FlowDirection.TopDown, WrapContents = false, Padding = new Padding(18, 0, 18, 14) };
             status = new Label { AutoSize = true, MaximumSize = new Size(720, 0), ForeColor = Dark.DimText, Margin = new Padding(0, 4, 0, 4) };
             bottom.Controls.Add(status);
 
@@ -208,6 +216,7 @@ namespace RyGT
             Controls.Add(bottom);
             outer.BringToFront();
             CancelButton = cancel;
+            outer.RowStyles.Add(new RowStyle(SizeType.AutoSize));
             outer.RowStyles.Add(new RowStyle(SizeType.AutoSize));
             outer.RowStyles.Add(new RowStyle(SizeType.AutoSize));
             outer.RowStyles.Add(new RowStyle(SizeType.AutoSize));
@@ -314,7 +323,7 @@ namespace RyGT
             lock (gate)
             {
                 deviceList.Text = deviceOrder.Count == 0
-                    ? "No wheel or joystick found. Plug it in (and start its software, like Moza Pit House or G HUB)."
+                    ? "No wheel or joystick found. Plug it in (and start its software, like Moza Pit House, G HUB or the Thrustmaster drivers)."
                     : "Found: " + string.Join(", ", deviceOrder.Select(id => devices[id].Name + (devices[id].Wheel ? " (wheel)" : "")));
                 var lines = deviceOrder.Select(id =>
                 {
