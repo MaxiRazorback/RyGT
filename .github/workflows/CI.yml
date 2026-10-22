@@ -17,6 +17,8 @@ jobs:
   windows:
     name: Runtime libraries and converter (Windows x64)
     runs-on: windows-latest
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
     defaults:
       run:
         shell: msys2 {0}
@@ -33,20 +35,68 @@ jobs:
           update: true
           install: >-
             mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-ccache
             mingw-w64-ucrt-x86_64-cmake
             mingw-w64-ucrt-x86_64-ninja
+            curl
+            unzip
             zip
 
+      - name: Cache C++ compilation results
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: windows-ucrt64-ccache-${{ hashFiles('**/CMakeLists.txt', '**/*.cpp', '**/*.h', '**/*.hpp', '**/*.c', '**/*.cc') }}
+          restore-keys: |
+            windows-ucrt64-ccache-
+
+      - name: Reset compiler cache statistics
+        run: ccache --zero-stats
+
+      - name: Get pinned FFmpeg revision
+        id: ffmpeg
+        run: echo "sha=$(git -C 3rdparty/ffmpeg-core rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache FFmpeg prebuilt libraries
+        uses: actions/cache@v4
+        with:
+          path: build/windows-mingw/externals/ffmpeg-${{ steps.ffmpeg.outputs.sha }}
+          key: windows-ffmpeg-${{ steps.ffmpeg.outputs.sha }}
+
+      - name: Download FFmpeg prebuilt libraries
+        env:
+          FFMPEG_REVISION: ${{ steps.ffmpeg.outputs.sha }}
+        run: |
+          set -euo pipefail
+          package="build/windows-mingw/externals/ffmpeg-$FFMPEG_REVISION"
+          if [ ! -f "$package/include/libavcodec/avcodec.h" ]; then
+            archive="build/windows-mingw/externals/$FFMPEG_REVISION-ffmpeg-mingw-x64.zip"
+            mkdir -p "$(dirname "$package")"
+            curl --fail --location --retry 5 --retry-all-errors --retry-delay 2 \
+              "https://github.com/KytyPS5/ext-ffmpeg-core/releases/download/$FFMPEG_REVISION/ffmpeg-mingw-x64.zip" \
+              --output "$archive"
+            mkdir -p "$package"
+            unzip -q "$archive" -d "$package"
+            test -f "$package/include/libavcodec/avcodec.h"
+          fi
+
       - name: Configure
+        env:
+          FFMPEG_REVISION: ${{ steps.ffmpeg.outputs.sha }}
         run: >-
           cmake -S . -B build/windows-mingw -G Ninja
           -DCMAKE_BUILD_TYPE=Release
           -DBUILD_TESTING=ON
           -DRTY_ENABLE_LTO=OFF
           -DRTY_BUILD_GUI=OFF
+          -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+          -DFFMPEG_PREBUILT_DIR="$PWD/build/windows-mingw/externals/ffmpeg-$FFMPEG_REVISION"
 
       - name: Build RyGT runtime and converter
         run: cmake --build build/windows-mingw --parallel
+
+      - name: Show compiler cache statistics
+        run: ccache --show-stats
 
       - name: Run tests
         run: ctest --test-dir build/windows-mingw --output-on-failure --parallel 2
