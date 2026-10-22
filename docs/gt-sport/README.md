@@ -51,8 +51,8 @@ own decrypted dump of CUSA03220 with update 1.69 and your own firmware files.
    each module in step 2.
 2. Next to `eboot.elf`, make a folder `sce_module` with the game's `libc.prx`, `libSceFios2.prx`,
    `libSceSecure.prx` and `logiWheel.prx`, and from your firmware `libSceFont.prx`, `libSceFontFt.prx`,
-   `libSceFreeTypeOt.prx`, `libSceJson2.prx` and `libSceNgs2.prx`, plus `libSceJpegDec.prx` (Scapes
-   images) and `libScePngEnc.prx` (saving photos) when your firmware has them.
+   `libSceFreeTypeOt.prx`, `libSceJson2.prx`, `libSceNgs2.prx` and `libSceBluetoothHid.prx`, plus
+   `libSceJpegDec.prx` (Scapes images) and `libScePngEnc.prx` (saving photos) when your firmware has them.
 3. Convert:
    `ryty.exe --windows --ps4 --skip-syscall-check --registry --report port-report.json eboot.elf GTSport.exe`
 4. Next to `GTSport.exe`, put the release's `libs` folder, MinGW DLLs and
