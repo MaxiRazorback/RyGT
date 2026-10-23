@@ -1,0 +1,42 @@
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -3464,6 +3464,13 @@
+ }
+ 
+ bool PipelineCache::NeverSkipped(const std::array<const Shader::Info*, MaxShaderStages>& infos) {
++    // Depth attachments are GPU outputs too. A loading-time shadow bake may run only once;
++    // dropping a draw while its pipeline builds leaves the retained map incomplete.
++    const auto& regs = Regs();
++    if (regs.depth_control.depth_enable && regs.depth_control.depth_write_enable &&
++        regs.depth_buffer.DepthValid()) {
++        return true;
++    }
+     // Keep going: rendering must not wait for a cosmetic pipeline.
+     if (CompileMode() == 2) return false;
+     // FIX-064: tessellated draws wait for their pipeline. On GT Sport's race summary they are
+@@ -3978,7 +3985,11 @@
+     // dozen new shaders came at once). Not compute, and not a shader that writes memory (later
+     // work reads what it writes). -DisablePerf 171 waits as before.
+     static const bool enabled = Common::PerfFeatureEnabled(171);
+-    if (!enabled || regs_override != nullptr || sw_stage == SwStage::Compute ||
++    const auto& regs = Regs();
++    const bool writes_depth = regs.depth_control.depth_enable &&
++                              regs.depth_control.depth_write_enable &&
++                              regs.depth_buffer.DepthValid();
++    if (!enabled || writes_depth || regs_override != nullptr || sw_stage == SwStage::Compute ||
+         !AsyncTranslation() || !AsyncPipelines() || MenusWait()) {
+         return false;
+     }
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.h b/src/video_core/renderer_vulkan/vk_pipeline_cache.h
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.h
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.h
+@@ -442,7 +442,7 @@
+     /// PERF-076: new graphics pipelines build in the background while their draws are skipped.
+     static bool AsyncPipelines();
+     static bool WritesMemory(const std::array<const Shader::Info*, MaxShaderStages>& infos);
+-    static bool NeverSkipped(const std::array<const Shader::Info*, MaxShaderStages>& infos);
++    bool NeverSkipped(const std::array<const Shader::Info*, MaxShaderStages>& infos);
+     struct AsyncStats {
+         u64 deferred{};
+         u64 installed{};

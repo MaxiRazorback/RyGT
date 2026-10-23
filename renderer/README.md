@@ -256,3 +256,15 @@ callback can record these writes after the upload pass's initial barrier; withou
 the dependency, menu icons can receive stale bytes. A delayed-transfer regression
 and six upload/overlap cases pass, the Release build and 2,609 import checks pass,
 and the runtime menu icons stayed correct after a track-to-menu transition.
+
+Patch 0068 applies after 0067. Depth-writing draws wait for both shader translation
+and graphics pipeline creation instead of being skipped during asynchronous
+compilation. A shadow map baked only during loading must receive every caster
+draw; retaining an incomplete map cannot restore the missing shadows. Other
+draws retain the existing asynchronous policy. Newly encountered depth-writing
+pipelines can cause compilation pauses.
+
+The Release renderer built successfully and all 2,654 checked local import
+bindings resolved. A fresh-process first Tokyo track load showed the previously
+missing distant tree shadows with correct rendering. No temporary shadow traces,
+instrumented shaders, capture helpers, or build artifacts are included.
