@@ -268,3 +268,24 @@ The Release renderer built successfully and all 2,654 checked local import
 bindings resolved. A fresh-process first Tokyo track load showed the previously
 missing distant tree shadows with correct rendering. No temporary shadow traces,
 instrumented shaders, capture helpers, or build artifacts are included.
+
+Patch 0069 applies after 0068. Native keeps at most sixteen completed 8 MiB upload
+chunks (128 MiB), rather than retaining the peak reached during loading. Chunks
+still in flight remain untouched; excess completed buffers use the existing
+GPU-safe retirement path. This bounds reusable upload memory, not total VRAM.
+After track-to-menu testing, the live free cache measured 96-104 MiB versus an
+earlier uncapped 568 MiB sample. Rendering and performance remained correct;
+dedicated-VRAM savings have not been quantified.
+
+Patch 0070 applies after 0069 and refines 0068. Only depth-only passes receive its
+mandatory shader-translation and graphics-pipeline waits. Ordinary color draws
+can write depth too; forcing all of them to wait stalled menu cursor updates and
+audio during compilation. Existing asynchronous policies and shader-memory-write
+protection remain in place. Runtime testing confirmed responsive cursor/audio
+while new menu shaders compiled and correct distant shadows on the first Tokyo
+track load.
+
+The combined Release renderer built successfully and all 2,654 local import
+bindings resolved. Temporary allocation inventories, memory readers, capture
+helpers, experimental pool/trimming changes, diagnostic shaders, and compiled
+artifacts are excluded from both patches.
