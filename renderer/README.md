@@ -249,3 +249,10 @@ showroom reflections, and improved menu performance. Intermittent menu-icon
 corruption and other captured defects remain under investigation. Temporary GPU
 timers, road/floor/curve traces, diagnostic shaders, capture helpers, and compiled
 binaries are not included in this patch.
+
+Patch 0067 applies after 0066. It orders native region-refresh transfer writes
+before a texture upload or untiling dispatch reads the same buffer. The upload
+callback can record these writes after the upload pass's initial barrier; without
+the dependency, menu icons can receive stale bytes. A delayed-transfer regression
+and six upload/overlap cases pass, the Release build and 2,609 import checks pass,
+and the runtime menu icons stayed correct after a track-to-menu transition.
