@@ -215,3 +215,37 @@ while the same renderer paths with the extensions still enabled in the driver re
 at the RDNA 3 driver in that mode rather than the renderer; RX 400/500 run AMD's separate legacy
 driver, so only a real card can confirm them. The buffer cache's 4 GB sparse arena pages exceed
 the 2 GB `maxBufferSize` every Radeon reports; RDNA 3's driver accepts them.
+
+## Native resource lifetime and reflection fixes (0066)
+
+Apply `0066-native-resource-lifetime-and-reflection-fixes.patch` after the current
+0020 and 0062-0065 patches on shadGT `ryty-gpu` at
+`1d13c88d2e57bc63ce1586fe0b8f3342b6afdd19`. The lighting-storage, compute-fence
+completion and render-target identity fixes (0054-0056) must also be present.
+When applying the Camera Manager after the upscaler patches, retain both the
+`ryty_camera.h` and `ryty_upscaler_status.h` includes in `ryty_entry.cpp`.
+The older local experimental 0047-0059 patch variants are not prerequisites.
+
+This patch retains GPU-only lighting and depth images within a 512 MiB budget,
+releases page watches only after their final native resource owner retires,
+and invalidates failed host imports after guest mapping changes. It bounds
+image/sparse allocations, protects queued pipeline and translated-fetch lifetimes,
+and batches page protection while refreshing only the buffer ranges being used.
+Menu buffer snapshots and bounded scalar prefixes improve menu performance;
+races retain the direct path to avoid geometry corruption. Image downloads use
+GPU-local tiling before copying back, and overlapping texture uploads preserve
+GPU-written region data.
+
+Normalized native fragment cube sampling uses cube-array views and reconstructed
+directions for filtering across face edges. Vertex/compute sampling and unsupported
+cube operations retain their existing paths. Translation cache versions invalidate
+only the affected shader categories. Vertex-fetch conversions now agree with their
+specialization keys. The window title identifies the active renderer.
+
+The Release renderer built successfully and all 2,609 packaged import bindings
+resolved. Resource-watch cleanup passed 4,097 ownership/overlap cases. Runtime
+checks confirmed restored distant shadows, normal sparks, correct track and
+showroom reflections, and improved menu performance. Intermittent menu-icon
+corruption and other captured defects remain under investigation. Temporary GPU
+timers, road/floor/curve traces, diagnostic shaders, capture helpers, and compiled
+binaries are not included in this patch.

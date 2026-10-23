@@ -1,0 +1,2529 @@
+diff --git a/ryty_gpu/native/image_registry.cpp b/ryty_gpu/native/image_registry.cpp
+index 47738fc..b81f4cb 100644
+--- a/ryty_gpu/native/image_registry.cpp
++++ b/ryty_gpu/native/image_registry.cpp
+@@ -128,6 +128,7 @@ bool WatchedTexture(VAddr begin, VAddr end) {
+             return true;
+         }
+     }
++
+     return false;
+ }
+ 
+@@ -152,11 +153,24 @@ std::string WatchedBytes(VAddr address) {
+ }
+ 
+ bool SameLayout(const VideoCore::ImageInfo& a, const VideoCore::ImageInfo& b) {
+-    return a.guest_address == b.guest_address && a.num_bits == b.num_bits &&
+-           a.size == b.size && a.pitch == b.pitch && a.tile_mode == b.tile_mode &&
+-           a.resources == b.resources && a.num_samples == b.num_samples &&
+-           a.props.is_depth == b.props.is_depth && a.props.is_block == b.props.is_block &&
+-           a.type == b.type;
++    if (a.guest_address != b.guest_address || a.num_bits != b.num_bits ||
++        a.size != b.size || a.pitch != b.pitch || a.tile_mode != b.tile_mode ||
++        a.array_mode != b.array_mode || a.bank_swizzle != b.bank_swizzle ||
++        a.alt_tile != b.alt_tile || a.resources != b.resources ||
++        a.num_samples != b.num_samples || a.props.is_depth != b.props.is_depth ||
++        a.props.is_block != b.props.is_block || a.type != b.type) {
++        return false;
++    }
++    // Equal dimensions do not imply equal byte offsets or padded mip footprints.
++    // Keep format reinterpretation, but only over the same guest-memory layout.
++    for (u32 level = 0; level < a.resources.levels; ++level) {
++        const auto& x = a.mips_layout[level];
++        const auto& y = b.mips_layout[level];
++        if (x.size != y.size || x.pitch != y.pitch || x.height != y.height || x.offset != y.offset) {
++            return false;
++        }
++    }
++    return true;
+ }
+ 
+ const Rhi::ImageView* ImageEntry::View(Rhi::Device& device, const ImageViewKey& key) {
+@@ -246,7 +260,11 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
+                 const auto& c = it->second->info;
+                 if (!it->second->from_cpu && it->second->image &&
+                     !it->second->reused.load(std::memory_order_relaxed) && c.pitch == info.pitch &&
+-                    c.tile_mode == info.tile_mode && c.num_bits == info.num_bits &&
++                    c.tile_mode == info.tile_mode && c.array_mode == info.array_mode &&
++                    c.bank_swizzle == info.bank_swizzle && c.alt_tile == info.alt_tile &&
++                    c.mips_layout[0].pitch == info.mips_layout[0].pitch &&
++                    (c.size != info.size || c.resources != info.resources || SameLayout(c, info)) &&
++                    c.num_bits == info.num_bits &&
+                     c.num_samples == 1 && !c.props.is_depth && c.type == info.type &&
+                     c.pixel_format == info.pixel_format && c.resources.levels == 1 &&
+                     c.resources.layers == 1 && c.size.width >= info.size.width &&
+@@ -309,7 +327,11 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
+                 const auto& c = it->second->info;
+                 if (!it->second->from_cpu && it->second->image &&
+                     !it->second->reused.load(std::memory_order_relaxed) && c.pitch == info.pitch &&
+-                    c.tile_mode == info.tile_mode && c.num_bits == info.num_bits &&
++                    c.tile_mode == info.tile_mode && c.array_mode == info.array_mode &&
++                    c.bank_swizzle == info.bank_swizzle && c.alt_tile == info.alt_tile &&
++                    c.mips_layout[0].pitch == info.mips_layout[0].pitch &&
++                    (c.size != info.size || c.resources != info.resources || SameLayout(c, info)) &&
++                    c.num_bits == info.num_bits &&
+                     c.num_samples == info.num_samples && c.props.is_depth == info.props.is_depth &&
+                     c.props.has_stencil == info.props.has_stencil && c.type == info.type &&
+                     c.resources.levels >= info.resources.levels &&
+@@ -782,8 +804,11 @@ void ImageRegistry::Invalidate(VAddr address, u64 size, Stale why) {
+     ForEachOverlapping(address, address + size, [&](ImageEntry& entry) {
+         if (entry.from_cpu) {
+             MarkStale(entry, why);
+-        } else if (entry.kept.load(std::memory_order_relaxed)) {
+-            MarkReused(entry); // FIX-157
++        } else {
++            entry.guest_modified.store(true, std::memory_order_seq_cst);
++            if (entry.kept.load(std::memory_order_seq_cst)) {
++                MarkReused(entry); // FIX-157
++            }
+         }
+     });
+ }
+@@ -936,7 +961,8 @@ void ImageRegistry::CpuWrite(VAddr address, u64 size, u64 exact) {
+     const VAddr written_end = address + (exact != 0 ? exact : size);
+     ForEachOverlapping(address, address + size, [&](ImageEntry& entry) {
+         if (!entry.from_cpu) {
+-            if (entry.kept.load(std::memory_order_relaxed)) {
++            entry.guest_modified.store(true, std::memory_order_seq_cst);
++            if (entry.kept.load(std::memory_order_seq_cst)) {
+                 MarkReused(entry); // FIX-157
+             }
+             return;
+@@ -1074,6 +1100,9 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list) {
+         if (upload_source) {
+             gpu_source = upload_source(*entry, list);
+         }
++        if (entry->total_uploads.load(std::memory_order_relaxed) == 0) {
++            entry->guest_writes_tracked = gpu_source.guest_writes_tracked;
++        }
+         std::unique_ptr<Rhi::Buffer> source;
+         const Rhi::Buffer* bytes = gpu_source.buffer;
+         u64 bytes_offset = gpu_source.offset;
+@@ -1195,14 +1224,18 @@ bool ImageRegistry::RecordDownload(Rhi::CommandList& list, ImageEntry& entry, co
+                                        .usage = Rhi::BufferUsageStorage |
+                                                 Rhi::BufferUsageTransferDst,
+                                        .memory = Rhi::MemoryKind::DeviceLocal});
+-    if (!tile || !params_buffer || !linear) {
++    auto tiled = device.CreateBuffer({.size = size,
++                                      .usage = Rhi::BufferUsageStorage |
++                                               Rhi::BufferUsageTransferSrc,
++                                      .memory = Rhi::MemoryKind::DeviceLocal});
++    if (!tile || !params_buffer || !linear || !tiled) {
+         return false;
+     }
+     list.CopyImageToBuffer(entry.image.get(), linear.get(), MipCopies(info));
+     list.Barrier(Rhi::ScopeTransfer, Rhi::ScopeCompute);
+     list.BindPipeline(tile);
+     const std::array<Rhi::Binding, 3> bindings{{
+-        {.slot = 0, .type = Rhi::BindingType::StorageBuffer, .buffer = &out, .offset = out_offset,
++        {.slot = 0, .type = Rhi::BindingType::StorageBuffer, .buffer = tiled.get(), .offset = 0,
+          .size = size},
+         {.slot = 1, .type = Rhi::BindingType::StorageBuffer, .buffer = linear.get(), .size = size},
+         {.slot = 2, .type = Rhi::BindingType::UniformBuffer, .buffer = params_buffer.get(),
+@@ -1210,7 +1243,9 @@ bool ImageRegistry::RecordDownload(Rhi::CommandList& list, ImageEntry& entry, co
+     }};
+     list.PushBindings(bindings);
+     list.Dispatch(static_cast<u32>((size / (info.num_bits / 8)) / 64), 1, 1);
+-    list.Barrier(Rhi::ScopeCompute, Rhi::ScopeTransfer | Rhi::ScopeHost);
++    list.Barrier(Rhi::ScopeCompute, Rhi::ScopeTransfer);
++    list.CopyBuffer(tiled.get(), 0, &out, out_offset, size);
++    list.Barrier(Rhi::ScopeTransfer, Rhi::ScopeCompute | Rhi::ScopeHost);
+     return true; // the device frees the temporary buffers after the GPU used them
+ }
+ 
+diff --git a/ryty_gpu/native/image_registry.h b/ryty_gpu/native/image_registry.h
+index db60755..47c1c65 100644
+--- a/ryty_gpu/native/image_registry.h
++++ b/ryty_gpu/native/image_registry.h
+@@ -91,6 +91,10 @@ public:
+     /// NAT-109: hash of the guest bytes last uploaded (small textures; 0: none), so a texture
+     /// made stale by a write to its page that left its bytes alone is not uploaded again.
+     u64 content_hash = 0;
++    /// A GPU-only target cannot be checked against a CPU hash. Its initial upload can instead
++    /// establish that CPU writes to the complete backing range are already being watched.
++    bool guest_writes_tracked = false;
++    std::atomic<bool> guest_modified{false};
+     /// FIX-153 (diagnosis): uploads in all, and where the last one read its bytes (0: none,
+     /// 1: a region, 2: an imported buffer, 3: a gathered copy, 4: a CPU copy).
+     std::atomic<u32> total_uploads{0};
+@@ -172,6 +176,7 @@ public:
+         const Rhi::Buffer* buffer = nullptr;
+         u64 offset = 0;
+         u8 kind = 0; ///< FIX-153 (diagnosis): see ImageEntry::upload_kind
++        bool guest_writes_tracked = false;
+         std::vector<std::unique_ptr<Rhi::Buffer>> keep; ///< alive until the GPU used them
+     };
+     void SetUploadSource(std::function<UploadSource(const ImageEntry&, Rhi::CommandList&)> source) {
+diff --git a/ryty_gpu/native/rhi/rhi_vulkan.cpp b/ryty_gpu/native/rhi/rhi_vulkan.cpp
+index 2146b45..92ace8a 100644
+--- a/ryty_gpu/native/rhi/rhi_vulkan.cpp
++++ b/ryty_gpu/native/rhi/rhi_vulkan.cpp
+@@ -20,6 +20,7 @@
+ #include "video_core/renderer_vulkan/vk_instance.h"
+ #include "video_core/renderer_vulkan/vk_platform.h"
+ #include "video_core/renderer_vulkan/vk_scheduler.h"
++#include "video_core/renderer_vulkan/image_allocation.h"
+ 
+ #include <vk_mem_alloc.h>
+ 
+@@ -845,7 +846,8 @@ std::unique_ptr<Image> VulkanDevice::CreateImage(const ImageDesc& desc) {
+ 
+ std::unique_ptr<Image> VulkanDevice::CreateImageFrom(const VkImageCreateInfo& image_ci,
+                                                     const ImageDesc& desc) {
+-    const VmaAllocationCreateInfo alloc_ci{.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
++    VmaAllocationCreateInfo alloc_ci{.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
++    alloc_ci.pool = Vulkan::SmallImageAllocationPool(allocator, image_ci, alloc_ci);
+     VkImage image{};
+     VmaAllocation allocation{};
+     struct AllocationResult {
+@@ -855,8 +857,14 @@ std::unique_ptr<Image> VulkanDevice::CreateImageFrom(const VkImageCreateInfo& im
+         [&] {
+           image = VK_NULL_HANDLE;
+           allocation = nullptr;
+-          return AllocationResult{vmaCreateImage(
+-              allocator, &image_ci, &alloc_ci, &image, &allocation, nullptr)};
++          VkResult status = vmaCreateImage(
++              allocator, &image_ci, &alloc_ci, &image, &allocation, nullptr);
++          if (status != VK_SUCCESS && alloc_ci.pool) {
++            alloc_ci.pool = VK_NULL_HANDLE;
++            status = vmaCreateImage(
++                allocator, &image_ci, &alloc_ci, &image, &allocation, nullptr);
++          }
++          return AllocationResult{status};
+         },
+         [&] {
+           Collect();
+@@ -1954,6 +1962,7 @@ std::unique_ptr<Device> CreateStandaloneVulkanDevice(std::string* error) {
+         .flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT,
+         .physicalDevice = physical,
+         .device = device,
++        .preferredLargeHeapBlockSize = 32ULL << 20,
+         .pVulkanFunctions = &functions,
+         .instance = instance,
+         .vulkanApiVersion = VK_API_VERSION_1_3,
+@@ -1984,6 +1993,7 @@ std::unique_ptr<Device> CreateStandaloneVulkanDevice(std::string* error) {
+         .max_push_descriptors = max_push_descriptors,
+         .destroy =
+             [device, allocator, kept_instance] {
++                Vulkan::DestroySmallImageAllocationPools(allocator);
+                 vmaDestroyAllocator(allocator);
+                 device.destroy();
+                 delete kept_instance;
+diff --git a/ryty_gpu/native/shadow.cpp b/ryty_gpu/native/shadow.cpp
+index 8510080..c55f271 100644
+--- a/ryty_gpu/native/shadow.cpp
++++ b/ryty_gpu/native/shadow.cpp
+@@ -567,6 +567,7 @@ public:
+     void OnDraw(const u32* packet, PM4ItOpcode opcode, const Regs& regs,
+                 const JobExtents& extents) override {
+         const void* pipeline = nullptr;
++        std::shared_ptr<const void> pipeline_keepalive;
+         const char* miss = nullptr;
+         bool looked_up = false;
+         if ((g_lookups || g_prepare) && state != nullptr && liverpool &&
+@@ -577,7 +578,8 @@ public:
+             AmdGpu::Liverpool::SetThreadDrawState(state);
+             const auto start = std::chrono::steady_clock::now();
+             auto* rasterizer = liverpool->GetRasterizer();
+-            const Vulkan::GraphicsPipeline* found = rasterizer->LookupJobPipeline(&miss);
++            const Vulkan::GraphicsPipeline* found =
++                rasterizer->LookupJobPipeline(pipeline_keepalive, &miss);
+             pipeline = found;
+             if (found && g_prepare) {
+                 // OPT-010: the draw's bindings, worked out here for the recorder.
+@@ -587,7 +589,7 @@ public:
+                     const u32 index_offset =
+                         opcode == PM4ItOpcode::DrawIndexOffset2 ? packet[2] : 0; // its body[1]
+                     native->PrepareJobDraw(
+-                        packet, epoch, regs, *found,
++                        packet, epoch, regs, *found, pipeline_keepalive,
+                         std::span<const Shader::Info* const>{infos.data(),
+                                                              Shader::MaxStageTypes - 1},
+                         is_indexed, index_offset);
+diff --git a/ryty_gpu/ryty_core_shims.cpp b/ryty_gpu/ryty_core_shims.cpp
+index 077cc92..b10dc9e 100644
+--- a/ryty_gpu/ryty_core_shims.cpp
++++ b/ryty_gpu/ryty_core_shims.cpp
+@@ -574,6 +574,10 @@ static AreaAnswer LookupAreaWalk(VAddr virtual_addr, VAddr limit) {
+             answer.readable};
+ }
+ 
++u64 MappingGeneration() {
++    return GetAreaCache().version.load(std::memory_order_acquire);
++}
++
+ void NoteMappingChange(VAddr address, u64 size) {
+     DropAliases(address, size); // PERF-080
+     auto& cache = GetAreaCache();
+diff --git a/ryty_gpu/ryty_entry.cpp b/ryty_gpu/ryty_entry.cpp
+index a9d783e..516c7a7 100644
+--- a/ryty_gpu/ryty_entry.cpp
++++ b/ryty_gpu/ryty_entry.cpp
+@@ -38,6 +38,7 @@
+ #include "ryty_gpu/native/image_registry.h"
+ #include "sdl_window.h"
+ #include "video_core/renderer_vulkan/vk_rasterizer.h"
++#include "video_core/renderer_vulkan/vk_rasterizer_native.h"
+ #include "core/debug_state.h"
+ #include "imgui.h"
+ #ifdef ENABLE_DISCORD_RPC
+@@ -66,7 +67,9 @@ void RunWindowThread() {
+     auto* controllers = Common::Singleton<Input::GameControllers>::Instance();
+     static Frontend::WindowSDL window(EmulatorSettings.GetWindowWidth(),
+                                       EmulatorSettings.GetWindowHeight(), controllers,
+-                                      "ryGT - Gran Turismo Sport");
++                                      Vulkan::NativeModeRequested()
++                                          ? "ryGT - Gran Turismo Sport (Native renderer)"
++                                          : "ryGT - Gran Turismo Sport (ShadGT renderer)");
+     window.SetIcon({}); // shadGT's Gran Turismo Sport icon
+     {
+         std::scoped_lock lock{g_window_mutex};
+diff --git a/src/core/memory.h b/src/core/memory.h
+index e662048..a1ee54e 100644
+--- a/src/core/memory.h
++++ b/src/core/memory.h
+@@ -24,6 +24,8 @@ namespace Core::RytyMemory {
+ VAddr MappedAreaEnd(VAddr virtual_addr, VAddr limit = ~VAddr{0});
+ /// Called when Ryty maps or unmaps guest memory, so cached MappedAreaEnd answers are dropped.
+ void NoteMappingChange(VAddr address, u64 size);
++/// Changes whenever Ryty reports a mapping or protection update.
++u64 MappingGeneration();
+ /// A guarded direct read of guest memory is running on this thread (see ryty_core_shims.cpp).
+ bool InGuardedRead();
+ /// Whether page tracking, rather than the game, made the page of address unreadable.
+diff --git a/src/shader_recompiler/backend/spirv/emit_spirv_image.cpp b/src/shader_recompiler/backend/spirv/emit_spirv_image.cpp
+index 28904ba..37fcfbf 100644
+--- a/src/shader_recompiler/backend/spirv/emit_spirv_image.cpp
++++ b/src/shader_recompiler/backend/spirv/emit_spirv_image.cpp
+@@ -9,7 +9,8 @@
+ namespace Shader::Backend::SPIRV {
+ 
+ template <bool is_float>
+-static Id FixImageCoords(EmitContext& ctx, Id coords, AmdGpu::ImageType image_type) {
++static Id FixImageCoords(EmitContext& ctx, Id coords, AmdGpu::ImageType image_type,
++                         bool native_cube = false) {
+     const auto coord_type = is_float ? ctx.F32 : ctx.U32;
+     const auto zero = is_float ? ctx.f32_zero_value : ctx.u32_zero_value;
+ 
+@@ -32,6 +33,38 @@ static Id FixImageCoords(EmitContext& ctx, Id coords, AmdGpu::ImageType image_ty
+             const auto y = ctx.OpCompositeExtract(coord_type[1], coords, 1U);
+             const auto face = ctx.OpCompositeExtract(coord_type[1], coords, 2U);
+ 
++            if (native_cube) {
++                // GCN supplies face-local coordinates in [1,2] and eight indices per
++                // cube. Recover a direction so Vulkan can filter across face edges.
++                const Id cube = ctx.OpFloor(ctx.F32[1],
++                    ctx.OpFDiv(ctx.F32[1], face, ctx.ConstF32(8.f)));
++                const Id local_face = ctx.OpFSub(ctx.F32[1], face,
++                    ctx.OpFMul(ctx.F32[1], cube, ctx.ConstF32(8.f)));
++                const Id s = ctx.OpFSub(ctx.F32[1],
++                    ctx.OpFMul(ctx.F32[1], x, ctx.ConstF32(2.f)), ctx.ConstF32(3.f));
++                const Id t = ctx.OpFSub(ctx.F32[1],
++                    ctx.OpFMul(ctx.F32[1], y, ctx.ConstF32(2.f)), ctx.ConstF32(3.f));
++                const Id ns = ctx.OpFNegate(ctx.F32[1], s);
++                const Id nt = ctx.OpFNegate(ctx.F32[1], t);
++                const Id one = ctx.ConstF32(1.f);
++                const Id neg_one = ctx.ConstF32(-1.f);
++                std::array<Id, 5> is_face{};
++                for (u32 f = 0; f < is_face.size(); ++f) {
++                    is_face[f] = ctx.OpFOrdEqual(ctx.U1[1], local_face, ctx.ConstF32(float(f)));
++                }
++                const auto select = [&](std::array<Id, 6> values) {
++                    Id value = values.back();
++                    for (s32 f = 4; f >= 0; --f) {
++                        value = ctx.OpSelect(ctx.F32[1], is_face[f], values[f], value);
++                    }
++                    return value;
++                };
++                return ctx.OpCompositeConstruct(ctx.F32[4],
++                    select({one, neg_one, s, s, s, ns}),
++                    select({nt, nt, one, neg_one, nt, nt}),
++                    select({ns, s, t, nt, one, neg_one}), cube);
++            }
++
+             // AMD cube math results in coordinates in the range [1.0, 2.0]. We need
+             // to convert this to the range [0.0, 1.0] to get correct results.
+             const auto one = ctx.ConstF32(1.f);
+@@ -151,7 +184,7 @@ Id EmitImageSampleImplicitLod(EmitContext& ctx, IR::Inst* inst, u32 handle, Id c
+     const Id result_type = texture.data_types->Get(4);
+     const Id sampler = ctx.OpLoad(ctx.sampler_type, ctx.samplers[handle >> 16]);
+     const Id sampled_image = ctx.OpSampledImage(texture.sampled_type, image, sampler);
+-    const Id fixed_coords = FixImageCoords<true>(ctx, coords, texture.view_type);
++    const Id fixed_coords = FixImageCoords<true>(ctx, coords, texture.view_type, texture.native_cube);
+     ImageOperands operands;
+     operands.Add(spv::ImageOperandsMask::Bias, bias);
+     operands.AddOffset(ctx, texture.view_type, offset);
+@@ -167,7 +200,7 @@ Id EmitImageSampleExplicitLod(EmitContext& ctx, IR::Inst* inst, u32 handle, Id c
+     const Id result_type = texture.data_types->Get(4);
+     const Id sampler = ctx.OpLoad(ctx.sampler_type, ctx.samplers[handle >> 16]);
+     const Id sampled_image = ctx.OpSampledImage(texture.sampled_type, image, sampler);
+-    const Id fixed_coords = FixImageCoords<true>(ctx, coords, texture.view_type);
++    const Id fixed_coords = FixImageCoords<true>(ctx, coords, texture.view_type, texture.native_cube);
+     ImageOperands operands;
+     operands.Add(spv::ImageOperandsMask::Lod, lod);
+     operands.AddOffset(ctx, texture.view_type, offset);
+@@ -267,8 +300,18 @@ Id EmitImageQueryDimensions(EmitContext& ctx, IR::Inst* inst, u32 handle, Id lod
+     case AmdGpu::ImageType::Color2D:
+     case AmdGpu::ImageType::Color2DMsaa:
+         return ctx.OpCompositeConstruct(ctx.U32[4], query(ctx.U32[2]), zero, mips());
++    case AmdGpu::ImageType::Cube: {
++        if (texture.native_cube) {
++            const Id dims = query(ctx.U32[3]);
++            const Id width = ctx.OpCompositeExtract(ctx.U32[1], dims, 0U);
++            const Id height = ctx.OpCompositeExtract(ctx.U32[1], dims, 1U);
++            const Id faces = ctx.OpIMul(ctx.U32[1],
++                ctx.OpCompositeExtract(ctx.U32[1], dims, 2U), ctx.ConstU32(6u));
++            return ctx.OpCompositeConstruct(ctx.U32[4], width, height, faces, mips());
++        }
++        return ctx.OpCompositeConstruct(ctx.U32[4], query(ctx.U32[3]), mips());
++    }
+     case AmdGpu::ImageType::Color2DArray:
+-    case AmdGpu::ImageType::Cube:
+     case AmdGpu::ImageType::Color3D:
+         return ctx.OpCompositeConstruct(ctx.U32[4], query(ctx.U32[3]), mips());
+     default:
+diff --git a/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp b/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
+index 620a154..210ed29 100644
+--- a/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
++++ b/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
+@@ -244,6 +244,20 @@ Id EmitContext::GetBufferSize(const u32 sharp_idx) {
+ }
+ 
+ void EmitContext::DefineBufferProperties() {
++    if (hw_stage == HwStage::Compute && info.uses_direct) {
++        // The per-dispatch table is immutable. Load scalar-pointer entries in the prologue
++        // so their IDs dominate all uses, including dynamic constant reads inside loops.
++        direct_table_words.resize(4 + info.buffers.size() * 4);
++        for (u32 i = 0; i < info.buffers.size(); ++i) {
++            if (!IsDirectBuffer(i) ||
++                info.buffers[i].post_op != SharpFetchPostOp::ReadConstPointer) {
++                continue;
++            }
++            for (u32 word = 4 + i * 4; word < 8 + i * 4; ++word) {
++                direct_table_words[word] = DirectTableWord(word);
++            }
++        }
++    }
+     if (!profile.needs_buffer_offsets) {
+         return;
+     }
+@@ -1001,6 +1015,10 @@ Id ImageType(EmitContext& ctx, const ImageResource& desc, Id sampled_type) {
+     const auto format = desc.is_atomic ? GetFormat(image) : spv::ImageFormat::Unknown;
+     const auto type = image.GetViewType(desc.is_array);
+     const u32 sampled = desc.is_written ? 2 : 1;
++    if (desc.post_op == SharpFetchPostOp::NativeCubeSampling) {
++        ctx.AddCapability(spv::Capability::SampledCubeArray);
++        return ctx.TypeImage(sampled_type, spv::Dim::Cube, false, true, false, sampled, format);
++    }
+     switch (type) {
+     case AmdGpu::ImageType::Color1D:
+     case AmdGpu::ImageType::Color2D:
+@@ -1050,6 +1068,7 @@ void EmitContext::DefineImagesAndSamplers() {
+             .view_type = sharp.GetViewType(image_desc.is_array),
+             .is_integer = is_integer,
+             .is_storage = is_storage,
++            .native_cube = image_desc.post_op == SharpFetchPostOp::NativeCubeSampling,
+             .mip_fallback_mode = mip_fallback_mode,
+         });
+         interfaces.push_back(id);
+@@ -1221,6 +1240,9 @@ Id EmitContext::DefineUfloatM5ToFloat32(u32 mantissa_bits, const std::string_vie
+ }
+ 
+ Id EmitContext::DirectTableWord(u32 index) {
++    if (index < direct_table_words.size() && Sirit::ValidId(direct_table_words[index])) {
++        return direct_table_words[index];
++    }
+     const auto& table = buffers[direct_table_index];
+     const auto [id, pointer_type] = table.Alias(PointerType::U32);
+     return OpLoad(U32[1], OpAccessChain(pointer_type, id, u32_zero_value, ConstU32(index)));
+@@ -1273,7 +1295,18 @@ Id EmitContext::EmitDirectLoad(u32 handle, Id byte_offset, u32 bytes, Id result_
+     const Id direct_label = OpLabel();
+     const Id fallback_label = OpLabel();
+     const Id merge_label = OpLabel();
+-    const Id valid = OpINotEqual(U1[1], DirectTableWord(entry + 3), u32_zero_value);
++    const Id mode = DirectTableWord(entry + 3);
++    Id valid = OpINotEqual(U1[1], mode, u32_zero_value);
++    if (info.hw_stage == HwStage::Compute &&
++        info.buffers[handle].post_op == SharpFetchPostOp::ReadConstPointer) {
++        // 0: ordinary SSBO, 1: direct guest reads, >1: SSBO prefix length. Reads beyond
++        // the prefix retain the original direct path and its full guest-buffer bounds.
++        const Id end = OpIAdd(U32[1], byte_offset, ConstU32(bytes));
++        const Id cached = OpLogicalAnd(U1[1], OpUGreaterThan(U1[1], mode, ConstU32(1U)),
++            OpLogicalAnd(U1[1], OpULessThanEqual(U1[1], end, mode),
++                          OpUGreaterThanEqual(U1[1], end, byte_offset)));
++        valid = OpLogicalAnd(U1[1], valid, OpLogicalNot(U1[1], cached));
++    }
+     OpSelectionMerge(merge_label, spv::SelectionControlMask::MaskNone);
+     OpBranchConditional(valid, direct_label, fallback_label);
+ 
+diff --git a/src/shader_recompiler/backend/spirv/spirv_emit_context.h b/src/shader_recompiler/backend/spirv/spirv_emit_context.h
+index 7cbf76d..0ec157d 100644
+--- a/src/shader_recompiler/backend/spirv/spirv_emit_context.h
++++ b/src/shader_recompiler/backend/spirv/spirv_emit_context.h
+@@ -308,6 +308,7 @@ public:
+         AmdGpu::ImageType view_type;
+         bool is_integer = false;
+         bool is_storage = false;
++        bool native_cube = false;
+         MipStorageFallbackMode mip_fallback_mode{};
+     };
+ 
+@@ -367,6 +368,7 @@ public:
+     Id physical_pointer_type_u8;
+     Id physical_pointer_type_u16;
+     size_t direct_table_index{}; // D2
++    std::vector<Id> direct_table_words; ///< entry-point IDs; helpers are emitted before these
+     Id direct_translate{};
+     bool IsDirectBuffer(u32 handle) const;
+     Id EmitDirectLoad(u32 handle, Id byte_offset, u32 bytes, Id result_type,
+diff --git a/src/shader_recompiler/frontend/translate/translate.cpp b/src/shader_recompiler/frontend/translate/translate.cpp
+index 5dd28a5..2928ba8 100644
+--- a/src/shader_recompiler/frontend/translate/translate.cpp
++++ b/src/shader_recompiler/frontend/translate/translate.cpp
+@@ -3,6 +3,7 @@
+ 
+ #include "common/io_file.h"
+ #include "common/path_util.h"
++#include "common/perf_monitor.h"
+ #include "core/emulator_settings.h"
+ #include "shader_recompiler/frontend/decode.h"
+ #include "shader_recompiler/frontend/fetch_shader.h"
+@@ -1160,6 +1161,7 @@ void Translator::EmitFetch(const GcnInst& inst) {
+     info.has_fetch_shader = true;
+     info.fetch_shader_sgpr_base = code_sgpr_base;
+     ASSERT(ParseFetchShader(info, fetch_data));
++    info.translated_fetch_shader = std::make_shared<const FetchShaderData>(fetch_data);
+ 
+     if (EmulatorSettings.IsDumpShaders()) {
+         using namespace Common::FS;
+@@ -1183,9 +1185,15 @@ void Translator::EmitFetch(const GcnInst& inst) {
+         const auto values =
+             ir.CompositeConstruct(ir.GetAttribute(attr, 0), ir.GetAttribute(attr, 1),
+                                   ir.GetAttribute(attr, 2), ir.GetAttribute(attr, 3));
++        // StageSpecialization keys these descriptors as plain floats with identity swizzles.
++        // Emit that same interpretation: retaining the invalid V#'s conversion/swizzle here
++        // would cache different code under that key and reuse it for a later valid descriptor.
++        static const bool plain_garbage = Common::PerfFeatureEnabled(83);
++        const bool plain = plain_garbage && buffer.GetSize() >= (u64{1} << 30);
+         const auto converted =
+-            IR::ApplyReadNumberConversionVec4(ir, values, buffer.GetNumberConversion());
+-        const auto swizzled = ApplySwizzle(ir, converted, buffer.DstSelect());
++            plain ? values : IR::ApplyReadNumberConversionVec4(ir, values,
++                                                              buffer.GetNumberConversion());
++        const auto swizzled = plain ? converted : ApplySwizzle(ir, converted, buffer.DstSelect());
+         for (u32 i = 0; i < attrib.num_elements; i++) {
+             ir.SetVectorReg(dst_reg++, IR::F32{ir.CompositeExtract(swizzled, i)});
+         }
+diff --git a/src/shader_recompiler/info.h b/src/shader_recompiler/info.h
+index 02e56d5..086fd12 100644
+--- a/src/shader_recompiler/info.h
++++ b/src/shader_recompiler/info.h
+@@ -6,6 +6,7 @@
+ #include <atomic>
+ #include <bitset>
+ #include <span>
++#include <memory>
+ #include <vector>
+ #include <boost/container/static_vector.hpp>
+ #include "common/assert.h"
+@@ -27,6 +28,7 @@ struct Archive;
+ }
+ 
+ namespace Shader {
++namespace Gcn { struct FetchShaderData; }
+ 
+ /// PB-1 (shader pre-build): a translation replayed outside the game. What the translator would
+ /// read from guest memory comes from a stored shader record instead: the flattened user data
+@@ -80,6 +82,9 @@ struct InfoPersistent {
+ };
+ 
+ struct Info : InfoPersistent {
++    // Parsed while translating; guest fetch code may be reused before async results are harvested.
++    std::shared_ptr<const Gcn::FetchShaderData> translated_fetch_shader;
++
+     struct AttributeFlags {
+         bool Get(IR::Attribute attrib, u32 comp = 0) const {
+             return flags[Index(attrib)] & (1 << comp);
+diff --git a/src/shader_recompiler/ir/passes/resource_patching_pass.cpp b/src/shader_recompiler/ir/passes/resource_patching_pass.cpp
+index 31d1b99..6638901 100644
+--- a/src/shader_recompiler/ir/passes/resource_patching_pass.cpp
++++ b/src/shader_recompiler/ir/passes/resource_patching_pass.cpp
+@@ -247,6 +247,20 @@ void PatchImageSharp(const ResourceDiscovery& resource, Info& info, Descriptors&
+ 
+     auto image = image_res.GetSharp(info);
+     ASSERT(image.GetType() != AmdGpu::ImageType::Invalid);
++    // Keep integer accesses, comparison/gather operations, and face-space offsets or
++    // gradients on their existing array path. Ordinary cube samples can use the host
++    // cube sampler; the post-op separates their descriptor from any array access.
++    if (profile.native_cube_sampling && info.hw_stage == HwStage::Fragment &&
++        image.GetType() == AmdGpu::ImageType::Cube &&
++        inst.GetOpcode() == IR::Opcode::ImageSampleRaw && !inst_info.is_depth &&
++        !inst_info.is_gather && !inst_info.has_offset && !inst_info.has_derivatives &&
++        !inst_info.is_unnormalized) {
++        AmdGpu::Sampler sampler{};
++        const auto fetch = ConstructSharpFetch<AmdGpu::Sampler>(resource.sharps[1]);
++        if (fetch.Fetch(info.flattened_ud_buf.data(), &sampler) && !sampler.force_unnormalized) {
++            image_res.post_op = SharpFetchPostOp::NativeCubeSampling;
++        }
++    }
+ 
+     if (needs_mip_storage_fallback) {
+         // If the mip level to IMAGE_(LOAD/STORE)_MIP is a constant, set up ImageResource
+diff --git a/src/shader_recompiler/profile.h b/src/shader_recompiler/profile.h
+index d31cd56..2c028a0 100644
+--- a/src/shader_recompiler/profile.h
++++ b/src/shader_recompiler/profile.h
+@@ -37,6 +37,7 @@ struct Profile {
+     bool support_fp64_signed_zero_inf_nan_preserve{};
+     bool supports_image_load_store_lod{};
+     bool supports_native_cube_calc{};
++    bool native_cube_sampling{};
+     bool supports_trinary_minmax{};
+     bool supports_buffer_fp32_atomic_min_max{};
+     bool supports_image_fp32_atomic_min_max{};
+diff --git a/src/shader_recompiler/resource.h b/src/shader_recompiler/resource.h
+index 17a9640..0d8e9d5 100644
+--- a/src/shader_recompiler/resource.h
++++ b/src/shader_recompiler/resource.h
+@@ -91,6 +91,8 @@ enum class SharpFetchPostOp : u8 {
+     ClearAnisoRatioAndThreshold,
+     // A scalar-memory base pointer, rather than a guest V# descriptor.
+     ReadConstPointer,
++    // Sample a cube through a native cube-array view, retaining cross-face filtering.
++    NativeCubeSampling,
+ };
+ 
+ enum class BufferType : u8 {
+diff --git a/src/shader_recompiler/specialization.h b/src/shader_recompiler/specialization.h
+index aa50ff7..e2f4913 100644
+--- a/src/shader_recompiler/specialization.h
++++ b/src/shader_recompiler/specialization.h
+@@ -97,9 +97,19 @@ struct StageSpecialization {
+ 
+     StageSpecialization() = default;
+     StageSpecialization(const Info& info_, RuntimeInfo runtime_info_, const Profile& profile_,
+-                        Backend::Bindings start_)
++                        Backend::Bindings start_,
++                        const Gcn::FetchShaderData* translated_fetch = nullptr)
+         : info{&info_}, runtime_info{runtime_info_}, start{start_} {
+-        if (info_.sw_stage == SwStage::Vertex && Gcn::ParseFetchShader(info_, fetch_shader_data)) {
++        bool parsed_fetch = false;
++        if (info_.sw_stage == SwStage::Vertex) {
++            if (translated_fetch) {
++                fetch_shader_data = *translated_fetch;
++                parsed_fetch = true;
++            } else {
++                parsed_fetch = Gcn::ParseFetchShader(info_, fetch_shader_data);
++            }
++        }
++        if (parsed_fetch) {
+             // Specialize shader on VS input number types to follow spec.
+             ForEachSharp(vs_attribs, fetch_shader_data.attributes,
+                          [this](auto& spec, const auto& desc, AmdGpu::Buffer sharp) {
+diff --git a/src/video_core/buffer_cache/buffer_cache.cpp b/src/video_core/buffer_cache/buffer_cache.cpp
+index c9e1900..b1b23f7 100644
+--- a/src/video_core/buffer_cache/buffer_cache.cpp
++++ b/src/video_core/buffer_cache/buffer_cache.cpp
+@@ -2411,13 +2411,20 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
+     // FIX-075: 64-bit counts. GT Sport's showroom makes a range of 4 GB + 64 KB resident at once;
+     // the 32-bit block loop below never reached its end and wrote past the staging buffer.
+     u64 resident_blocks{};
+-    IntervalList bind_ranges;
++    std::vector<Interval> bind_ranges;
++    const u64 max_allocation_blocks = std::max<u64>(1, 16_MB >> block_shift);
+     resident_ranges.ForEachGap(first_block, last_block + 1, [&](u64 start, u64 end) {
+         resident_blocks += end - start;
+-        bind_ranges.Add({start, end});
++        // Keep independently retired ranges in separate, bounded allocations.
++        // A small survivor must not pin hundreds of MiB from unrelated gaps.
++        while (start < end) {
++            const u64 chunk_end = std::min(end, start + max_allocation_blocks);
++            bind_ranges.push_back({start, chunk_end});
++            start = chunk_end;
++        }
+     });
+ 
+-    if (bind_ranges.Empty()) {
++    if (bind_ranges.empty()) {
+         return;
+     }
+     if ((resident_blocks << block_shift) >= (1ull << 30)) {
+@@ -2427,68 +2434,67 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
+                     (last_block + 1) << block_shift, arena->CpuAddr(), arena->SizeBytes());
+     }
+ 
+-    const vk::MemoryAllocateInfo alloc_info = {
+-        .allocationSize = resident_blocks << block_shift,
+-        .memoryTypeIndex = arena_memory_type_index,
+-    };
+-    u32 allocation_attempt = 0;
+-    const auto allocation = Common::AllocateWithPressureRetry(
+-        [&] {
+-            ++allocation_attempt;
+-            auto result = instance.GetDevice().allocateMemory(alloc_info);
+-            if (result.result != vk::Result::eSuccess) {
+-                vk::PhysicalDeviceMemoryBudgetPropertiesEXT budget{};
+-                vk::PhysicalDeviceMemoryProperties2 properties{
+-                    .pNext = instance.CanReportMemoryUsage() ? &budget : nullptr,
+-                };
+-                instance.GetPhysicalDevice().getMemoryProperties2(&properties);
+-                const u32 heap =
+-                    properties.memoryProperties.memoryTypes[arena_memory_type_index].heapIndex;
+-                std::map<vk::DeviceMemory, bool> allocations;
+-                u64 resident_bytes = 0;
+-                for (const auto& range : resident_ranges) {
+-                    allocations.emplace(range.memory, true);
+-                    resident_bytes += (range.end - range.start) << block_shift;
+-                }
+-                LOG_ERROR(Render_Vulkan,
+-                          "Sparse allocation failed: result={} attempt={} requested_bytes={} "
+-                          "guest={:#x}..{:#x} arena={:#x}+{:#x} memory_type={} heap={} "
+-                          "heap_usage_bytes={} heap_budget_bytes={} budget_available={} "
+-                          "sparse_resident_bytes={} sparse_allocations={} recycled_bytes={}",
+-                          vk::to_string(result.result), allocation_attempt,
+-                          alloc_info.allocationSize, first_block << block_shift,
+-                          (last_block + 1) << block_shift, arena->CpuAddr(), arena->SizeBytes(),
+-                          arena_memory_type_index, heap, budget.heapUsage[heap],
+-                          budget.heapBudget[heap], instance.CanReportMemoryUsage(), resident_bytes,
+-                          allocations.size(), RecycledImageBytes());
+-            }
+-            return result;
+-        },
+-        [&] {
+-            const u64 recycled = ReleaseRecycledImages(instance.GetAllocator());
+-            const auto empty_blocks = Vulkan::TrimEmptyVmaBlocks(instance.GetAllocator());
+-            LOG_WARNING(Render_Vulkan,
+-                        "Sparse allocation recovery: released {} recycled bytes and {} empty "
+-                        "VMA block bytes; retrying {} bytes once",
+-                        recycled, empty_blocks, alloc_info.allocationSize);
+-        },
+-        vk::Result::eErrorOutOfDeviceMemory);
+-    const auto device_memory = Vulkan::Check(allocation);
+-
+     boost::container::small_vector<vk::BufferCopy, 8> copies;
+     const auto staging =
+         staging_pool.Request(resident_blocks * sizeof(vk::DeviceAddress), MemoryType::HostUncached);
+ 
+-    u64 memory_offset{};
+     ArenaBinds* binds = BindsForArena(arena);
+     auto* bda_addrs = reinterpret_cast<vk::DeviceAddress*>(staging.mapped);
+     u64 offset = staging.offset;
+     for (const auto& range : bind_ranges) {
++        const vk::MemoryAllocateInfo alloc_info = {
++            .allocationSize = (range.end - range.start) << block_shift,
++            .memoryTypeIndex = arena_memory_type_index,
++        };
++        u32 allocation_attempt = 0;
++        const auto allocation = Common::AllocateWithPressureRetry(
++            [&] {
++                ++allocation_attempt;
++                auto result = instance.GetDevice().allocateMemory(alloc_info);
++                if (result.result != vk::Result::eSuccess) {
++                    vk::PhysicalDeviceMemoryBudgetPropertiesEXT budget{};
++                    vk::PhysicalDeviceMemoryProperties2 properties{
++                        .pNext = instance.CanReportMemoryUsage() ? &budget : nullptr,
++                    };
++                    instance.GetPhysicalDevice().getMemoryProperties2(&properties);
++                    const u32 heap =
++                        properties.memoryProperties.memoryTypes[arena_memory_type_index].heapIndex;
++                    std::map<vk::DeviceMemory, bool> allocations;
++                    u64 resident_bytes = 0;
++                    for (const auto& range : resident_ranges) {
++                        allocations.emplace(range.memory, true);
++                        resident_bytes += (range.end - range.start) << block_shift;
++                    }
++                    LOG_ERROR(Render_Vulkan,
++                              "Sparse allocation failed: result={} attempt={} requested_bytes={} "
++                              "guest={:#x}..{:#x} arena={:#x}+{:#x} memory_type={} heap={} "
++                              "heap_usage_bytes={} heap_budget_bytes={} budget_available={} "
++                              "sparse_resident_bytes={} sparse_allocations={} recycled_bytes={}",
++                              vk::to_string(result.result), allocation_attempt,
++                              alloc_info.allocationSize, range.start << block_shift,
++                              range.end << block_shift, arena->CpuAddr(), arena->SizeBytes(),
++                              arena_memory_type_index, heap, budget.heapUsage[heap],
++                              budget.heapBudget[heap], instance.CanReportMemoryUsage(), resident_bytes,
++                              allocations.size(), RecycledImageBytes());
++                }
++                return result;
++            },
++            [&] {
++                const u64 recycled = ReleaseRecycledImages(instance.GetAllocator());
++                const auto empty_blocks = Vulkan::TrimEmptyVmaBlocks(instance.GetAllocator());
++                LOG_WARNING(Render_Vulkan,
++                            "Sparse allocation recovery: released {} recycled bytes and {} empty "
++                            "VMA block bytes; retrying {} bytes once",
++                            recycled, empty_blocks, alloc_info.allocationSize);
++            },
++            vk::Result::eErrorOutOfDeviceMemory);
++        const auto device_memory = Vulkan::Check(allocation);
++
+         Backing backing;
+         backing.start = range.start;
+         backing.end = range.end;
+         backing.memory = device_memory;
+-        backing.offset = memory_offset >> block_shift;
++        backing.offset = 0;
+         resident_ranges.Add(backing);
+ 
+         LOG_INFO(Render, "Making range start={}, end={} resident", backing.start, backing.end);
+@@ -2497,9 +2503,8 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
+             .resourceOffset = (range.start << block_shift) - arena->cpu_addr,
+             .size = (range.end - range.start) << block_shift,
+             .memory = device_memory,
+-            .memoryOffset = memory_offset,
++            .memoryOffset = 0,
+         });
+-        memory_offset += bind.size;
+ 
+         for (u64 block = 0; block < bind.size; block += block_size) {
+             *(bda_addrs++) = arena->BufferDeviceAddress() + bind.resourceOffset + block;
+diff --git a/src/video_core/buffer_cache/direct_memory.cpp b/src/video_core/buffer_cache/direct_memory.cpp
+index f5457e0..8cd11e3 100644
+--- a/src/video_core/buffer_cache/direct_memory.cpp
++++ b/src/video_core/buffer_cache/direct_memory.cpp
+@@ -14,6 +14,7 @@
+ #endif
+ 
+ #include "common/logging/log.h"
++#include "core/memory.h"
+ #include "video_core/buffer_cache/buffer.h"
+ #include "video_core/buffer_cache/direct_memory.h"
+ #include "video_core/buffer_cache/proto_import.h"
+@@ -220,12 +221,17 @@ bool DirectMemory::ImportView(VAddr address) {
+     if (base == 0) {
+         return false;
+     }
+-    if (std::ranges::binary_search(failed, base)) {
++    if (failed.contains(base)) {
+         return false;
+     }
+     const VAddr end = GuestViewEnd(base, 1ULL << 32);
+     const auto fail = [&](const char* why) {
+-        failed.insert(std::ranges::upper_bound(failed, base), base);
++        // An unmap/remap can leave the allocation temporarily uncommitted or split
++        // before the requested page. That is not a permanent import failure.
++        if (end > address && (base & (PageSize - 1)) == 0 &&
++            ((end - base) & (PageSize - 1)) == 0) {
++            failed.emplace(base, end);
++        }
+         if (++failed_count <= 40) {
+             LOG_WARNING(Render_Vulkan, "D1: view {:#x}+{:#x} not imported: {}", base, end - base,
+                         why);
+@@ -355,7 +361,22 @@ bool DirectMemory::EnsureImported(VAddr address, u64 size) {
+         }
+     }
+     std::scoped_lock lk{mutex};
++#ifdef RYTY_GPU
++    // OnUnmap is reported before the host remap. A lookup during that window can
++    // fail, so discard negative results after the completed mapping is reported too.
++    const u64 mapping_generation = Core::RytyMemory::MappingGeneration();
++    if (failed_generation != mapping_generation) {
++        failed.clear();
++        failed_generation = mapping_generation;
++    }
++#endif
+     for (VAddr page = address & ~(PageSize - 1); page < end;) {
++        // A failed view is retried by many draws (and again by the gather fallback).
++        // Its bounds are already known: avoid querying Windows for its base each time.
++        const auto failure = failed.upper_bound(page);
++        if (failure != failed.begin() && page < std::prev(failure)->second) {
++            return false;
++        }
+         auto it = views.upper_bound(page);
+         if (it != views.begin()) {
+             const auto& view = std::prev(it)->second;
+@@ -408,8 +429,10 @@ void DirectMemory::OnUnmap(VAddr address, u64 size) {
+         }
+         it = views.erase(it);
+     }
+-    // A view base unmapped may be mapped again with other memory.
+-    std::erase_if(failed, [&](VAddr base) { return base >= address && base < end; });
++    // Even a partial unmap can replace part of a failed view with importable memory.
++    std::erase_if(failed, [&](const auto& view) {
++        return view.first < end && (view.second > address || view.first >= address);
++    });
+ }
+ 
+ DirectMemory::Stats DirectMemory::GetStats() const {
+diff --git a/src/video_core/buffer_cache/direct_memory.h b/src/video_core/buffer_cache/direct_memory.h
+index 0a03ce3..dd2359b 100644
+--- a/src/video_core/buffer_cache/direct_memory.h
++++ b/src/video_core/buffer_cache/direct_memory.h
+@@ -111,7 +111,8 @@ private:
+     Vulkan::Scheduler& scheduler;
+     mutable std::mutex mutex;
+     std::map<VAddr, View> views; // by begin
+-    std::vector<VAddr> failed;   // view bases that could not be imported (sorted)
++    std::map<VAddr, VAddr> failed; // failed view base -> committed end; invalidated on unmap
++    u64 failed_generation{};
+     std::unique_ptr<Buffer> l1;
+     std::unique_ptr<Buffer> l2_pool;
+     std::unique_ptr<Buffer> zero_page;
+diff --git a/src/video_core/renderer_vulkan/image_allocation.h b/src/video_core/renderer_vulkan/image_allocation.h
+new file mode 100644
+index 0000000..97f4137
+--- /dev/null
++++ b/src/video_core/renderer_vulkan/image_allocation.h
+@@ -0,0 +1,13 @@
++// SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#pragma once
++#include <vk_mem_alloc.h>
++namespace Vulkan {
++VmaPool SmallImageAllocationPool(VmaAllocator allocator, const VkImageCreateInfo& image,
++                                const VmaAllocationCreateInfo& allocation);
++void DestroySmallImageAllocationPools(VmaAllocator allocator);
++}
++namespace VideoCore {
++void ClearRecycledImages(VmaAllocator allocator);
++}
+diff --git a/src/video_core/renderer_vulkan/vk_common.cpp b/src/video_core/renderer_vulkan/vk_common.cpp
+index db69302..c8b1049 100644
+--- a/src/video_core/renderer_vulkan/vk_common.cpp
++++ b/src/video_core/renderer_vulkan/vk_common.cpp
+@@ -14,7 +14,84 @@
+ VULKAN_HPP_DEFAULT_DISPATCH_LOADER_DYNAMIC_STORAGE
+ 
+ #include <atomic>
++#include <algorithm>
++#include <array>
++#include <map>
++#include <mutex>
++#include "video_core/renderer_vulkan/image_allocation.h"
+ namespace Vulkan {
++namespace {
++std::mutex small_image_pools_mutex;
++using ImagePoolKey = std::array<uint32_t, 17>;
++std::map<VmaAllocator, std::map<std::pair<uint32_t, VkDeviceSize>, VmaPool>> small_image_pools;
++std::map<VmaAllocator, std::map<ImagePoolKey, VmaPool>> small_image_pool_cache;
++}
++VmaPool SmallImageAllocationPool(VmaAllocator allocator, const VkImageCreateInfo& image,
++                                const VmaAllocationCreateInfo& allocation) {
++    if (image.pNext || image.sharingMode != VK_SHARING_MODE_EXCLUSIVE ||
++        (image.flags & VK_IMAGE_CREATE_DISJOINT_BIT) ||
++        (image.tiling != VK_IMAGE_TILING_OPTIMAL && image.tiling != VK_IMAGE_TILING_LINEAR) ||
++        (allocation.flags & VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT))
++        return VK_NULL_HANDLE;
++    const ImagePoolKey key{image.flags, uint32_t(image.imageType), uint32_t(image.format),
++        image.extent.width, image.extent.height, image.extent.depth, image.mipLevels,
++        image.arrayLayers, uint32_t(image.samples), uint32_t(image.tiling), image.usage,
++        uint32_t(image.sharingMode), allocation.flags, uint32_t(allocation.usage),
++        allocation.requiredFlags, allocation.preferredFlags, allocation.memoryTypeBits};
++    std::scoped_lock lock{small_image_pools_mutex};
++    auto& cache = small_image_pool_cache[allocator];
++    if (const auto found = cache.find(key); found != cache.end()) return found->second;
++    // Query once per complete resource configuration: compressed images must be
++    // classified by their allocation footprint, not uncompressed pixel dimensions.
++    const auto& functions = allocator->GetVulkanFunctions();
++    VkMemoryRequirements requirements{};
++    bool requires_dedicated = false;
++#if VMA_KHR_MAINTENANCE4 || VMA_VULKAN_VERSION >= 1003000
++    if (functions.vkGetDeviceImageMemoryRequirements) {
++        const VkDeviceImageMemoryRequirements info{VK_STRUCTURE_TYPE_DEVICE_IMAGE_MEMORY_REQUIREMENTS, nullptr, &image};
++        VkMemoryDedicatedRequirements dedicated{VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS};
++        VkMemoryRequirements2 result{VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2, &dedicated};
++        functions.vkGetDeviceImageMemoryRequirements(allocator->m_hDevice, &info, &result);
++        requirements = result.memoryRequirements;
++        requires_dedicated = dedicated.requiresDedicatedAllocation;
++    } else
++#endif
++    {
++        VkImage temporary{};
++        if (functions.vkCreateImage(allocator->m_hDevice, &image, allocator->GetAllocationCallbacks(), &temporary) != VK_SUCCESS)
++            return VK_NULL_HANDLE;
++        bool prefers_dedicated = false;
++        allocator->GetImageMemoryRequirements(temporary, requirements, requires_dedicated, prefers_dedicated);
++        functions.vkDestroyImage(allocator->m_hDevice, temporary, allocator->GetAllocationCallbacks());
++    }
++    const auto footprint = std::max(requirements.size, requirements.alignment);
++    if (requires_dedicated || footprint > (4ULL << 20)) {
++        cache.emplace(key, VK_NULL_HANDLE);
++        return VK_NULL_HANDLE;
++    }
++    uint32_t type = 0;
++    if (allocator->FindMemoryTypeIndex(requirements.memoryTypeBits, &allocation,
++            VmaBufferImageUsage(image), &type) != VK_SUCCESS) return VK_NULL_HANDLE;
++    const VkDeviceSize block_size = footprint <= (64ULL << 10) ? 1ULL << 20 :
++        footprint <= (1ULL << 20) ? 4ULL << 20 : 8ULL << 20;
++    auto& pool = small_image_pools[allocator][{type, block_size}];
++    if (!pool) {
++        const VmaPoolCreateInfo info{.memoryTypeIndex = type, .blockSize = block_size};
++        if (vmaCreatePool(allocator, &info, &pool) != VK_SUCCESS) return VK_NULL_HANDLE;
++        vmaSetPoolName(allocator, pool, block_size == (1ULL << 20) ? "Tiny images" :
++            block_size == (4ULL << 20) ? "Small images" : "Medium images");
++    }
++    cache.emplace(key, pool);
++    return pool;
++}
++void DestroySmallImageAllocationPools(VmaAllocator allocator) {
++    std::scoped_lock lock{small_image_pools_mutex};
++    small_image_pool_cache.erase(allocator);
++    const auto it = small_image_pools.find(allocator);
++    if (it == small_image_pools.end()) return;
++    for (const auto& [type, pool] : it->second) if (pool) vmaDestroyPool(allocator, pool);
++    small_image_pools.erase(it);
++}
+ static std::atomic<vk::DeviceSize> g_empty_vma_bytes_freed{};
+ vk::DeviceSize EmptyVmaBytesFreed() {
+     return g_empty_vma_bytes_freed.load(std::memory_order_relaxed);
+diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+index 4c1ff1a..2b3c1c5 100644
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+@@ -2,6 +2,7 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include <atomic>
++#include <map>
+ #include <algorithm>
+ #include <filesystem>
+ #include <chrono>
+@@ -313,28 +314,32 @@ private:
+ // PERF-018: shader stage libraries (pre-rasterization and fragment shader) of runtime
+ // pipelines, shared by every pipeline whose stages, layout and stage state are the same. Many new
+ // pipelines differ from an earlier one only in blending, targets or vertex input, so they reuse
+-// both compiled shader libraries and only link. Libraries live until exit.
++// both compiled shader libraries and only link. Pipelines own their shared libraries.
+ class StageLibraryCache {
+ public:
+-    static StageLibraryCache& Instance() {
+-        static StageLibraryCache cache;
+-        return cache;
++    static StageLibraryCache& Instance() { static StageLibraryCache cache; return cache; }
++    std::shared_ptr<vk::UniquePipeline> Find(vk::Device device, u64 key) {
++        std::scoped_lock lock{mutex};
++        const auto it = libraries.find({device, key});
++        return it != libraries.end() ? it->second.lock() : nullptr;
+     }
+-
+-    vk::Pipeline Find(u64 key) {
+-        std::scoped_lock lk{mutex};
+-        const auto it = libraries.find(key);
+-        return it != libraries.end() ? it->second : vk::Pipeline{};
+-    }
+-
+-    void Insert(u64 key, vk::Pipeline library) {
+-        std::scoped_lock lk{mutex};
+-        libraries.emplace(key, library);
++    std::shared_ptr<vk::UniquePipeline> Insert(vk::Device device, u64 key, vk::Pipeline library, bool share) {
++        auto owned = std::make_shared<vk::UniquePipeline>(library, device);
++        if (!share) return owned;
++        std::scoped_lock lock{mutex};
++        auto& cached = libraries[{device, key}];
++        if (auto existing = cached.lock()) return existing;
++        cached = owned;
++        // Weak entries own no GPU resources; remove expired keys as scenes change.
++        if (++insertions % 128 == 0) {
++            std::erase_if(libraries, [](const auto& entry) { return entry.second.expired(); });
++        }
++        return owned;
+     }
+-
+ private:
+     std::mutex mutex;
+-    std::unordered_map<u64, vk::Pipeline> libraries;
++    std::map<std::pair<vk::Device, u64>, std::weak_ptr<vk::UniquePipeline>> libraries;
++    size_t insertions{};
+ };
+ 
+ class LibraryKey {
+@@ -488,6 +493,9 @@ GraphicsPipeline::GraphicsPipeline(
+         vk::DynamicState::eLineWidth,          vk::DynamicState::ePrimitiveRestartEnable,
+     };
+ 
++    if (instance.IsAttachmentFeedbackLoopLayoutSupported()) {
++        dynamic_states.push_back(vk::DynamicState::eAttachmentFeedbackLoopEnableEXT);
++    }
+     if (instance.IsDepthBoundsSupported()) {
+         dynamic_states.push_back(vk::DynamicState::eDepthBoundsTestEnable);
+         dynamic_states.push_back(vk::DynamicState::eDepthBounds);
+@@ -944,10 +952,10 @@ GraphicsPipeline::GraphicsPipeline(
+         const u64 fragment_hash = fragment_key.Hash();
+         // -DisablePerf 18 compiles every library for every pipeline, one after another.
+         const bool share_libraries = Common::PerfFeatureEnabled(18);
+-        vk::Pipeline pre_raster_library =
+-            share_libraries ? library_cache.Find(pre_raster_hash) : vk::Pipeline{};
+-        vk::Pipeline fragment_library =
+-            share_libraries ? library_cache.Find(fragment_hash) : vk::Pipeline{};
++        auto pre_raster_owner = share_libraries ? library_cache.Find(device, pre_raster_hash) : nullptr;
++        auto fragment_owner = share_libraries ? library_cache.Find(device, fragment_hash) : nullptr;
++        vk::Pipeline pre_raster_library = pre_raster_owner ? **pre_raster_owner : vk::Pipeline{};
++        vk::Pipeline fragment_library = fragment_owner ? **fragment_owner : vk::Pipeline{};
+         const bool pre_raster_reused = bool(pre_raster_library);
+         const bool fragment_reused = bool(fragment_library);
+         // PERF-018: the two shader libraries are compiled at the same time, the fragment one
+@@ -960,7 +968,8 @@ GraphicsPipeline::GraphicsPipeline(
+         library_handles[0] = create_library(0);
+         if (!pre_raster_library) {
+             pre_raster_library = create_library(1);
+-            library_cache.Insert(pre_raster_hash, pre_raster_library);
++            pre_raster_owner = library_cache.Insert(device, pre_raster_hash, pre_raster_library, share_libraries);
++            pre_raster_library = **pre_raster_owner;
+         }
+         library_handles[3] = create_library(3);
+         if (fragment_future.valid()) {
+@@ -969,8 +978,10 @@ GraphicsPipeline::GraphicsPipeline(
+             fragment_library = create_library(2);
+         }
+         if (!fragment_reused) {
+-            library_cache.Insert(fragment_hash, fragment_library);
++            fragment_owner = library_cache.Insert(device, fragment_hash, fragment_library, share_libraries);
++            fragment_library = **fragment_owner;
+         }
++        library_link->shared_libraries = {pre_raster_owner, fragment_owner};
+         library_handles[1] = pre_raster_library;
+         library_handles[2] = fragment_library;
+         library_link->owned_libraries[0] = vk::UniquePipeline{library_handles[0], device};
+diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.h b/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
+index 5515213..9669f1d 100644
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
+@@ -126,6 +126,10 @@ public:
+     /// PERF-021: optimized relinks wait until no new pipeline has been needed for a while, so
+     /// they never take cores from pipelines a draw is waiting for.
+     static void NotePipelineMiss();
++    bool CanRetire() const {
++        return !library_link || !library_link->optimized.valid() ||
++               library_link->optimized.wait_for(std::chrono::seconds{0}) == std::future_status::ready;
++    }
+ 
+     /// PERF-019: a pipeline built on a worker from copies of the shader infos points at the
+     /// cached infos once it is used.
+@@ -139,6 +143,7 @@ private:
+     struct LibraryLink {
+         /// Vertex input and fragment output libraries; the shader libraries are shared (PERF-018).
+         std::array<vk::UniquePipeline, 2> owned_libraries;
++        std::array<std::shared_ptr<vk::UniquePipeline>, 2> shared_libraries;
+         std::future<void> optimized;
+     };
+     /// PERF-018 / SHD-002: hashes of the stage set layouts' bindings, so a shader library is
+diff --git a/src/video_core/renderer_vulkan/vk_instance.cpp b/src/video_core/renderer_vulkan/vk_instance.cpp
+index bbf70c1..20e0e3a 100644
+--- a/src/video_core/renderer_vulkan/vk_instance.cpp
++++ b/src/video_core/renderer_vulkan/vk_instance.cpp
+@@ -17,6 +17,7 @@
+ #include "sdl_window.h"
+ #include "video_core/renderer_vulkan/liverpool_to_vk.h"
+ #include "video_core/renderer_vulkan/vk_instance.h"
++#include "video_core/renderer_vulkan/image_allocation.h"
+ #include "video_core/renderer_vulkan/vk_platform.h"
+ #ifdef RYTY_GPU
+ #include "ryty_gpu/ryty_dlss.h"
+@@ -256,6 +257,8 @@ Instance::Instance(Frontend::WindowSDL& window, s32 physical_device_index,
+ 
+ Instance::~Instance() {
+     ImGui::Core::Shutdown(GetDevice());
++    VideoCore::ClearRecycledImages(allocator);
++    DestroySmallImageAllocationPools(allocator);
+     vmaDestroyAllocator(allocator);
+ }
+ 
+@@ -879,6 +882,9 @@ void Instance::CreateAllocator() {
+         .flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT,
+         .physicalDevice = physical_device,
+         .device = *device,
++        // Small persistent images must not pin mostly empty 256 MiB scene blocks.
++        // VMA still creates dedicated allocations for resources too large to pool.
++        .preferredLargeHeapBlockSize = 32_MB,
+         .pVulkanFunctions = &functions,
+         .instance = *instance,
+         .vulkanApiVersion = TargetVulkanApiVersion,
+diff --git a/src/video_core/renderer_vulkan/vk_instance.h b/src/video_core/renderer_vulkan/vk_instance.h
+index 209f460..e54651f 100644
+--- a/src/video_core/renderer_vulkan/vk_instance.h
++++ b/src/video_core/renderer_vulkan/vk_instance.h
+@@ -98,6 +98,10 @@ public:
+         return features.samplerAnisotropy;
+     }
+ 
++    bool IsImageCubeArraySupported() const {
++        return features.imageCubeArray;
++    }
++
+     /// Returns true if depth bounds testing is supported
+     bool IsDepthBoundsSupported() const {
+         return features.depthBounds;
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index a4b3cbc..31d3b75 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -32,6 +32,7 @@
+ #ifdef RYTY_GPU
+ #include "ryty_gpu/ryty_hdr_ui.h"
+ #include "ryty_gpu/ryty_ghost.h"
++#include "video_core/renderer_vulkan/vk_rasterizer_native.h"
+ #endif
+ #include "common/read_capture.h"
+ #include "common/scope_exit.h"
+@@ -796,6 +797,9 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
+     // D2: read-only guest buffers are read in place through the direct-memory page table.
+     profile.direct_buffers =
+         VideoCore::DirectMemory::Enabled() && instance.IsExternalMemoryHostSupported();
++#ifdef RYTY_GPU
++    profile.native_cube_sampling = NativeModeRequested() && instance.IsImageCubeArraySupported();
++#endif
+     CreateDriverCache();
+     LoadElseScopeFixed();
+     // PERF-032: the shader store is used again, without the startup precompile Lance had removed:
+@@ -2242,6 +2246,7 @@ const GraphicsPipeline* PipelineCache::LookupBuiltPipeline(const DrawIndirectPar
+         if (const auto it = graphics_pipelines.find(scratch.graphics_key);
+             it != graphics_pipelines.end()) {
+             found = it->second.get();
++            found->NoteRetentionUse(std::chrono::steady_clock::now());
+         }
+         if (!found) {
+             scratch.lookup_miss = "pipeline not built";
+@@ -2416,6 +2421,8 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
+                 if (!S().key_uses_legacy) {
+                     RegisterPipelineData(S().graphics_key, pipeline_hash, sdata);
+                 }
++                retention_now = std::chrono::steady_clock::now();
++                pipeline_last_use[it->second.get()] = retention_now;
+                 return it->second.get();
+             }
+             if ((stored->async || (CompileMode() == 2 && AsyncPipelines())) &&
+@@ -2549,6 +2556,8 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
+             }
+         }
+     }
++    if (is_new) retention_now = std::chrono::steady_clock::now();
++    pipeline_last_use[it->second.get()] = retention_now;
+     return it->second.get();
+ }
+ 
+@@ -2593,6 +2602,8 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
+             module_related_pipelines[m].emplace_back(compute_key);
+         }
+     }
++    if (is_new) retention_now = std::chrono::steady_clock::now();
++    pipeline_last_use[it->second.get()] = retention_now;
+     return it->second.get();
+ }
+ 
+@@ -4109,7 +4120,8 @@ void PipelineCache::HarvestTranslations(u64 hash, bool wait) {
+             return true;
+         }
+         translate_stats.translate_ms += job->translate_ms;
+-        job->spec = Shader::StageSpecialization(*job->info, job->runtime_info, profile, job->start);
++        job->spec = Shader::StageSpecialization(*job->info, job->runtime_info, profile, job->start,
++                                               job->info->translated_fetch_shader.get());
+         job->ready_since = now;
+         ready.push_back(job);
+         return true;
+@@ -4794,3 +4806,66 @@ std::optional<std::vector<u32>> PipelineCache::GetShaderPatch(u64 hash, Shader::
+     return code;
+ }
+ } // namespace Vulkan
++
++
++namespace Vulkan {
++std::shared_ptr<const void> PipelineCache::KeepAlive(const GraphicsPipeline* pipeline) const {
++    if (!pipeline) return {};
++    const auto it = graphics_pipelines.find(pipeline->GetGraphicsKey());
++    ASSERT(it != graphics_pipelines.end() && it->second.get() == pipeline);
++    return it->second;
++}
++std::shared_ptr<const void> PipelineCache::KeepAlive(const ComputePipeline* pipeline) const {
++    if (!pipeline) return {};
++    const auto it = compute_pipelines.find(compute_key);
++    ASSERT(it != compute_pipelines.end() && it->second.get() == pipeline);
++    return it->second;
++}
++void PipelineCache::TrimUnusedPipelines() {
++    using namespace std::chrono;
++    const auto now = steady_clock::now();
++    if (now - retention_last_scan < seconds{1}) return;
++    std::unique_lock lock{lookup_mutex, std::try_to_lock};
++    if (!lock.owns_lock()) return;
++    retention_last_scan = now;
++    retention_now = now;
++    // Keep the active working set even if a scene needs more than the soft limit.
++    // Queued selections hold a shared reference; retirement cannot invalidate them.
++    constexpr size_t soft_limit = 1024;
++    constexpr size_t retire_batch = 64;
++    const auto cutoff = now - seconds{60};
++    std::vector<std::shared_ptr<const void>> retired;
++    const auto trim = [&](auto& cache) {
++        using Entry = typename std::remove_reference_t<decltype(cache)>::value_type;
++        using Key = std::remove_const_t<typename Entry::first_type>;
++        std::vector<std::pair<steady_clock::time_point, Key>> candidates;
++        for (const auto& [key, pipeline] : cache) {
++            if (!pipeline || pipeline.use_count() != 1) continue;
++            if constexpr (std::is_same_v<Key, GraphicsPipelineKey>) {
++                if (!pipeline->CanRetire()) continue;
++            }
++            const auto found = pipeline_last_use.find(pipeline.get());
++            if (found != pipeline_last_use.end()) {
++                const auto last_use = std::max(found->second, pipeline->LastRetentionUse());
++                if (last_use < cutoff) candidates.emplace_back(last_use, key);
++            }
++        }
++        std::sort(candidates.begin(), candidates.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
++        for (const auto& [used, key] : candidates) {
++            if (retired.size() >= retire_batch || graphics_pipelines.size() + compute_pipelines.size() <= soft_limit) break;
++            auto it = cache.find(key);
++            pipeline_last_use.erase(it->second.get());
++            retired.emplace_back(std::move(it.value()));
++            cache.erase(it);
++        }
++    };
++    trim(graphics_pipelines);
++    trim(compute_pipelines);
++    if (retired.empty()) return;
++    const auto count = retired.size();
++    // Includes commands already recorded in the current, not-yet-submitted batch.
++    scheduler.DeferOperation([retired = std::move(retired)] {});
++    LOG_DEBUG(Render_Vulkan, "Retired {} unused pipelines; {} cached", count,
++              graphics_pipelines.size() + compute_pipelines.size());
++}
++}
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.h b/src/video_core/renderer_vulkan/vk_pipeline_cache.h
+index 9c89a5d..e9c5f2e 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.h
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.h
+@@ -127,6 +127,11 @@ public:
+ 
+     void Sync();
+ 
++    /// Recorder only, between draws. Retires unused pipelines after GPU completion.
++    void TrimUnusedPipelines();
++    std::shared_ptr<const void> KeepAlive(const GraphicsPipeline* pipeline) const;
++    std::shared_ptr<const void> KeepAlive(const ComputePipeline* pipeline) const;
++
+     const GraphicsPipeline* GetGraphicsPipeline(const DrawIndirectParams params = {});
+     /// The pipeline of the key RefreshGraphicsKey made (built if needed).
+     const GraphicsPipeline* PipelineForCurrentKey(const DrawIndirectParams params);
+@@ -336,8 +341,11 @@ private:
+         std::chrono::steady_clock::time_point since{};
+     } legacy_stats;
+     void ReportLegacy();
+-    tsl::robin_map<ComputePipelineKey, std::unique_ptr<ComputePipeline>> compute_pipelines;
+-    tsl::robin_map<GraphicsPipelineKey, std::unique_ptr<GraphicsPipeline>> graphics_pipelines;
++    tsl::robin_map<ComputePipelineKey, std::shared_ptr<ComputePipeline>> compute_pipelines;
++    tsl::robin_map<GraphicsPipelineKey, std::shared_ptr<GraphicsPipeline>> graphics_pipelines;
++    std::unordered_map<const Pipeline*, std::chrono::steady_clock::time_point> pipeline_last_use;
++    std::chrono::steady_clock::time_point retention_now{std::chrono::steady_clock::now()};
++    std::chrono::steady_clock::time_point retention_last_scan{};
+     /// NAT-031: what a key is computed in. The command and recorder threads use the cache's own
+     /// (scratch_, under the exclusive lock); a game job thread looking a pipeline up uses its
+     /// own (under the shared lock), so job threads look pipelines up at the same time.
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_common.h b/src/video_core/renderer_vulkan/vk_pipeline_common.h
+index ea0701d..7a76c3e 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_common.h
++++ b/src/video_core/renderer_vulkan/vk_pipeline_common.h
+@@ -4,6 +4,7 @@
+ #pragma once
+ 
+ #include <atomic>
++#include <chrono>
+ 
+ #include "shader_recompiler/backend/bindings.h"
+ #include "shader_recompiler/profile.h"
+@@ -35,6 +36,15 @@ public:
+              bool is_compute = false);
+     virtual ~Pipeline();
+ 
++    void NoteRetentionUse(std::chrono::steady_clock::time_point now) const {
++        retention_use.store(now.time_since_epoch().count(), std::memory_order_relaxed);
++    }
++
++    std::chrono::steady_clock::time_point LastRetentionUse() const {
++        return std::chrono::steady_clock::time_point{std::chrono::steady_clock::duration{
++            retention_use.load(std::memory_order_relaxed)}};
++    }
++
+     vk::Pipeline Handle() const noexcept {
+         // PERF-017: the fully optimized pipeline once a worker has linked it.
+         if (const VkPipeline optimized = optimized_pipeline.load(std::memory_order_acquire)) {
+@@ -91,6 +101,7 @@ public:
+                        const Shader::PushData& push_data) const;
+ 
+ protected:
++    mutable std::atomic<std::chrono::steady_clock::duration::rep> retention_use{0};
+     [[nodiscard]] std::string GetDebugString() const;
+ 
+     const Instance& instance;
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_serialization.cpp b/src/video_core/renderer_vulkan/vk_pipeline_serialization.cpp
+index 2a2dea0..d49caae 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_serialization.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_serialization.cpp
+@@ -1,6 +1,7 @@
+ // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include <algorithm>
+ #include <map>
+ #include <mutex>
+ 
+@@ -13,6 +14,9 @@
+ #include "video_core/renderer_vulkan/vk_instance.h"
+ #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
+ #include "video_core/renderer_vulkan/vk_shader_util.h"
++#ifdef RYTY_GPU
++#include "video_core/renderer_vulkan/vk_rasterizer_native.h"
++#endif
+ 
+ namespace Serialization {
+ /* You should increment versions below once corresponding serialization scheme is changed. */
+@@ -24,6 +28,20 @@ static constexpr u32 ShaderBinaryVersion = 15u;
+ static constexpr u32 ShaderBinaryVersionQuadSampleMask = 16u;
+ static constexpr u32 ShaderBinaryVersionMsaaRead = 17u;
+ static constexpr u32 ShaderBinaryVersionMsaaReadQuadSampleMask = 18u;
++// Scalar-pointer compute loads support bounded prefixes and prologue table loads.
++static constexpr u32 ShaderBinaryVersionScalarPrefix = 19u;
++static constexpr u32 ShaderBinaryVersionScalarPrefixMsaaRead = 20u;
++// Vertex fetch conversion/swizzles must agree with the invalid-descriptor cache policy.
++static constexpr u32 ShaderBinaryVersionVertexFetch = 21u;
++// Fragment reflections use cube views; other stages keep their existing array path.
++static constexpr u32 ShaderBinaryVersionNativeCube = 23u;
++
++static bool UsesScalarPrefix(const Shader::Info& info) {
++    return info.hw_stage == Shader::HwStage::Compute &&
++           std::ranges::any_of(info.buffers, [](const auto& buffer) {
++               return buffer.post_op == Shader::SharpFetchPostOp::ReadConstPointer;
++           });
++}
+ static_assert(sizeof(Shader::HwFragmentRuntimeInfo) == 248 && sizeof(Shader::RuntimeInfo) == 312,
+               "Legacy metadata compatibility requires the runtime-info layout to stay unchanged");
+ // Stored output metadata and runtime color-buffer flags include swizzled-alpha emulation.
+@@ -55,7 +73,23 @@ static bool HasMsaaImage(const Shader::StageSpecialization& spec) {
+     });
+ }
+ 
+-static u32 ShaderBinaryVersionFor(const Shader::StageSpecialization& spec) {
++static u32 ShaderBinaryVersionFor(const Shader::StageSpecialization& spec,
++                                  bool scalar_prefix = false) {
++#ifdef RYTY_GPU
++    if (NativeModeRequested() && spec.runtime_info.hw_stage == Shader::HwStage::Fragment &&
++        std::ranges::any_of(spec.images, [](const auto& image) {
++            return image.type == AmdGpu::ImageType::Cube;
++        })) {
++        return Serialization::ShaderBinaryVersionNativeCube;
++    }
++#endif
++    if (!spec.fetch_shader_data.Empty()) {
++        return Serialization::ShaderBinaryVersionVertexFetch;
++    }
++    if (scalar_prefix) {
++        return HasMsaaImage(spec) ? Serialization::ShaderBinaryVersionScalarPrefixMsaaRead
++                                  : Serialization::ShaderBinaryVersionScalarPrefix;
++    }
+     const bool masked_fragment = spec.runtime_info.hw_stage == Shader::HwStage::Fragment &&
+                                  spec.runtime_info.hw.fs.quad_sample_mask;
+     if (HasMsaaImage(spec)) {
+@@ -70,7 +104,11 @@ static bool IsKnownShaderBinaryVersion(u32 version) {
+     return version == Serialization::ShaderBinaryVersion ||
+            version == Serialization::ShaderBinaryVersionQuadSampleMask ||
+            version == Serialization::ShaderBinaryVersionMsaaRead ||
+-           version == Serialization::ShaderBinaryVersionMsaaReadQuadSampleMask;
++           version == Serialization::ShaderBinaryVersionMsaaReadQuadSampleMask ||
++           version == Serialization::ShaderBinaryVersionScalarPrefix ||
++           version == Serialization::ShaderBinaryVersionScalarPrefixMsaaRead ||
++           version == Serialization::ShaderBinaryVersionVertexFetch ||
++           version == Serialization::ShaderBinaryVersionNativeCube;
+ }
+ 
+ void RegisterPipelineData(const ComputePipelineKey& key,
+@@ -285,7 +323,7 @@ void RegisterShaderMeta(const Shader::Info& info,
+     Serialization::Writer meta{ar};
+ 
+     meta.Write(Serialization::ShaderMetaVersion);
+-    meta.Write(ShaderBinaryVersionFor(spec));
++    meta.Write(ShaderBinaryVersionFor(spec, Serialization::UsesScalarPrefix(info)));
+ 
+     meta.Write(perm_hash);
+     meta.Write(perm_idx);
+@@ -336,11 +374,11 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
+         // This byte was padding before quad-mask emulation, and need not have been zero.
+         spec.runtime_info.hw.fs.quad_sample_mask = false;
+     }
+-    if (binary_version != ShaderBinaryVersionFor(spec)) {
+-        return false;
+-    }
+     info.Deserialize(ar, perm_hash_ar,
+                      meta_version != Serialization::ShaderMetaVersionWithoutAttributeFlags);
++    if (binary_version != ShaderBinaryVersionFor(spec, Serialization::UsesScalarPrefix(info))) {
++        return false;
++    }
+     info.resource_usage_known = false;
+     if (meta_version >= Serialization::ShaderMetaVersion) {
+         ReadResourceUsage(meta, info);
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index 67c3181..ece6c80 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -267,6 +267,7 @@ std::optional<Rasterizer::SelectedPipeline> Rasterizer::SelectPipelineAhead() {
+         .instance_sgpr_offset = 0,
+         .tessellate_quads = false,
+     });
++    selected.keepalive[0] = pipeline_cache.KeepAlive(selected.pipeline);
+     if (selected.pipeline) {
+         CopySelectedStages(selected.stages);
+     }
+@@ -276,6 +277,7 @@ std::optional<Rasterizer::SelectedPipeline> Rasterizer::SelectPipelineAhead() {
+             .instance_sgpr_offset = 0,
+             .tessellate_quads = true,
+         });
++        selected.keepalive[2] = pipeline_cache.KeepAlive(selected.quad_tess_pipeline);
+         if (selected.quad_tess_pipeline) {
+             CopySelectedStages(selected.quad_tess_stages);
+         }
+@@ -305,7 +307,9 @@ void Rasterizer::CopyComputeStage(std::array<SelectedStage, Shader::MaxStageType
+     selected.flattened = info->flattened_ud_buf;
+ }
+ 
+-const GraphicsPipeline* Rasterizer::LookupJobPipeline(const char** miss) {
++const GraphicsPipeline* Rasterizer::LookupJobPipeline(std::shared_ptr<const void>& keepalive,
++                                                      const char** miss) {
++    keepalive.reset();
+     const auto& regs = liverpool->DrawRegs();
+     bool depth_copy;
+     bool stencil_copy;
+@@ -319,6 +323,7 @@ const GraphicsPipeline* Rasterizer::LookupJobPipeline(const char** miss) {
+     // both and the recorder picks); its tessellated twin is looked up the same way when needed.
+     std::shared_lock lk{pipeline_cache.LookupMutex()}; // NAT-031: job threads at once
+     const auto* pipeline = pipeline_cache.LookupBuiltPipeline({});
++    keepalive = pipeline_cache.KeepAlive(pipeline);
+     if (!pipeline && miss) {
+         *miss = pipeline_cache.LookupMiss();
+     }
+@@ -373,6 +378,7 @@ std::optional<Rasterizer::SelectedPipeline> Rasterizer::SelectComputePipelineAhe
+     selected.is_compute = true;
+     std::scoped_lock lk{pipeline_cache.LookupMutex()};
+     selected.compute = pipeline_cache.GetComputePipeline();
++    selected.keepalive[1] = pipeline_cache.KeepAlive(selected.compute);
+     if (selected.compute) {
+         CopyComputeStage(selected.stages);
+     }
+@@ -2617,6 +2623,7 @@ void Rasterizer::OnSubmit() {
+     buffer_cache.TickFrame();
+     ProcessDownloadsTimed(DrainSource::Submit);
+     texture_cache.RunGarbageCollector();
++    pipeline_cache.TrimUnusedPipelines();
+     runtime.TickFrame();
+ }
+ 
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.h b/src/video_core/renderer_vulkan/vk_rasterizer.h
+index 0b2d786..34245f4 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.h
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.h
+@@ -78,6 +78,7 @@ public:
+         std::shared_ptr<const Shader::Info> seed;
+     };
+     struct SelectedPipeline {
++        std::array<std::shared_ptr<const void>, 3> keepalive;
+         const GraphicsPipeline* pipeline{};
+         /// PERF-055: a direct dispatch's compute pipeline (then `pipeline` is unused).
+         bool is_compute{};
+@@ -99,7 +100,8 @@ public:
+     std::optional<SelectedPipeline> SelectComputePipelineAhead();
+     /// NAT-030: on a game job thread whose registers Liverpool::SetThreadDrawState installed,
+     /// the built pipeline of its draw, or nullptr (special draws, quad lists, not built yet).
+-    const GraphicsPipeline* LookupJobPipeline(const char** miss = nullptr);
++    const GraphicsPipeline* LookupJobPipeline(std::shared_ptr<const void>& keepalive,
++                                              const char** miss = nullptr);
+     /// NAT-032: a hash of the resource descriptors (V#, T#, S#) the stages read for a draw.
+     static u64 SharpsHash(std::span<const Shader::Info* const> stages);
+     /// NAT-032: right after LookupJobPipeline found a pipeline, the sharps its draw reads, as
+@@ -213,6 +215,7 @@ public:
+     }
+     /// PERF-056: a used selection goes back for reuse with its vectors' capacity.
+     void RecycleSelectedPipeline(SelectedPipeline&& selected) {
++        selected.keepalive = {};
+         selected_recycler.Give(std::move(selected));
+     }
+ 
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp b/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp
+index 7a579c1..903d8d1 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp
+@@ -18,6 +18,7 @@
+ #include <bit>
+ #include <cstdlib>
+ #include <cstring>
++#include <map>
+ 
+ #include <fmt/ranges.h>
+ #include <magic_enum/magic_enum.hpp>
+@@ -58,6 +59,7 @@ vk::ImageViewType ConvertImageViewType(AmdGpu::ImageType type);
+ }
+ 
+ namespace Vulkan {
++bool RytyGtsInRace();
+ namespace {
+ 
+ /// Logs the first few times and then every 1000th.
+@@ -171,6 +173,9 @@ vk::ImageUsageFlags UsageOf(const Instance& instance, const VideoCore::ImageInfo
+                                 vk::ImageUsageFlagBits::eTransferDst |
+                                 vk::ImageUsageFlagBits::eSampled;
+     if (!info.props.is_block) {
++        if (instance.IsAttachmentFeedbackLoopLayoutSupported()) {
++            usage |= vk::ImageUsageFlagBits::eAttachmentFeedbackLoopEXT;
++        }
+         if (info.props.is_depth) {
+             usage |= vk::ImageUsageFlagBits::eDepthStencilAttachment;
+         } else {
+@@ -322,14 +327,17 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
+         }
+         // NAT-146: the GPU's bytes there are in a region (shader-written memory lives in video
+         // memory): the upload reads the region.
+-        if (Region* region = RegionOver(address, size);
++        Region* overlap = RegionOver(address, size);
++        if (Region* region = overlap;
+             region && address >= region->begin && address + size <= region->end &&
+             (address - region->begin) % r.instance.StorageMinAlignment() == 0) {
+-            RefreshRegion(*region);
++            RefreshRegion(*region, address, size);
+             auto wrapped = device->WrapBuffer(region->buffer->NativeHandle(), region->buffer->Size());
+             source.buffer = wrapped.get();
+             source.offset = address - region->begin;
+             source.kind = 1;
++            // MakeRegion watches the complete range before any target is initialized from it.
++            source.guest_writes_tracked = true;
+             source.keep.push_back(std::move(wrapped));
+             return source;
+         }
+@@ -337,7 +345,7 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
+             return source;
+         }
+         if (const auto found = direct->FindBuffer(address, size);
+-            found && found->second % r.instance.StorageMinAlignment() == 0) {
++            !overlap && found && found->second % r.instance.StorageMinAlignment() == 0) {
+             auto wrapped = device->WrapBuffer(
+                 reinterpret_cast<u64>(static_cast<VkBuffer>(found->first->Handle())),
+                 found->first->SizeBytes());
+@@ -365,6 +373,32 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
+                                               .size = bytes});
+             });
+         if (all) {
++            if (overlap) {
++                // The texture can straddle several GPU-written regions and imported guest
++                // memory. Keep guest bytes in the gaps, but use the GPU's current bytes for
++                // every overlap. Reading the whole range from the import loses those writes.
++                for (auto& [base, region] : regions) {
++                    const VAddr begin = std::max(address, region.begin);
++                    const VAddr end = std::min(address + size, region.end);
++                    if (begin < end) {
++                        RefreshRegion(region, begin, end - begin);
++                    }
++                }
++                list.Barrier(Native::Rhi::ScopeDraw | Native::Rhi::ScopeCompute |
++                                 Native::Rhi::ScopeTransfer,
++                             Native::Rhi::ScopeTransfer);
++                for (auto& [base, region] : regions) {
++                    const VAddr begin = std::max(address, region.begin);
++                    const VAddr end = std::min(address + size, region.end);
++                    if (begin < end) {
++                        cmd.copyBuffer(
++                            vk::Buffer{Handle<VkBuffer_T>(region.buffer->NativeHandle())}, dst,
++                            vk::BufferCopy{.srcOffset = begin - region.begin,
++                                           .dstOffset = begin - address,
++                                           .size = end - begin});
++                    }
++                }
++            }
+             list.Barrier(Native::Rhi::ScopeTransfer,
+                          Native::Rhi::ScopeCompute | Native::Rhi::ScopeTransfer);
+             source.buffer = gathered.get();
+@@ -414,6 +448,11 @@ Native::MadeImage NativeRenderer::MakeImage(const VideoCore::ImageInfo& info, bo
+     const Instance& instance = r.instance;
+     vk::ImageCreateFlags flags{vk::ImageCreateFlagBits::eMutableFormat |
+                                vk::ImageCreateFlagBits::eExtendedUsage};
++    if (r.instance.IsImageCubeArraySupported() && !info.props.is_volume &&
++        info.size.width == info.size.height &&
++        info.resources.layers >= 6 && info.num_samples == 1) {
++        flags |= vk::ImageCreateFlagBits::eCubeCompatible;
++    }
+     if (info.props.is_volume) {
+         flags |= vk::ImageCreateFlagBits::e2DArrayCompatible;
+         if (instance.Is2dViewOf3dSupported()) {
+@@ -534,6 +573,9 @@ vk::ImageView NativeRenderer::View(const Native::ImageEntry& entry,
+         format = r.instance.GetSupportedFormat(format, vk::FormatFeatureFlags2{entry.backend_features});
+     }
+     vk::ImageViewType view_type = VideoCore::ConvertImageViewType(info.type);
++    if (use == ViewUse::CubeSampled) {
++        view_type = vk::ImageViewType::eCubeArray;
++    }
+     if (volume) {
+         view_type = vk::ImageViewType::e3D;
+     } else if (view_type == vk::ImageViewType::e3D) {
+@@ -631,7 +673,7 @@ void NativeRenderer::BeginRendering(const RenderState& state) {
+         const auto& cb = state.color_attachments[i];
+         colors[i] = vk::RenderingAttachmentInfo{
+             .imageView = cb.image_view,
+-            .imageLayout = vk::ImageLayout::eGeneral,
++            .imageLayout = cb.image_layout,
+             .loadOp = cb.is_clear ? vk::AttachmentLoadOp::eClear : vk::AttachmentLoadOp::eLoad,
+             .storeOp = vk::AttachmentStoreOp::eStore,
+             .clearValue = vk::ClearValue{.color = vk::ClearColorValue{.uint32 = cb.clear_value}},
+@@ -734,12 +776,43 @@ void NativeRenderer::FlushWritebacks() {
+             found->first->SizeBytes());
+         if (registry->RecordDownload(*s.list, *entry, *out, found->second)) {
+             ++stats.writebacks;
++            if (RegionOver(address, size)) {
++                // Image writes are authoritative for their entire byte range. A CPU-page
++                // delta cannot represent them: its saved baseline can already contain the
++                // same image bytes while an older native region contains something else.
++                // Order the image download before copying its exact overlap into each region.
++                const vk::MemoryBarrier2 downloaded{
++                    .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
++                    .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
++                    .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
++                    .dstAccessMask = vk::AccessFlagBits2::eTransferRead |
++                                     vk::AccessFlagBits2::eTransferWrite,
++                };
++                s.cmd.pipelineBarrier2(vk::DependencyInfo{
++                    .memoryBarrierCount = 1,
++                    .pMemoryBarriers = &downloaded,
++                });
++                for (auto& [base, region] : regions) {
++                    const VAddr begin = std::max(address, region.begin);
++                    const VAddr end = std::min(address + size, region.end);
++                    if (begin >= end) {
++                        continue;
++                    }
++                    s.cmd.copyBuffer(found->first->Handle(),
++                                     vk::Buffer{Handle<VkBuffer_T>(region.buffer->NativeHandle())},
++                                     vk::BufferCopy{.srcOffset = found->second + begin - address,
++                                                    .dstOffset = begin - region.begin,
++                                                    .size = end - begin});
++                }
++
++            }
+             // NAT-146: regions over the picture's memory copy it in before their next use.
+             if (Region* region = RegionOver(address, size)) {
+                 for (VAddr page = Common::AlignDown(std::max<VAddr>(address, region->begin), 4096);
+                      page < std::min<VAddr>(address + size, region->end); page += 4096) {
+                     region->dirty_pages.push_back(page);
+                 }
++                region->dirty_sorted = false;
+             }
+             // NAT-150: so do mirrors.
+             for (auto it = FirstMirror(address);
+@@ -899,6 +972,7 @@ NativeRenderer::Region* NativeRenderer::MakeRegion(VAddr address, u64 size) {
+             if (it->second.begin < end && it->second.end > begin) {
+                 begin = std::min(begin, it->second.begin);
+                 end = std::max(end, it->second.end);
++                retired_watch_ranges.emplace_back(it->second.begin, it->second.end);
+                 merged.push_back(std::move(it->second));
+                 it = regions.erase(it);
+             } else {
+@@ -963,6 +1037,7 @@ NativeRenderer::Region* NativeRenderer::MakeRegion(VAddr address, u64 size) {
+         // FIX-173: CPU writes to it not copied in yet are copied in at the new one's next use.
+         region.dirty_pages.insert(region.dirty_pages.end(), old.dirty_pages.begin(),
+                                   old.dirty_pages.end());
++        region.dirty_sorted = false;
+     }
+     s.buffers_written = true;
+     // CPU writes to it from now on are copied in before its next use.
+@@ -992,6 +1067,7 @@ void NativeRenderer::SortRegionWrites() {
+                      page += 4096) {
+                     region.dirty_pages.push_back(page);
+                 }
++                region.dirty_sorted = false;
+             }
+         }
+         // FIX-173: copies of pages no region holds are not needed.
+@@ -1033,6 +1109,7 @@ void NativeRenderer::SortRegionWrites() {
+                 ++stats.mirrors_dropped;
+                 ++buffer_generation; // OPT-003
+                 buffer_log.Note(mirror.begin, mirror.end); // OPT-010
++                retired_watch_ranges.emplace_back(mirror.begin, mirror.end);
+                 std::unique_lock map_lock{buffer_map_mutex};
+                 it = mirrors.erase(it); // freed once the GPU is done with it
+                 continue;
+@@ -1238,6 +1315,7 @@ void NativeRenderer::MakePendingMirrors() {
+                     mirror_bytes -= it->second.end - it->second.begin;
+                     ++stats.mirrors_evicted;
+                     buffer_log.Note(it->second.begin, it->second.end);
++                    retired_watch_ranges.emplace_back(it->second.begin, it->second.end);
+                     it = mirrors.erase(it);
+                 } else {
+                     ++it;
+@@ -1266,6 +1344,7 @@ void NativeRenderer::MakePendingMirrors() {
+             std::unique_lock map_lock{buffer_map_mutex}; // OPT-010
+             for (auto it = FirstMirror(begin); it != mirrors.end() && it->second.begin < end;) {
+                 mirror_bytes -= it->second.end - it->second.begin;
++                retired_watch_ranges.emplace_back(it->second.begin, it->second.end);
+                 it = mirrors.erase(it); // freed once the GPU is done with it
+             }
+         }
+@@ -1302,18 +1381,35 @@ void NativeRenderer::DropMirrors(VAddr address, u64 size) {
+         mirror_bytes -= it->second.end - it->second.begin;
+         ++buffer_generation; // OPT-003
+         buffer_log.Note(it->second.begin, it->second.end); // OPT-010
++        retired_watch_ranges.emplace_back(it->second.begin, it->second.end);
+         std::unique_lock map_lock{buffer_map_mutex};
+         it = mirrors.erase(it); // freed once the GPU is done with it
+     }
+ }
+ 
+-void NativeRenderer::RefreshRegion(Region& region) {
++void NativeRenderer::RefreshRegion(Region& region, VAddr address, u64 size) {
+     SortRegionWrites();
+-    std::vector<VAddr> pages;
+-    pages.swap(region.dirty_pages);
+-    if (pages.empty()) {
++    auto& dirty = region.dirty_pages;
++    if (dirty.empty() || size == 0) {
++        return;
++    }
++    if (!region.dirty_sorted) {
++        std::ranges::sort(dirty);
++        dirty.erase(std::unique(dirty.begin(), dirty.end()), dirty.end());
++        region.dirty_sorted = true;
++    }
++    // Regions survive scene changes and may hold unrelated allocations. Refresh only the
++    // pages this operation uses; the rest stay pending, with their original CPU snapshots,
++    // until a later operation uses them. GPU-written bytes still come from the region.
++    const VAddr begin = Common::AlignDown(std::max(address, region.begin), 4096);
++    const VAddr end = std::min(region.end, address + size);
++    const auto first = std::lower_bound(dirty.begin(), dirty.end(), begin);
++    const auto last = std::lower_bound(first, dirty.end(), end);
++    if (first == last) {
+         return;
+     }
++    std::vector<VAddr> pages(first, last);
++    dirty.erase(first, last);
+     const auto refresh_start = std::chrono::steady_clock::now();
+     struct Timed {
+         std::chrono::steady_clock::time_point start;
+@@ -1332,8 +1428,31 @@ void NativeRenderer::RefreshRegion(Region& region) {
+     Stream& s = Begin();
+     GlobalBarrier();
+     const vk::Buffer dst{Handle<VkBuffer_T>(region.buffer->NativeHandle())};
+-    std::ranges::sort(pages);
+-    pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
++    // The selected dirty pages are already sorted and unique. Detach their old snapshots
++    // before rearming protection: a write fault after that must save a new snapshot for the
++    // next refresh, rather than have its snapshot consumed by this one.
++    std::vector<std::unique_ptr<std::array<u8, 4096>>> snapshots(pages.size());
++    {
++        std::scoped_lock lock{region_dirty_mutex};
++        for (size_t i = 0; i < pages.size(); ++i) {
++            if (const auto it = page_snapshots.find(pages[i]); it != page_snapshots.end()) {
++                snapshots[i] = std::move(it->second);
++                page_snapshots.erase(it);
++            }
++        }
++    }
++    // One protection operation per contiguous run, instead of one per dirty page. All pages
++    // are watched before comparing guest bytes, so writes racing with the comparison still
++    // fault and remain pending for the next use.
++    for (size_t first = 0; first < pages.size();) {
++        size_t last = first + 1;
++        while (last < pages.size() && pages[last] == pages[last - 1] + 4096) {
++            ++last;
++        }
++        const VAddr end = std::min(region.end, pages[last - 1] + 4096);
++        WatchPages(pages[first], end - pages[first]);
++        first = last;
++    }
+     const auto copy_in = [&](VAddr from, u64 size) {
+         direct->ForEachPart(from, size,
+                             [&](const VideoCore::Buffer& view, u64 view_offset, u64 offset,
+@@ -1345,25 +1464,13 @@ void NativeRenderer::RefreshRegion(Region& region) {
+                                                                 .size = bytes});
+                             });
+     };
+-    for (const VAddr page : pages) {
++    for (size_t i = 0; i < pages.size(); ++i) {
++        const VAddr page = pages[i];
+         if (page < region.begin || page >= region.end) {
+             continue;
+         }
+         const u64 page_bytes = std::min<u64>(4096, region.end - page);
+-        // FIX-173: the page as it was before the CPU wrote it (taken at the write fault).
+-        std::unique_ptr<std::array<u8, 4096>> before;
+-        {
+-            std::scoped_lock lock{region_dirty_mutex};
+-            if (const auto it = page_snapshots.find(page); it != page_snapshots.end()) {
+-                before = std::move(it->second);
+-                page_snapshots.erase(it);
+-            }
+-        }
+-        // NAT-145: only the pages copied in are watched again (the region was watched whole
+-        // when made; re-watching all of it at each refresh cost ~9 us a draw with big regions).
+-        // FIX-173: watched before guest memory is compared, so a CPU write from now on faults
+-        // (and takes a new copy) instead of slipping in between the compare and the watch.
+-        WatchPages(page, page_bytes);
++        const auto& before = snapshots[i];
+         std::array<u8, 4096> now;
+         if (!before || !Core::RytyMemory::GuardedCopy(now.data(),
+                                                       reinterpret_cast<const void*>(page),
+@@ -1411,9 +1518,10 @@ void NativeRenderer::RefreshRegion(Region& region) {
+ u64 NativeRenderer::SnapshotBelow() {
+     static const u64 below = [] {
+         const char* env = std::getenv("RYGT_NATIVE_SNAPSHOT_BELOW");
+-        return env && *env ? std::strtoull(env, nullptr, 0) : u64{0};
++        return env && *env ? std::strtoull(env, nullptr, 0) : u64{1_MB};
+     }();
+-    return below;
++    // Race buffers can depend on GPU writes not yet visible to a CPU snapshot.
++    return RytyGtsInRace() ? 0 : below;
+ }
+ 
+ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBuffer(VAddr address, u64 size,
+@@ -1484,7 +1592,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBufferLookup(VAdd
+             region = MakeRegion(address, size);
+         }
+         if (region) {
+-            RefreshRegion(*region);
++            RefreshRegion(*region, address, size);
+             ++stats.region_binds;
+             memo_kind = MemoKind::Region; // OPT-003
+             memo_region = region;
+@@ -1962,6 +2070,14 @@ bool NativeRenderer::ResolveTargets(const AmdGpu::Regs& regs, const GraphicsPipe
+                             u32(regs.depth_render_control.stencil_clear_enable), frame);
+             }
+             db.image_view = view;
++            if (r.FrameDumpCollecting() && entry->info.guest_address == 0x100ca70000) {
++                r.FrameDumpEvent(fmt::format(
++                    "shadow binding: target {}x{} layers {}, view layer {}+{}, instances {}, "
++                    "indices {}, depth clear {}, stencil clear {}",
++                    entry->info.size.width, entry->info.size.height, entry->info.resources.layers,
++                    desc.view_info.range.base.layer, desc.view_info.range.extent.layers,
++                    regs.num_instances.NumInstances(), regs.num_indices, depth_clear, stencil_clear));
++            }
+             if (regs.depth_buffer.DepthValid()) {
+                 db.clear_value[0] = depth_clear ? std::bit_cast<u32>(regs.depth_clear) : 0u;
+                 db.has_depth = true;
+@@ -2024,6 +2140,16 @@ void NativeRenderer::BindStages(std::span<const Shader::Info* const> stages,
+ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& regs, bool compute,
+                                  Shader::Backend::Bindings& binding, DrawBindings& b) {
+     const u64 alignment = r.instance.StorageMinAlignment();
++    if (r.FrameDumpCollecting() && !compute &&
++        regs.depth_buffer.DepthAddress() == 0x100ca70000 &&
++        stage.sw_stage == Shader::SwStage::Vertex) {
++        std::string values;
++        for (size_t i = 0; i < std::min<size_t>(stage.flattened_ud_buf.size(), 64); ++i) {
++            values += fmt::format(" {}:{:08x}@{:x}", i, stage.flattened_ud_buf[i],
++                i < stage.flattened_ud_src.size() ? stage.flattened_ud_src[i] : 0);
++        }
++        r.FrameDumpEvent(fmt::format("shadow constants vs {:#x}:{}", stage.pgm_hash, values));
++    }
+     // DIAG-150 (SHADGT_WATCH_SHADERS=<hex,...>): a watched shader's buffers, how they are bound
+     // and the first bytes guest memory holds there, and its flattened user data.
+     if (Rasterizer::ExposureLogOn()) {
+@@ -2205,6 +2331,30 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs&
+                     !RegionOver(base, size) && direct->EnsureImported(base, size)) {
+                     // D3: read in place through the page table; nothing bound.
+                     direct_entries[buffer_index] = {u32(base), u32(base >> 32), u32(size), 1u};
++                    if (SnapshotBelow() >= 4_KB && stage.hw_stage == Shader::HwStage::Compute &&
++                        size >= 4_KB &&
++                        desc.post_op == Shader::SharpFetchPostOp::ReadConstPointer) {
++                        constexpr u64 PrefixSize = 4_KB;
++                        const auto [source, offset] = SnapshotRange(base, PrefixSize).value();
++                        auto prefix = device->CreateBuffer({
++                            .size = PrefixSize,
++                            .usage = Native::Rhi::BufferUsageStorage |
++                                     Native::Rhi::BufferUsageTransferDst,
++                            .memory = Native::Rhi::MemoryKind::DeviceLocal,
++                            .name = "native scalar prefix"});
++                        if (prefix) {
++                            EndRendering();
++                            const vk::Buffer target{Handle<VkBuffer_T>(prefix->NativeHandle())};
++                            stream.cmd.copyBuffer(source, target,
++                                vk::BufferCopy{.srcOffset = offset, .dstOffset = 0,
++                                               .size = PrefixSize});
++                            stream.list->Barrier(Native::Rhi::ScopeTransfer,
++                                                 Native::Rhi::ScopeCompute);
++                            info = {target, 0, PrefixSize};
++                            direct_entries[buffer_index][3] = u32(PrefixSize);
++                            stream.keep.push_back(std::move(prefix));
++                        }
++                    }
+                     if (InPlaceSampled()) {
+                         in_place.Note(2, base, size); // NAT-142
+                     }
+@@ -2246,6 +2396,7 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
+                                   Shader::Backend::Bindings& binding, DrawBindings& b) {
+     for (const auto& image_desc : stage.images) {
+         const auto tsharp = image_desc.GetSharp(stage);
++        const bool cube_sampling = image_desc.post_op == Shader::SharpFetchPostOp::NativeCubeSampling;
+         const u32 num_bindings = image_desc.NumBindings(stage);
+         const u32 first = static_cast<u32>(b.images.size());
+         const bool storage = image_desc.is_written;
+@@ -2280,7 +2431,7 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
+                                (u32(image_desc.is_depth) << 2) |
+                                (u32(image_desc.mip_fallback_mode) << 3) |
+                                ((image_desc.constant_mip_index & 0xff) << 6) |
+-                               (num_bindings << 16);
++                               (num_bindings << 16) | (u32(cube_sampling) << 31);
+         if (num_bindings <= 4 && stage.pgm_hash != 0xaa3822a3 && !r.FrameDumpCollecting()) {
+             memo = &texture_memos[XXH3_64bits_withSeed(raw_sharp.data(), sizeof(raw_sharp),
+                                                        memo_flags) &
+@@ -2354,12 +2505,7 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
+                 const char* env = std::getenv("RYGT_FRAME_DUMP_ALL_TEXTURES");
+                 return env && env[0] == '1';
+             }();
+-            bool gpu_written = dump_all || !entry->from_cpu;
+-            if (!gpu_written) {
+-                std::scoped_lock lock{entry->sources_mutex};
+-                gpu_written = !entry->sources.empty();
+-            }
+-            if (gpu_written) {
++            if (dump_all || !entry->from_cpu) {
+                 auto key = Rasterizer::FrameDumpTextureKey(desc.info); // NAT-123
+                 if (std::ranges::find(dump_textures, key, &decltype(dump_textures)::value_type::first) ==
+                     dump_textures.end()) {
+@@ -2383,7 +2529,9 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
+                 view_info.range.extent.levels = 1;
+             }
+             const vk::ImageView view =
+-                View(*entry, view_info, storage ? ViewUse::Storage : ViewUse::Sampled);
++                View(*entry, view_info, storage ? ViewUse::Storage
++                                               : cube_sampling ? ViewUse::CubeSampled
++                                                           : ViewUse::Sampled);
+             b.images.push_back({VK_NULL_HANDLE, view, vk::ImageLayout::eGeneral});
+         }
+         if (memo) {
+@@ -2857,8 +3005,11 @@ void NativeRenderer::Written(const Native::ImageEntry* entry, u64 at) {
+         return;
+     }
+     auto* written = const_cast<Native::ImageEntry*>(entry);
++    const bool watched = Native::WatchedTexture(entry->info.guest_address,
++                                                entry->info.guest_address + 1);
++    const bool first_write = watched && written->write_version.load(std::memory_order_relaxed) == 0;
+     written->write_version.store(at != 0 ? at : ++write_clock, std::memory_order_relaxed);
+-    if (Native::WatchedTexture(entry->info.guest_address, entry->info.guest_address + 1)) {
++    if (watched) {
+         // FIX-159 (diagnosis, RYGT_FRAME_DUMP_ON_STORE=<seconds>): from that long after start,
+         // the first write of a watched picture starts a frame dump there (the frames a
+         // time-triggered dump never lands on).
+@@ -2874,7 +3025,7 @@ void NativeRenderer::Written(const Native::ImageEntry* entry, u64 at) {
+             dumped = true;
+             Native::g_dump_request = true;
+         }
+-        if (Native::WatchSample()) {
++        if (first_write || Native::WatchSample()) {
+             LOG_WARNING(Render_Vulkan, "FIX-157 watch: {} {:#x} {}x{} layers {} written, version {} "
+                         "(frame {})", entry->from_cpu ? "texture" : "target",
+                         entry->info.guest_address, entry->info.size.width,
+@@ -2917,17 +3068,33 @@ void NativeRenderer::RefreshSources(Native::ImageEntry& texture) {
+         if (version == 0 || !source->image || source->reused.load(std::memory_order_relaxed)) {
+             continue; // FIX-157: a reused one is stale
+         }
+-        const u32 key = (u32(place.mip) << 16) | u32(place.layer);
+-        if (version <= std::max(held[key], own)) {
++        const u32 source_layers = std::max(source->image->Desc().layers, 1u);
++        if (place.src_layer < 0 || place.layer < 0 ||
++            u32(place.src_layer) >= source_layers ||
++            u32(place.layer) >= std::max(texture.image->Desc().layers, 1u)) {
+             continue;
+         }
+-        const auto same = std::ranges::find_if(picks, [&](const Pick& pick) {
+-            return pick.place.mip == place.mip && pick.place.layer == place.layer;
+-        });
+-        if (same == picks.end()) {
+-            picks.push_back({source, place, version});
+-        } else if (version > same->version) {
+-            *same = {source, place, version};
++        const u32 layers = std::min(source_layers - u32(place.src_layer),
++                                    std::max(texture.image->Desc().layers, 1u) - u32(place.layer));
++        // A layered target and individual faces can overlap. Choose and remember the newest
++        // source for each face; choosing only the first face lets an older array overwrite a
++        // newer face later in the copy list (or after that face was already copied).
++        for (u32 layer = 0; layer < layers; ++layer) {
++            auto face = place;
++            face.layer += s32(layer);
++            face.src_layer += s32(layer);
++            const u32 key = (u32(face.mip) << 16) | u32(face.layer);
++            if (version <= std::max(held[key], own)) {
++                continue;
++            }
++            const auto same = std::ranges::find_if(picks, [&](const Pick& pick) {
++                return pick.place.mip == face.mip && pick.place.layer == face.layer;
++            });
++            if (same == picks.end()) {
++                picks.push_back({source, face, version});
++            } else if (version > same->version) {
++                *same = {source, face, version};
++            }
+         }
+     }
+     if (picks.empty()) {
+@@ -2940,7 +3107,11 @@ void NativeRenderer::RefreshSources(Native::ImageEntry& texture) {
+     PrepareImages();  // the texture's own upload goes first
+     GlobalBarrier();  // the sources' pictures are written
+     const vk::Image dst{Handle<VkImage_T>(texture.image->NativeHandle())};
+-    for (const auto& pick : picks) {
++    std::ranges::sort(picks, {}, [](const Pick& pick) {
++        return std::pair{pick.place.mip, pick.place.layer};
++    });
++    for (size_t index = 0; index < picks.size();) {
++        const auto& pick = picks[index];
+         const auto& place = pick.place;
+         const u32 width = std::min(
+             {place.width, std::max(texture.info.size.width >> place.mip, 1u),
+@@ -2948,12 +3119,20 @@ void NativeRenderer::RefreshSources(Native::ImageEntry& texture) {
+         const u32 height = std::min(
+             {place.height, std::max(texture.info.size.height >> place.mip, 1u),
+              std::max(pick.source->info.size.height >> place.src_mip, 1u)});
+-        // NAT-125: a layered target (a cube's faces drawn in one pass, the layer from the
+-        // vertex shader) gives all its layers; NAT-131: from the layer the texture starts at.
+-        const u32 layers = std::max<u32>(
+-            1u, std::min<u32>(std::max<u32>(pick.source->image->Desc().layers, 1u) -
+-                                  u32(place.src_layer),
+-                              std::max<u32>(texture.image->Desc().layers, 1u) - u32(place.layer)));
++        // Keep contiguous faces from the same source in one GPU copy, without crossing a
++        // face selected from a newer source.
++        u32 layers = 1;
++        while (index + layers < picks.size()) {
++            const auto& next = picks[index + layers];
++            if (next.source != pick.source || next.version != pick.version ||
++                next.place.mip != place.mip || next.place.src_mip != place.src_mip ||
++                next.place.layer != place.layer + s32(layers) ||
++                next.place.src_layer != place.src_layer + s32(layers) ||
++                next.place.width != place.width || next.place.height != place.height) {
++                break;
++            }
++            ++layers;
++        }
+         const vk::ImageCopy region{
+             .srcSubresource{.aspectMask = vk::ImageAspectFlagBits::eColor,
+                             .mipLevel = u32(place.src_mip),
+@@ -2980,7 +3159,10 @@ void NativeRenderer::RefreshSources(Native::ImageEntry& texture) {
+                         pick.source->info.resources.layers, place.mip, place.layer, layers,
+                         pick.version);
+         }
+-        held[(u32(place.mip) << 16) | u32(place.layer)] = pick.version;
++        for (u32 layer = 0; layer < layers; ++layer) {
++            held[(u32(place.mip) << 16) | (u32(place.layer) + layer)] = pick.version;
++        }
++        index += layers;
+     }
+     s.written.push_back(&texture); // read after the next barrier
+     stats.source_copies += picks.size();
+@@ -3192,6 +3374,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
+         PhaseClock clock{stats.phase_ns[1]};
+         ResolveTargets(regs, *pipeline, targets);
+     }
++
+     if (r.FrameDumpActive() || Rasterizer::ExposureLogOn()) {
+         r.FrameDumpPass(regs, targets.state, pipeline); // NAT-117
+     }
+@@ -3238,6 +3421,83 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
+         return;
+     }
+     Begin();
++    // A color image sampled while this draw writes it is a feedback attachment. Native
++    // images normally stay in GENERAL, but that does not make an overlapping attachment
++    // read legal. Enter the feedback layout for this draw and restore GENERAL afterward.
++    boost::container::small_vector<const Native::ImageEntry*, 8> feedback;
++    if (r.instance.IsAttachmentFeedbackLoopLayoutSupported()) {
++        for (u32 cb = 0; cb < targets.colors.size(); ++cb) {
++            const auto* target = targets.colors[cb];
++            if (target && std::ranges::find(b.sampled, target) != b.sampled.end() &&
++                std::ranges::find(feedback, target) == feedback.end()) {
++                // Output-resolution UI can redirect this attachment to a separate proxy.
++                // Only the original image's own attachment views form a feedback loop.
++                std::scoped_lock lock{views_mutex};
++                const auto found = views.find(target);
++                if (found != views.end() && std::ranges::any_of(found->second, [&](const auto& view) {
++                        return view.use == ViewUse::Attachment &&
++                               *view.view == targets.state.color_attachments[cb].image_view;
++                    })) {
++                    feedback.push_back(target);
++                }
++            }
++        }
++    }
++    const auto feedback_layout = [&](vk::ImageLayout from, vk::ImageLayout to) {
++        boost::container::static_vector<vk::ImageMemoryBarrier2, 8> barriers;
++        for (const auto* entry : feedback) {
++            barriers.push_back(vk::ImageMemoryBarrier2{
++                .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
++                .srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
++                .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
++                .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
++                .oldLayout = from,
++                .newLayout = to,
++                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++                .image = vk::Image{Handle<VkImage_T>(entry->image->NativeHandle())},
++                .subresourceRange{
++                    .aspectMask = vk::ImageAspectFlagBits::eColor,
++                    .baseMipLevel = 0,
++                    .levelCount = VK_REMAINING_MIP_LEVELS,
++                    .baseArrayLayer = 0,
++                    .layerCount = VK_REMAINING_ARRAY_LAYERS,
++                },
++            });
++        }
++        s.cmd.pipelineBarrier2(vk::DependencyInfo{
++            .imageMemoryBarrierCount = static_cast<u32>(barriers.size()),
++            .pImageMemoryBarriers = barriers.data(),
++        });
++    };
++    if (!feedback.empty()) {
++        GlobalBarrier();
++        feedback_layout(vk::ImageLayout::eGeneral,
++                        vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT);
++        for (u32 cb = 0; cb < targets.colors.size(); ++cb) {
++            if (std::ranges::find(feedback, targets.colors[cb]) != feedback.end()) {
++                targets.state.color_attachments[cb].image_layout =
++                    vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT;
++            }
++        }
++        std::scoped_lock lock{views_mutex};
++        for (const auto* entry : feedback) {
++            const auto found = views.find(entry);
++            if (found == views.end()) {
++                continue;
++            }
++            for (const auto& view : found->second) {
++                if (view.use != ViewUse::Sampled && view.use != ViewUse::CubeSampled) {
++                    continue;
++                }
++                for (auto& image : b.images) {
++                    if (image.imageView == *view.view) {
++                        image.imageLayout = vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT;
++                    }
++                }
++            }
++        }
++    }
+     PhaseClock record_clock{stats.phase_ns[7]};
+     {
+         PhaseClock part{stats.record_ns[0]}; // OPT-011
+@@ -3290,7 +3550,8 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
+         PhaseClock part{stats.record_ns[2]};
+         DynamicState* const saved = Rasterizer::t_dynamic_state;
+         Rasterizer::t_dynamic_state = &s.dynamic;
+-        r.ctx->attachment_feedback_loop = {};
++        r.ctx->attachment_feedback_loop = feedback.empty() ? vk::ImageAspectFlags{}
++                                                           : vk::ImageAspectFlagBits::eColor;
+         r.UpdateViewportScissorState();
+         r.UpdateDepthStencilState();
+         r.UpdatePrimitiveState(is_indexed, quad_triangles);
+@@ -3322,6 +3583,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
+         const auto [vertex_offset, instance_offset] =
+             DrawOffsets(regs, vs_info, pipeline->GetFetchShader());
+         const u32 instances = regs.num_instances.NumInstances();
++        const auto* fs = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+         if (quad_triangles) {
+             if (index_count != 0) {
+                 cmdbuf.drawIndexed(index_count, instances, 0, s32(vertex_offset),
+@@ -3338,6 +3600,13 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
+         PhaseClock part{stats.record_ns[7]};
+         NoteWrites(&targets, b);
+     }
++    if (!feedback.empty()) {
++        EndRendering();
++        feedback_layout(vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT,
++                        vk::ImageLayout::eGeneral);
++        s.buffers_written = true;
++    }
++
+     ++stats.draws;
+     ++s.commands;
+     ChunkFlushCheck();
+@@ -3356,6 +3625,7 @@ void NativeRenderer::PreparedDraw::Reset() {
+     packet = nullptr;
+     epoch = 0;
+     pipeline = nullptr;
++    pipeline_keepalive.reset();
+     stage_hashes = {};
+     bindings.Clear();
+     regions.clear();
+@@ -3496,6 +3766,7 @@ u64 NativeRenderer::StageHash(const Shader::Info& info) {
+ 
+ void NativeRenderer::PrepareJobDraw(const void* packet, u32 epoch, const AmdGpu::Regs& regs,
+                                     const GraphicsPipeline& pipeline,
++                                    std::shared_ptr<const void> pipeline_keepalive,
+                                     std::span<const Shader::Info* const> stages, bool is_indexed,
+                                     u32 index_offset) {
+     const auto start = std::chrono::steady_clock::now();
+@@ -3503,6 +3774,7 @@ void NativeRenderer::PrepareJobDraw(const void* packet, u32 epoch, const AmdGpu:
+     p->packet = packet;
+     p->epoch = epoch;
+     p->pipeline = &pipeline;
++    p->pipeline_keepalive = std::move(pipeline_keepalive);
+     // What the lookups depend on, read before them.
+     p->image_generation = registry->Generation();
+     p->buffer_seq = buffer_log.Seq();
+@@ -3747,6 +4019,7 @@ bool NativeRenderer::PrepareTextures(const Shader::Info& stage, const AmdGpu::Re
+     static thread_local std::array<TextureMemo, 4096> memos{};
+     for (const auto& image_desc : stage.images) {
+         const auto tsharp = image_desc.GetSharp(stage);
++        const bool cube_sampling = image_desc.post_op == Shader::SharpFetchPostOp::NativeCubeSampling;
+         const u32 num_bindings = image_desc.NumBindings(stage);
+         const u32 first = static_cast<u32>(b.images.size());
+         const bool storage = image_desc.is_written;
+@@ -3777,7 +4050,7 @@ bool NativeRenderer::PrepareTextures(const Shader::Info& stage, const AmdGpu::Re
+                                (u32(image_desc.is_depth) << 2) |
+                                (u32(image_desc.mip_fallback_mode) << 3) |
+                                ((image_desc.constant_mip_index & 0xff) << 6) |
+-                               (num_bindings << 16);
++                               (num_bindings << 16) | (u32(cube_sampling) << 31);
+         if (num_bindings > 4 || stage.pgm_hash == 0xaa3822a3) {
+             return false; // the recorder (FIX-081's grass shader, long arrays)
+         }
+@@ -3829,7 +4102,9 @@ bool NativeRenderer::PrepareTextures(const Shader::Info& stage, const AmdGpu::Re
+                 view_info.range.extent.levels = 1;
+             }
+             const vk::ImageView view =
+-                View(*entry, view_info, storage ? ViewUse::Storage : ViewUse::Sampled);
++                View(*entry, view_info, storage ? ViewUse::Storage
++                                               : cube_sampling ? ViewUse::CubeSampled
++                                                               : ViewUse::Sampled);
+             b.images.push_back({VK_NULL_HANDLE, view, vk::ImageLayout::eGeneral});
+         }
+         memo.sharp = raw_sharp;
+@@ -4079,7 +4354,7 @@ bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pip
+     }
+     // The ordered part, as BindBuffers and BindTextures do it.
+     for (Region* region : p.regions) {
+-        RefreshRegion(*region);
++        RefreshRegion(*region, region->begin, region->end - region->begin);
+         ++stats.region_binds;
+     }
+     const u64 alignment = r.instance.StorageMinAlignment();
+@@ -4766,6 +5041,7 @@ void NativeRenderer::OnUnmap(VAddr address, u64 size) {
+         for (auto it = regions.begin(); it != regions.end();) {
+             if (it->second.begin < address + size && it->second.end > address) {
+                 buffer_log.Note(it->second.begin, it->second.end);
++                retired_watch_ranges.emplace_back(it->second.begin, it->second.end);
+                 it = regions.erase(it);
+             } else {
+                 ++it;
+@@ -5014,7 +5290,7 @@ void NativeRenderer::EvictImages() {
+     if (frame <= KeepFrames || frame % 30 != 0) {
+         return;
+     }
+-    // FIX-157: a picture the GPU wrote and used for a second or more stays past its idle time
++    // FIX-157: a picture the GPU wrote stays past its idle time
+     // while nothing else writes its memory: its pixels exist nowhere else (the GPU's writes stay
+     // in the picture, not in guest memory). GT Sport bakes its light probes (two cube arrays of
+     // 322 32x32 cubes, at 0x107aee1400 and 0x108626d400) with compute shaders while a race
+@@ -5025,9 +5301,12 @@ void NativeRenderer::EvictImages() {
+     // keeping pictures whose memory the CPU had reused drew stale pictures, and writing them
+     // back overwrote shader code the game had loaded there), no newer picture overlaps it, and
+     // GPU work wrote no part of its memory since; from then on its pages are watched, and a CPU
+-    // write, an unmap or GPU work there lets it go. Pictures in use for less than a second (the
+-    // scratch pool's) go as before; kept ones take at most 256 MB.
+-    constexpr u64 KeptBudget = 256ull << 20;
++    // write, an unmap or GPU work there lets it go. A baked image may be written in just one
++    // frame and sampled much later; its short initial use does not make its GPU contents
++    // disposable. Include room for the persistent 221 MB terrain shadow map alongside the
++    // lighting probes; dropping that map makes its texture reload only the initial clear.
++    // Kept images take at most 512 MB.
++    constexpr u64 KeptBudget = 512ull << 20;
+     u32 newly_kept = 0;
+     const auto keep = [&](Native::ImageEntry& entry) {
+         if (entry.from_cpu || !entry.image || entry.reused.load(std::memory_order_relaxed)) {
+@@ -5051,11 +5330,23 @@ void NativeRenderer::EvictImages() {
+         if (entry.kept.load(std::memory_order_relaxed)) {
+             return true;
+         }
+-        if (entry.last_use.load(std::memory_order_relaxed) < entry.made_frame + 60 ||
+-            kept_bytes + size > KeptBudget || !registry->MemoryUnchanged(entry)) {
++        // A persistent depth map may live in GPU-only guest memory: there is no complete CPU
++        // hash, and the region still holds its initial clear rather than the rendered depth.
++        // Keep that authoritative image only when its backing has been watched since the first
++        // upload and no CPU write or unmap occurred. The foreign-write and budget guards above
++        // still apply; ordinary CPU-backed images continue to require an unchanged hash.
++        const bool tracked_depth = entry.info.props.is_depth && entry.content_hash == 0 &&
++                                   entry.guest_writes_tracked &&
++                                   !entry.guest_modified.load(std::memory_order_seq_cst);
++        if (kept_bytes + size > KeptBudget ||
++            (!tracked_depth && !registry->MemoryUnchanged(entry))) {
++            return false;
++        }
++        entry.kept.store(true, std::memory_order_seq_cst);
++        if (tracked_depth && entry.guest_modified.load(std::memory_order_seq_cst)) {
++            entry.kept.store(false, std::memory_order_relaxed);
+             return false;
+         }
+-        entry.kept.store(true, std::memory_order_relaxed);
+         kept_bytes += size;
+         WatchPages(address, size);
+         ++newly_kept;
+@@ -5066,6 +5357,10 @@ void NativeRenderer::EvictImages() {
+         return true;
+     };
+     registry->Evict(frame - KeepFrames, [&](Native::ImageEntry& entry) {
++        retired_watch_ranges.emplace_back(
++            VideoCore::PageManager::GetPageAddr(entry.info.guest_address),
++            VideoCore::PageManager::GetNextPageAddr(
++                entry.info.guest_address + std::max<u64>(entry.info.guest_size, 1) - 1));
+         if (entry.kept.load(std::memory_order_relaxed)) {
+             kept_bytes -= std::min<u64>(kept_bytes, std::max<u64>(entry.info.guest_size, 1));
+         }
+@@ -5151,6 +5446,57 @@ void NativeRenderer::UnwatchPages(VAddr begin, VAddr end) {
+     }
+ }
+ 
++void NativeRenderer::ReleaseUnusedWatches() {
++    if (retired_watch_ranges.empty()) {
++        return;
++    }
++    // WatchPages coalesces every native owner into one page-manager watch. Removing one
++    // resource may open only pages that no other image, region or mirror still needs.
++    // In particular, retired mesh/texture memory can become a fiber stack: leaving its
++    // unused pages read-only can prevent Windows from dispatching a subsequent write fault.
++    std::vector<std::pair<VAddr, VAddr>> pending;
++    pending.swap(retired_watch_ranges);
++    std::ranges::sort(pending);
++    std::vector<std::pair<VAddr, VAddr>> ranges;
++    for (const auto& range : pending) {
++        if (!ranges.empty() && range.first <= ranges.back().second) {
++            ranges.back().second = std::max(ranges.back().second, range.second);
++        } else {
++            ranges.push_back(range);
++        }
++    }
++    for (const auto& [begin, end] : ranges) {
++        std::vector<std::pair<VAddr, VAddr>> live;
++        const auto retain = [&](VAddr base, VAddr limit) {
++            if (base < end && limit > begin) {
++                live.emplace_back(std::max(begin, VideoCore::PageManager::GetPageAddr(base)),
++                                  std::min(end, VideoCore::PageManager::GetNextPageAddr(limit - 1)));
++            }
++        };
++        registry->ForEachOverlapping(begin, end, [&](Native::ImageEntry& entry) {
++            retain(entry.info.guest_address,
++                   entry.info.guest_address + std::max<u64>(entry.info.guest_size, 1));
++        });
++        for (const auto& [base, region] : regions) {
++            retain(region.begin, region.end);
++        }
++        for (const auto& [base, mirror] : mirrors) {
++            retain(mirror.begin, mirror.end);
++        }
++        std::ranges::sort(live);
++        VAddr cursor = begin;
++        for (const auto& [base, limit] : live) {
++            if (base > cursor) {
++                UnwatchPages(cursor, base);
++            }
++            cursor = std::max(cursor, limit);
++        }
++        if (cursor < end) {
++            UnwatchPages(cursor, end);
++        }
++    }
++}
++
+ void NativeRenderer::OnCpuWrite(VAddr address, u64 size, u64 exact) {
+     // The written pages stop being watched (so they open up and the write goes on), and the
+     // textures over them are uploaded again when next used (which watches them again).
+@@ -5371,6 +5717,7 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
+     }
+     VerifyMirrors(); // FIX-176 (diagnosis)
+     EvictImages(); // (the display picture was just used: it stays)
++    ReleaseUnusedWatches();
+     return display;
+ }
+ 
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer_native.h b/src/video_core/renderer_vulkan/vk_rasterizer_native.h
+index a5159c6..3d77879 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer_native.h
++++ b/src/video_core/renderer_vulkan/vk_rasterizer_native.h
+@@ -121,11 +121,12 @@ public:
+     /// bindings worked out ahead for the recorder (see PreparedDraw).
+     void PrepareJobDraw(const void* packet, u32 epoch, const AmdGpu::Regs& regs,
+                         const GraphicsPipeline& pipeline,
++                        std::shared_ptr<const void> pipeline_keepalive,
+                         std::span<const Shader::Info* const> stages, bool is_indexed,
+                         u32 index_offset);
+ 
+ private:
+-    enum class ViewUse : u8 { Sampled, Storage, Attachment };
++    enum class ViewUse : u8 { Sampled, Storage, Attachment, CubeSampled };
+ 
+     struct Chunk {
+         std::unique_ptr<Native::Rhi::Buffer> buffer;
+@@ -232,6 +233,7 @@ private:
+         VAddr end = 0;
+         std::unique_ptr<Native::Rhi::Buffer> buffer;
+         std::vector<VAddr> dirty_pages; ///< written by the CPU since the last use
++        bool dirty_sorted = true;
+     };
+     std::map<VAddr, Region> regions; ///< by begin; guarded by mutex
+     std::mutex region_dirty_mutex;   ///< pending_region_writes (CPU write faults: any thread)
+@@ -244,7 +246,7 @@ private:
+     void SortRegionWrites();
+     Region* RegionOver(VAddr address, u64 size);
+     Region* MakeRegion(VAddr address, u64 size);
+-    void RefreshRegion(Region& region);
++    void RefreshRegion(Region& region, VAddr address, u64 size);
+     /// NAT-150: copies in video memory of guest memory the GPU reads as vertices and indices
+     /// and the CPU leaves alone (meshes), instead of reading it over PCIe at every draw. A range
+     /// bound in a second frame is copied at the start of the next list; CPU writes to its pages
+@@ -394,6 +396,9 @@ private:
+     void WatchPages(VAddr address, u64 size);
+     /// NAT-105, FIX-153: the watched pages of [begin, end) (page aligned) are watched no more.
+     void UnwatchPages(VAddr begin, VAddr end);
++    /// Retired resources must not leave write protection on memory reused by the CPU.
++    std::vector<std::pair<VAddr, VAddr>> retired_watch_ranges;
++    void ReleaseUnusedWatches();
+     /// NAT-112: small render targets drawn into are written back to guest memory (GT Sport's
+     /// CPU reads its brightness chain there for auto exposure).
+     void FlushWritebacks();
+@@ -466,6 +471,7 @@ private:
+         const void* packet = nullptr;
+         u32 epoch = 0;
+         const GraphicsPipeline* pipeline = nullptr;
++        std::shared_ptr<const void> pipeline_keepalive;
+         std::array<u64, Shader::MaxStageTypes> stage_hashes{};
+         u64 image_generation = 0;
+         u64 buffer_seq = 0;
+diff --git a/src/video_core/texture_cache/image.cpp b/src/video_core/texture_cache/image.cpp
+index f63b28a..6bbcee0 100644
+--- a/src/video_core/texture_cache/image.cpp
++++ b/src/video_core/texture_cache/image.cpp
+@@ -21,6 +21,7 @@
+ #include "video_core/renderer_vulkan/vk_scheduler.h"
+ #include "video_core/texture_cache/blit_helper.h"
+ #include "video_core/texture_cache/image.h"
++#include "video_core/renderer_vulkan/image_allocation.h"
+ #include <chrono>
+ 
+ #include <vk_mem_alloc.h>
+@@ -320,6 +321,16 @@ u64 RecycledImageBytes() {
+     return g_recycled_bytes;
+ }
+ 
++void ClearRecycledImages(VmaAllocator allocator) {
++    std::scoped_lock lk{g_recycle_mutex};
++    for (auto& [key, images] : g_recycled) {
++        for (const auto& image : images) vmaDestroyImage(allocator, image.image, image.allocation);
++    }
++    g_recycled.clear();
++    g_recycle_order.clear();
++    g_recycled_bytes = 0;
++}
++
+ void TrimUnusedRecycledImages(VmaAllocator allocator) {
+     const auto cutoff = std::chrono::steady_clock::now() - std::chrono::seconds{30};
+     std::scoped_lock lk{g_recycle_mutex};
+@@ -383,7 +394,7 @@ void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
+         size_bytes = recycled->size_bytes;
+         return;
+     }
+-    const VmaAllocationCreateInfo alloc_ci = {
++    VmaAllocationCreateInfo alloc_ci = {
+         .flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT,
+         .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+         .requiredFlags = 0,
+@@ -393,10 +404,16 @@ void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
+     };
+ 
+     const VkImageCreateInfo image_ci_unsafe = static_cast<VkImageCreateInfo>(image_ci);
++    alloc_ci.pool = Vulkan::SmallImageAllocationPool(allocator, image_ci_unsafe, alloc_ci);
+     VkImage unsafe_image{};
+     VmaAllocationInfo alloc_info{};
+     VkResult result = vmaCreateImage(allocator, &image_ci_unsafe, &alloc_ci, &unsafe_image,
+                                      &allocation, &alloc_info);
++    if (result != VK_SUCCESS && alloc_ci.pool) {
++        alloc_ci.pool = VK_NULL_HANDLE;
++        result = vmaCreateImage(allocator, &image_ci_unsafe, &alloc_ci, &unsafe_image,
++                               &allocation, &alloc_info);
++    }
+     ASSERT_MSG(result == VK_SUCCESS,
+                "Failed allocating image: error={} format={} type={} extent={}x{}x{} "
+                "mips={} layers={} samples={} flags={} usage={} tiling={}",
