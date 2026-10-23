@@ -137,3 +137,81 @@ with an empty shader store), and it also turned direct memory off and undid Sani
 every GPU. 0058 reverts it; 0059 (FIX-188) brings its Intel Arc changes back behind
 `Instance::IsIntel()` (vendor 0x8086), so every other GPU runs what it ran before 0042-intel-arc.
 `ryty-gpu` and `linux-proton` have every patch through 0059 (commit `1d13c88d`).
+
+## Camera Manager
+
+`shadGT-patches/0065-in-game-camera-manager.patch` adds the in-game Camera Manager
+for Windows. It is a plain Git diff against shadGT
+`1d13c88d2e57bc63ce1586fe0b8f3342b6afdd19` on `ryty-gpu`; apply it with `git apply`
+on that checkout, then build the existing `ryty_gpu` target. Its native renderer
+and shader sources are unchanged. This patch follows the existing RyGT convention
+of carrying shadGT additions here; the shadGT source tree is not vendored into RyGT.
+
+The patch includes the dedicated camera sources, build integration and the host
+startup, overlay and input connections. It does not include compiled modules.
+Existing build options are retained; the camera target additionally links Windows
+`bcrypt` for executable validation.
+
+For controls, ranges and presets, see [Camera Manager](../docs/user/CAMERA_MANAGER.md).
+For the standalone Windows tests, see [camera-manager-tests](camera-manager-tests/README.md).
+## Temporal FSR 3.1 and Intel XeSS (0063-0064)
+
+Patches 0063 and 0064 apply after 0062 (shadGT `ryty-gpu` at `1d13c88d` plus 0020, 0062 and
+0058-0061). Tested on an RX 7600 (Windows 11, driver 26.8.1) at Dragon Trail.
+- 0063 (FIX-211): AMD's driver refuses storage use for some block-compressed images (BC5, BC6H)
+  even with extended usage. The default renderer made them anyway and the textures came out
+  garbled (broken colours on car dashboards). They are now made without storage use when
+  `getImageFormatProperties2` refuses it; shaders only sample them.
+- 0064 (FSR-201..209): temporal upscaling with the scene inputs from 0020 (colour, depth, motion
+  vectors and jitter), default renderer only. It replaces the game's anti-aliasing.
+  - `GPU.fsr_temporal` turns it on (with `fsr_enabled` and `fsr3_enabled`; DLSS temporal wins
+    when it is on). `SHADGT_FSR_TEMPORAL` overrides it.
+  - `GPU.fsr_upscaler` picks the backend: `fsr3` (FSR 3.1 through `amd_fidelityfx_vk.dll`),
+    `fsr4` (newest 4.x the DLL offers; AMD ships FSR 4 for D3D12 only, so this is a placeholder)
+    or `xess` (Intel XeSS-SR, needs `libxess.dll` from the XeSS SDK next to `GTSport.exe`).
+    `SHADGT_FSR_UPSCALER` overrides it.
+  - `GPU.upscale_ratio` (string) sets the render size below the output: `1` (native, AA only),
+    `1.3`, `1.5`, `1.7`, `2`, `2.3`, `3`; `0` renders at the window size. XeSS picks the quality
+    mode whose ratio is nearest. `SHADGT_UPSCALE_RATIO` overrides it.
+  - The window title names the upscaler in use, e.g. `ryGT - Gran Turismo Sport | FSR 3.1.4
+    temporal 1280x720 -> 1920x1080`.
+  - Depth reaches FSR/XeSS through an R32 copy and the reconstruction is blitted to the native
+    image: on AMD, a D32S8 depth view and the view-copy draw faulted the GPU (device lost).
+  - DIAG-206 logs a `VK_EXT_device_fault` report when the device is lost.
+
+The launcher's Graphics tab has the matching options: "Temporal upscaling", "Upscaler" (AMD FSR
+3.1, AMD FSR 4 (D3D12, WIP), Intel XeSS) and "Output resolution" (render size, from native 1080p
+down to 360p for 1080p output).
+
+Known issue (AMD, default renderer): scattered green and red dots on car dashboards (seen on the
+R92CP in the garage and in races). They are older than these patches and do not show in a
+RenderDoc replay of the same frame. Ruled out so far: FIX-191, image recycling, MSAA, draw-to-draw
+barriers, finishing the GPU after every draw, the staging ring, zero-filled new images, present
+FSR and zeroed undefined shader registers.
+
+## Radeon RX 400 to RX 9000 (0065)
+
+Patch 0065 applies after 0064. The fixes above were checked against the Vulkan reports of each
+Radeon generation's newest Windows driver on vulkan.gpuinfo.org: RX 580 and RX Vega (2.0.283,
+Vulkan 1.3.264), RX 5700 XT and RX 6800 (2.0.353), RX 7600 (2.0.406) and RX 9070 XT (2.0.416).
+Every generation has what the renderer requires (Vulkan 1.3, push descriptors, vertex attribute
+divisor, robustness2). FIX-189 and FIX-211 ask the driver per format, so they follow each card.
+The texture formats the RX 7600 cannot use (96-bit R32G32B32, signed 10-bit A2B10G10R10) are
+missing on every Radeon, and GT Sport's logs show no textures made in them.
+- AMD-301: the 64-wide subgroup requirement goes only to stages the driver lists
+  (`requiredSubgroupSizeStages`: compute on every Radeon, fragment from RX 7000 on). It was
+  given to every graphics stage, which the Vulkan spec does not allow.
+- AMD-302: RX 400/500 have no `shaderFloat16`; translated shaders that use 16-bit floats declare
+  Float16, so `VK_AMD_gpu_shader_half_float` (on every Radeon) is enabled in that case.
+- XESS-210: if XeSS does not start on a GPU, temporal upscaling switches to FSR 3.1.
+- AMD-300 (test switch): `SHADGT_SIMULATE_GPU=gcn|rdna1|rdna2` makes the device report only what
+  an RX 400/500/Vega, RX 5000 or RX 6000 driver offers; `SHADGT_SIMULATE_SKIP=<item>,...` keeps
+  items real (extension names, `f16`, `gpl`, `v3d`, `af2`, `sub`, `push`, `driver`).
+
+Tested on an RX 7600: races with 0065, and the simulated RX 400/500, RX 5000 and RX 6000 paths to
+the menus. A full RX 400/500 simulation (both `VK_EXT_graphics_pipeline_library` and
+`VK_EXT_vertex_input_dynamic_state` off in the driver) loses the device in a compute dispatch,
+while the same renderer paths with the extensions still enabled in the driver render. That points
+at the RDNA 3 driver in that mode rather than the renderer; RX 400/500 run AMD's separate legacy
+driver, so only a real card can confirm them. The buffer cache's 4 GB sparse arena pages exceed
+the 2 GB `maxBufferSize` every Radeon reports; RDNA 3's driver accepts them.

@@ -927,12 +927,11 @@ namespace RyGT
 
     class LoaderForm : Form, IBackdrop
     {
-        static readonly string[] FirmwareModules = { "libSceFont", "libSceFontFt", "libSceFreeTypeOt", "libSceJson2", "libSceNgs2" };
+        static readonly string[] FirmwareModules = { "libSceFont", "libSceFontFt", "libSceFreeTypeOt", "libSceJson2", "libSceNgs2", "libSceBluetoothHid" };
         // Used when present: the JPEG decoder (Scapes thumbnails and backgrounds) and PNG encoder (photos).
         // Both are plain software modules needing only libkernel and libSceLibcInternal.
-        // (The other firmware modules GT Sport imports stay RyGT's stubs in libs: converted from a full
-        // firmware folder, some of them need modules nothing provides, such as libSceOttvCapture,
-        // and GTSport.exe then stopped at start with "Failed to load module".)
+        // Other firmware modules GT Sport imports stay RyGT's stubs in libs: some, such as
+        // libSceOttvCapture, need modules nothing provides and make GTSport.exe fail at startup.
         static readonly string[] OptionalFirmwareModules = { "libSceJpegDec", "libScePngEnc" };
 
         readonly string root = AppDomain.CurrentDomain.BaseDirectory.TrimEnd('\\');
@@ -1129,11 +1128,109 @@ namespace RyGT
             var framegen = AddOption(graphics, fsr3Installed
                 ? "FSR frame generation: about 2x the frames (any GPU)"
                 : "FSR frame generation (needs amd_fidelityfx_vk.dll)", "GPU", "framegen_enabled", false);
-            foreach (var sub in new[] { fsr3, rcas, framegen }) sub.Margin = new Padding(22, 2, 0, 2);
-            fsr3.Enabled = fsr.Checked && fsr3Installed;
-            rcas.Enabled = fsr.Checked;
+            // FSR-200: FSR reconstructs the race scene from the game's depth, motion vectors and
+            // camera jitter (the default renderer's temporal scene capture, like temporal DLSS)
+            // instead of scaling the finished picture.
+            var fsrTemporal = AddOption(graphics, "Temporal upscaling: replaces the game's anti-aliasing (default renderer only)",
+                "GPU", "fsr_temporal", true);
+            // FSR-201: the upscaler: the FSR version inside amd_fidelityfx_vk.dll (FSR 4 is DirectX 12
+            // only until AMD releases it for Vulkan; until then the renderer uses FSR 3.1), or
+            // XESS-200: Intel XeSS through libxess.dll next to GTSport.exe (temporal only; from Intel's
+            // XeSS SDK), on any GPU with the Vulkan features it needs.
+            bool xessInstalled = File.Exists(Path.Combine(root, "libxess.dll"));
+            var versionRow = new FlowLayoutPanel { AutoSize = true, BackColor = Color.Transparent, Margin = new Padding(22, 2, 0, 2), WrapContents = false };
+            var versionLabel = new Label { Text = "Upscaler", AutoSize = false, Width = 174, Height = 20, BackColor = Color.Transparent, Margin = new Padding(0, 6, 8, 0) };
+            var version = new DarkComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 200, FlatStyle = FlatStyle.Flat };
+            var versionValues = new[] { "fsr3", "fsr4", "xess" };
+            version.Items.AddRange(new object[] { "AMD FSR 3.1", "AMD FSR 4 (D3D12, WIP)",
+                xessInstalled ? "Intel XeSS (temporal)" : "Intel XeSS (needs libxess.dll)" });
+            version.SelectedIndex = Math.Max(0, Array.IndexOf(versionValues, ReadStringSetting("GPU", "fsr_upscaler", "fsr3")));
+            version.SelectedIndexChanged += delegate
+            {
+                try { WriteSetting("GPU", "fsr_upscaler", versionValues[version.SelectedIndex]); }
+                catch (Exception e) { MessageBox.Show(this, "Could not save the setting: " + e.Message); }
+            };
+            versionRow.Controls.Add(versionLabel);
+            versionRow.Controls.Add(version);
+            graphics.Controls.Add(versionRow);
+            // FSR-209: the upscaler's preset (GPU.upscale_ratio). GT Sport always renders the race at
+            // 1920 x 1080, so a preset sets the output size as a multiple of it, which the picture
+            // is then scaled to the window from (supersampling when the window is smaller). Each
+            // upscaler lists its own presets; "Match the window" (0) keeps the window's size.
+            var presetRow = new FlowLayoutPanel { AutoSize = true, BackColor = Color.Transparent, Margin = new Padding(22, 2, 0, 2), WrapContents = false };
+            var presetLabel = new Label { Text = "Output resolution", AutoSize = false, Width = 174, Height = 20, BackColor = Color.Transparent, Margin = new Padding(0, 6, 8, 0) };
+            var preset = new DarkComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 300, FlatStyle = FlatStyle.Flat };
+            // The output size each preset gives from the race's 1920 x 1080, then the upscaler's own
+            // name for that scale.
+            var fsrPresets = new[] {
+                new[] { "Same as the window / screen", "0" },
+                new[] { "1920 x 1080 - anti-aliasing only (Native AA)", "1" },
+                new[] { "2880 x 1620 - sharper (Quality, 1.5x)", "1.5" },
+                new[] { "3264 x 1836 - sharper (Balanced, 1.7x)", "1.7" },
+                new[] { "3840 x 2160 / 4K - sharpest (Performance, 2x)", "2" },
+                new[] { "5760 x 3240 - very heavy (Ultra Performance, 3x)", "3" } };
+            var xessPresets = new[] {
+                new[] { "Same as the window / screen", "0" },
+                new[] { "1920 x 1080 - anti-aliasing only (Native AA)", "1" },
+                new[] { "2496 x 1404 - sharper (Ultra Quality Plus, 1.3x)", "1.3" },
+                new[] { "2880 x 1620 - sharper (Ultra Quality, 1.5x)", "1.5" },
+                new[] { "3264 x 1836 - sharper (Quality, 1.7x)", "1.7" },
+                new[] { "3840 x 2160 / 4K - sharpest (Balanced, 2x)", "2" },
+                new[] { "4416 x 2484 - very heavy (Performance, 2.3x)", "2.3" },
+                new[] { "5760 x 3240 - very heavy (Ultra Performance, 3x)", "3" } };
+            string[][] shownPresets = fsrPresets;
+            bool loadingPresets = false;
+            Action fillPresets = delegate
+            {
+                loadingPresets = true;
+                shownPresets = versionValues[Math.Max(0, version.SelectedIndex)] == "xess" ? xessPresets : fsrPresets;
+                string saved = ReadStringSetting("GPU", "upscale_ratio", "0");
+                preset.Items.Clear();
+                int selected = 0;
+                for (int i = 0; i < shownPresets.Length; i++)
+                {
+                    preset.Items.Add(shownPresets[i][0]);
+                    if (shownPresets[i][1] == saved) selected = i;
+                }
+                preset.SelectedIndex = selected;
+                loadingPresets = false;
+            };
+            fillPresets();
+            preset.SelectedIndexChanged += delegate
+            {
+                if (loadingPresets || preset.SelectedIndex < 0) return;
+                try { WriteSetting("GPU", "upscale_ratio", shownPresets[preset.SelectedIndex][1]); }
+                catch (Exception e) { MessageBox.Show(this, "Could not save the setting: " + e.Message); }
+            };
+            version.SelectedIndexChanged += delegate { fillPresets(); };
+            presetRow.Controls.Add(presetLabel);
+            presetRow.Controls.Add(preset);
+            graphics.Controls.Add(presetRow);
+            var presetNote = new Label
+            {
+                Text = "GT Sport always renders races at 1920 x 1080. The upscaler rebuilds that picture at the " +
+                       "output resolution, then it is fitted to your screen. On a 1080p screen, anything above " +
+                       "1920 x 1080 is supersampling: smoother edges and finer detail, but more GPU work.",
+                AutoSize = true, MaximumSize = new Size(420, 0), BackColor = Color.Transparent, ForeColor = Dark.DimText,
+                Tag = "heading", Margin = new Padding(22, 2, 0, 6)
+            };
+            graphics.Controls.Add(presetNote);
+            // Under "Use FSR 3.1.4", before sharpening and frame generation.
+            graphics.Controls.SetChildIndex(fsrTemporal, graphics.Controls.GetChildIndex(fsr3) + 1);
+            graphics.Controls.SetChildIndex(versionRow, graphics.Controls.GetChildIndex(fsrTemporal) + 1);
+            graphics.Controls.SetChildIndex(presetRow, graphics.Controls.GetChildIndex(versionRow) + 1);
+            graphics.Controls.SetChildIndex(presetNote, graphics.Controls.GetChildIndex(presetRow) + 1);
+            foreach (var sub in new[] { fsr3, fsrTemporal, rcas, framegen }) sub.Margin = new Padding(22, 2, 0, 2);
+            Action refreshFsr = delegate
+            {
+                fsr3.Enabled = fsr.Checked && fsr3Installed;
+                fsrTemporal.Enabled = version.Enabled = preset.Enabled = fsr.Checked && fsr3Installed && fsr3.Checked;
+                rcas.Enabled = fsr.Checked;
+            };
+            refreshFsr();
             framegen.Enabled = fsr3Installed;
-            fsr.CheckedChanged += delegate { fsr3.Enabled = fsr.Checked && fsr3Installed; rcas.Enabled = fsr.Checked; };
+            fsr.CheckedChanged += delegate { refreshFsr(); };
+            fsr3.CheckedChanged += delegate { refreshFsr(); };
             // NVIDIA (the dlss folder): DLSS upscaling through ryGT_dlss.dll and nvngx_dlss.dll, and
             // DLSS frame generation through Streamline (sl.*.dll and nvngx_dlssg.dll; RTX 40 and
             // newer, Windows' hardware-accelerated GPU scheduling on). One frame generation at a time.
