@@ -16,6 +16,28 @@
 #include <windows.h>
 #endif
 
+// Reclaim a reused guest allocation for CPU stack use before executing on it.
+// Renderer page watches must be invalidated while the current stack is still safe;
+// a fault after switching to a protected stack may not be dispatchable by Windows.
+static void PrepareCpuStack(void* context, std::uint64_t size) {
+#ifdef _WIN32
+    using Invalidate = void (*)(std::uint64_t, std::uint64_t);
+    static std::atomic<Invalidate> cached{nullptr};
+    auto invalidate = cached.load(std::memory_order_acquire);
+    if (!invalidate) {
+        if (HMODULE renderer = GetModuleHandleA("libSceVideoOut.prx")) {
+            invalidate = reinterpret_cast<Invalidate>(reinterpret_cast<void*>(
+                GetProcAddress(renderer, "RytyGpuInvalidateMemory")));
+            if (invalidate) cached.store(invalidate, std::memory_order_release);
+        }
+    }
+    if (invalidate) invalidate(reinterpret_cast<std::uint64_t>(context), size);
+#else
+    (void)context;
+    (void)size;
+#endif
+}
+
 static constexpr int32_t SCE_OK = 0;
 static constexpr int32_t SCE_FIBER_ERROR_NULL = static_cast<int32_t>(0x80590001);
 static constexpr int32_t SCE_FIBER_ERROR_ALIGNMENT = static_cast<int32_t>(0x80590002);
@@ -316,6 +338,7 @@ int32_t APS5_VABI _sceFiberInitializeImpl_nid_postfix(FiberObject* object, const
     if ((reinterpret_cast<std::uintptr_t>(addr_context) & 15) != 0 || (size_context & 15) != 0) return SCE_FIBER_ERROR_ALIGNMENT;
     if (addr_context == nullptr) return SCE_FIBER_ERROR_INVALID;
     if (size_context < FIBER_MIN_CONTEXT_SIZE) return SCE_FIBER_ERROR_RANGE;
+    PrepareCpuStack(addr_context, size_context);
     auto* fiber = reinterpret_cast<Fiber*>(object);
     std::memset(object, 0, FIBER_OBJECT_SIZE);
     fiber->magic = FIBER_MAGIC;
