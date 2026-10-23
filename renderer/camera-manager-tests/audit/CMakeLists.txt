@@ -1,0 +1,13 @@
+cmake_minimum_required(VERSION 3.24)
+project(CameraNativeTriggerRegression LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 23)
+enable_testing()
+if(NOT DEFINED SHADGT)
+  message(FATAL_ERROR "Pass -DSHADGT=<patched checkout>")
+endif()
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+execute_process(COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/extract_trigger.py"
+  "${SHADGT}" "${CMAKE_CURRENT_BINARY_DIR}/trigger_install_under_test.inc" COMMAND_ERROR_IS_FATAL ANY)
+add_executable(trigger_guard_tests trigger_guard_tests.cpp)
+target_include_directories(trigger_guard_tests PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+add_test(NAME original_adaptive_trigger_hook_policy COMMAND trigger_guard_tests)

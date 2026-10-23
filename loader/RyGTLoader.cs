@@ -927,12 +927,11 @@ namespace RyGT
 
     class LoaderForm : Form, IBackdrop
     {
-        static readonly string[] FirmwareModules = { "libSceFont", "libSceFontFt", "libSceFreeTypeOt", "libSceJson2", "libSceNgs2" };
+        static readonly string[] FirmwareModules = { "libSceFont", "libSceFontFt", "libSceFreeTypeOt", "libSceJson2", "libSceNgs2", "libSceBluetoothHid" };
         // Used when present: the JPEG decoder (Scapes thumbnails and backgrounds) and PNG encoder (photos).
         // Both are plain software modules needing only libkernel and libSceLibcInternal.
-        // (The other firmware modules GT Sport imports stay RyGT's stubs in libs: converted from a full
-        // firmware folder, some of them need modules nothing provides, such as libSceOttvCapture,
-        // and GTSport.exe then stopped at start with "Failed to load module".)
+        // Other firmware modules GT Sport imports stay RyGT's stubs in libs: some, such as
+        // libSceOttvCapture, need modules nothing provides and make GTSport.exe fail at startup.
         static readonly string[] OptionalFirmwareModules = { "libSceJpegDec", "libScePngEnc" };
 
         readonly string root = AppDomain.CurrentDomain.BaseDirectory.TrimEnd('\\');

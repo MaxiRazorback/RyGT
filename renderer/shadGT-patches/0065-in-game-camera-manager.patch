@@ -1,0 +1,1827 @@
+diff --git a/ryty_gpu/RytyGpu.cmake b/ryty_gpu/RytyGpu.cmake
+index d21f913f..fd6b12aa 100644
+--- a/ryty_gpu/RytyGpu.cmake
++++ b/ryty_gpu/RytyGpu.cmake
+@@ -101,6 +101,9 @@ ryty_add_library(ryty_gpu libSceVideoOut
+         ryty_gpu/ryty_entry.cpp
+         ryty_gpu/ryty_input_bridge.cpp
+         ryty_gpu/ryty_controller_overlay.cpp
++        ryty_gpu/ryty_camera_overlay.cpp
++        ryty_gpu/ryty_camera_settings.cpp
++        ryty_gpu/ryty_camera_runtime.cpp
+         ryty_gpu/ryty_write_watch.cpp
+         # Stutter diagnostics (RYGT_DIAG=1), ryty_diag.h.
+         ryty_gpu/ryty_diag.cpp
+@@ -234,3 +237,5 @@ target_include_directories(ryty_np PRIVATE "${SHADNET_PROTO_OUT}")
+ foreach(target IN ITEMS ryty_ngs2 ryty_ajm ryty_audio3d ryty_zlib ryty_discmap ryty_screenshot ryty_np)
+     target_sources(${target} PRIVATE ryty_gpu/ryty_hle_precompile.cpp)
+ endforeach()
++
++target_link_libraries(ryty_gpu PRIVATE bcrypt)
+diff --git a/ryty_gpu/camera_math/orbit_ground.h b/ryty_gpu/camera_math/orbit_ground.h
+new file mode 100644
+index 00000000..6710b08d
+--- /dev/null
++++ b/ryty_gpu/camera_math/orbit_ground.h
+@@ -0,0 +1,66 @@
++#ifndef ORBIT_GROUND_H
++#define ORBIT_GROUND_H
++// Verified SysV interface: RunWayRayCastAdapter::cast(this, plane/material output,
++// ray origin, ray direction). Output begins with normalized world plane nx,ny,nz,d.
++typedef int (__attribute__((sysv_abi)) *GroundRay)(void*,float*,const float*,const float*);
++static inline float ground_sqrt(float x){return __builtin_sqrtf(x);}
++static inline unsigned ground_finite(float x){return x==x&&x<3.4e38f&&x> -3.4e38f;}
++static inline float ground_atan(float x){
++ // atan for |x|<=1, error below 0.000012 rad. Reduction covers our <=65 degree orbit.
++ float a=x<0?-x:x,z=a*a;
++ float p=a*(0.99997726f+z*(-0.33262347f+z*(0.19354346f+z*(-0.11643287f+z*(0.05265332f+z*(-0.01172120f))))));
++ return x<0?-p:p;
++}
++static inline void ground_restore(float* v,const float* native,unsigned char* b){
++ for(unsigned i=0;i<8;++i)v[i]=native[i];
++ if(b[100]){float* p=(float*)b;p[38]=p[39]=p[40]=p[41]=0;b[184]=0;}
++}
++static void ground_apply(float* v,unsigned char* b,const float* anchor,const float* native){
++ if(!b[192])return;
++ b[193]=1;((float*)b)[59]=0;
++ unsigned long long global=*(unsigned long long*)(b+200);
++ if(!global){ground_restore(v,native,b);return;}
++ void* organizer=*(void**)global;
++ void* root=organizer?*(void**)organizer:0;
++ if(!root||*(unsigned long long*)root!=*(unsigned long long*)(b+208)){ground_restore(v,native,b);return;}
++ void* course=*(void**)((unsigned char*)root+0x25b0);
++ void* ray=course?(unsigned char*)course+0x660:0;
++ GroundRay cast=*(GroundRay*)(b+224);
++ if(!ray||!cast||*(unsigned long long*)ray!=*(unsigned long long*)(b+216)||!*(void**)((unsigned char*)ray+8)){
++  ground_restore(v,native,b);return;
++ }
++ float origin[4]={v[0],(v[1]>anchor[1]?v[1]:anchor[1])+2.0f,v[2],0};
++ float direction[4]={0,-1,0,0},plane[8]={0};
++ ((unsigned*)b)[60]++;
++ int hit=cast(ray,plane,origin,direction);
++ // Reject no-hit, walls, ceilings, corrupt results and remote lower track layers.
++ if(hit<0||!ground_finite(plane[0])||!ground_finite(plane[1])||!ground_finite(plane[2])||!ground_finite(plane[3])||plane[1]<0.2f||plane[1]>1.01f){ground_restore(v,native,b);return;}
++ float height=-(plane[0]*v[0]+plane[2]*v[2]+plane[3])/plane[1];
++ if(!ground_finite(height)||height>origin[1]+0.01f||height<anchor[1]-50){ground_restore(v,native,b);return;}
++ ((unsigned*)b)[61]++;((float*)b)[58]=height;b[193]=2;
++ float floor=height+((float*)b)[49]/plane[1];
++ if(v[1]>=floor)return;
++ float rx=v[0]-anchor[0],ry=v[1]-anchor[1],rz=v[2]-anchor[2],newY=floor-anchor[1];
++ float oldLength=ground_sqrt(rx*rx+ry*ry+rz*rz),newLength=ground_sqrt(rx*rx+newY*newY+rz*rz);
++ if(oldLength>0.001f&&newLength>0.001f){
++  // Shortest quaternion rotates the old pivot radius to the constrained radius,
++  // preserving framing while lifting the camera above the road.
++  float x=rz*(ry-newY),z=rx*(newY-ry),w=oldLength*newLength+rx*rx+ry*newY+rz*rz;
++  float norm=ground_sqrt(x*x+z*z+w*w);
++  if(norm>0.000001f){
++   x/=norm;z/=norm;w/=norm;
++   float qx=v[4],qy=v[5],qz=v[6],qw=v[7];
++   v[4]=w*qx+x*qw-z*qy;v[5]=w*qy+z*qx-x*qz;v[6]=w*qz+z*qw+x*qy;v[7]=w*qw-x*qx-z*qz;
++   if(b[100]&&w>0.000001f){
++    // Prevent input wind-up at the boundary; reversing the stick moves immediately.
++    float sn=ground_sqrt(x*x+z*z),t=sn/w;
++    float angle=t<=1?ground_atan(t):1.5707963267948966f-ground_atan(1/t);
++    float* p=(float*)b;p[39]-=angle*114.59155902616465f;
++    if(p[39]< -65)p[39]=-65;if(p[39]>65)p[39]=65;
++    if(p[41]>0)p[41]=0;
++   }
++  }
++ }
++ ((float*)b)[59]=floor-v[1];v[1]=floor;b[193]=3;
++}
++#endif
+diff --git a/ryty_gpu/camera_math/orbit_ground_apply.inc b/ryty_gpu/camera_math/orbit_ground_apply.inc
+new file mode 100644
+index 00000000..b0684a89
+--- /dev/null
++++ b/ryty_gpu/camera_math/orbit_ground_apply.inc
+@@ -0,0 +1,47 @@
++#include "orbit_motion.h"
++#include "orbit_ground.h"
++typedef long long i64;
++typedef int __attribute__((ms_abi)) (*QueryClock)(i64*);
++static void orbit_apply(float* v,unsigned char* b,const float* anchor,const float* native){
++ if(!b[40]){ground_apply(v,b,anchor,native);return;}
++ ((unsigned*)b)[21]++;
++ const volatile unsigned* sequence=(const volatile unsigned*)(b+96);
++ unsigned version=*sequence;if(version&1)return;
++ const volatile float* p=(const volatile float*)b;
++ float c=p[11],s=p[12],ch=p[13],sh=p[14],cp=p[17],sp=p[18],hc=p[19],hs=p[20];
++ unsigned pitch_enabled=b[65];
++ if(b[100]){
++  QueryClock clock=*(QueryClock*)(b+128);i64 frequency=*(i64*)(b+136),now=0;
++  if(!clock||frequency<=0||!clock(&now))return;
++  i64 previous=*(i64*)(b+144),input=*(i64*)(b+176);
++  float dt=previous&&now>=previous?(float)((double)(now-previous)/(double)frequency):0;
++  unsigned active=b[127]&&input>0&&now>=input&&((double)(now-input)/(double)frequency)<0.2;
++  MotionState state={p[38],p[39],p[40],p[41],p[42],b[184]};
++  MotionConfig config={p[26],p[27],p[28],p[29],p[30],b[124],b[125],b[126]};
++  motion_step(&state,&config,dt,active);
++  motion_sincos(state.yaw,&s,&c);motion_sincos(state.yaw*0.5f,&sh,&ch);
++  motion_sincos(state.pitch,&sp,&cp);motion_sincos(state.pitch*0.5f,&hs,&hc);pitch_enabled=1;
++  if(*sequence!=version)return;
++  *(i64*)(b+144)=now;
++  float* writable=(float*)b;writable[38]=state.yaw;writable[39]=state.pitch;
++  writable[40]=state.vx;writable[41]=state.vy;writable[42]=state.idle;b[184]=state.returning;
++ }
++ float x=v[0]-anchor[0],y=v[1]-anchor[1],z=v[2]-anchor[2];
++ float rx=c*x+s*z,ry=y,rz=-s*x+c*z;
++ float qx=v[4],qy=v[5],qz=v[6],qw=v[7];
++ float nx=ch*qx+sh*qz,ny=ch*qy+sh*qw,nz=ch*qz-sh*qx,nw=ch*qw-sh*qy;
++ if(pitch_enabled){
++  float ax=1-2*(ny*ny+nz*nz),ay=2*(nx*ny+nw*nz),az=2*(nx*nz-nw*ny);
++  float dot=ax*rx+ay*ry+az*rz;
++  float px=rx*cp+(ay*rz-az*ry)*sp+ax*dot*(1-cp);
++  float py=ry*cp+(az*rx-ax*rz)*sp+ay*dot*(1-cp);
++  float pz=rz*cp+(ax*ry-ay*rx)*sp+az*dot*(1-cp);
++  rx=px;ry=py;rz=pz;
++  float tx=nx*hc+nw*hs,ty=ny*hc+nz*hs,tz=nz*hc-ny*hs,tw=nw*hc-nx*hs;
++  nx=tx;ny=ty;nz=tz;nw=tw;
++ }
++ if(*sequence!=version)return;
++ v[0]=anchor[0]+rx;v[1]=anchor[1]+ry;v[2]=anchor[2]+rz;
++ v[4]=nx;v[5]=ny;v[6]=nz;v[7]=nw;
++ ground_apply(v,b,anchor,native);
++}
+diff --git a/ryty_gpu/camera_math/orbit_motion.h b/ryty_gpu/camera_math/orbit_motion.h
+new file mode 100644
+index 00000000..e6e8724c
+--- /dev/null
++++ b/ryty_gpu/camera_math/orbit_motion.h
+@@ -0,0 +1,48 @@
++#ifndef ORBIT_MOTION_H
++#define ORBIT_MOTION_H
++typedef struct { float yaw,pitch,vx,vy,idle; unsigned returning; } MotionState;
++typedef struct { float x,y,speed,smoothing_ms,delay; unsigned auto_return,invert_x,invert_y; } MotionConfig;
++static inline float motion_abs(float x){return x<0?-x:x;}
++static inline float motion_wrap(float x){while(x>=360)x-=360;while(x<0)x+=360;if(x>=360)x=0;return x;}
++static inline float motion_alpha(float dt,float tau){
++ if(tau<=0)return 1;
++ float x=dt/tau;
++ // Stable exponential approximation. Return smoothing always uses tau 0.25 s.
++ return 1-1/(1+x+x*x*0.5f+x*x*x*(1.0f/6.0f));
++}
++static inline void motion_step(MotionState* s,const MotionConfig* c,float dt,unsigned active){
++ if(dt<0)dt=0;if(dt>0.05f)dt=0.05f;
++ if(!active){s->vx=s->vy=0;s->returning=0;return;}
++ float x=c->invert_x?c->x:-c->x,y=c->invert_y?c->y:-c->y;
++ unsigned moving=x!=0||y!=0;
++ if(moving){s->idle=0;s->returning=0;}else s->idle+=dt;
++ if(!moving&&c->auto_return&&s->idle>=c->delay){
++  s->returning=1;s->vx=s->vy=0;
++  float delta=s->yaw>180?360-s->yaw:-s->yaw;
++  float a=motion_alpha(dt,0.25f);
++  s->yaw=motion_wrap(s->yaw+delta*a);s->pitch-=s->pitch*a;
++  // Sub-pixel settling threshold, after the smooth return has effectively finished.
++  if(motion_abs(delta)<0.01f&&motion_abs(s->pitch)<0.01f){s->yaw=s->pitch=0;s->returning=0;}
++  return;
++ }
++ s->returning=0;
++ float a=motion_alpha(dt,c->smoothing_ms*0.001f);
++ float tx=x*c->speed,ty=y*c->speed,tau=c->smoothing_ms*0.001f;
++ float dx=tx*dt+(s->vx-tx)*tau*a,dy=ty*dt+(s->vy-ty)*tau*a;
++ s->vx+=(tx-s->vx)*a;s->vy+=(ty-s->vy)*a;
++ if(!moving&&motion_abs(s->vx)<0.01f&&motion_abs(s->vy)<0.01f)s->vx=s->vy=0;
++ s->yaw=motion_wrap(s->yaw+dx);s->pitch+=dy;
++ if(s->pitch>65){s->pitch=65;if(s->vy>0)s->vy=0;}
++ if(s->pitch< -65){s->pitch=-65;if(s->vy<0)s->vy=0;}
++}
++static inline void motion_sincos(float degrees,float* sine,float* cosine){
++ float d=motion_wrap(degrees);if(d>180)d-=360;
++ float x=d*0.01745329251994329577f,sign=1;
++ if(x>1.5707963267948966f){x=3.1415926535897932f-x;sign=-1;}
++ else if(x< -1.5707963267948966f){x=-3.1415926535897932f-x;sign=-1;}
++ float z=x*x;
++ *sine=x*(1+z*(-1.0f/6+z*(1.0f/120+z*(-1.0f/5040+z*(1.0f/362880+z*(-1.0f/39916800))))));
++ *cosine=sign*(1+z*(-0.5f+z*(1.0f/24+z*(-1.0f/720+z*(1.0f/40320+z*(-1.0f/3628800))))));
++}
++#endif
++
+diff --git a/ryty_gpu/camera_math/roof_apply.inc b/ryty_gpu/camera_math/roof_apply.inc
+new file mode 100644
+index 00000000..15e5efc3
+--- /dev/null
++++ b/ryty_gpu/camera_math/roof_apply.inc
+@@ -0,0 +1,44 @@
++// Roof final-view FOV, world-height and camera-local forward distance adjustment. The original call has already built the view.
++typedef unsigned long long U64;
++typedef int (__attribute__((sysv_abi)) *RayCast)(void*,float*,const float*,const float*);
++static int finite_value(float x){return x==x&&x<3.4e38f&&x> -3.4e38f;}
++static void roof_apply(float* view,unsigned char* data){
++ float* p=(float*)data;
++ const float nativeY=view[1];p[2]=view[22];p[6]=nativeY;((unsigned*)data)[7]++;
++ unsigned fov=data[0],position=data[12];float desiredFov=p[1],requested=p[4],distance=p[5];
++ if(fov&&finite_value(desiredFov)&&desiredFov>=30&&desiredFov<=100)view[22]=desiredFov;
++ data[193]=1;p[9]=0;
++ if(!position)requested=distance=0;
++ if(!finite_value(requested))requested=0;
++ if(!finite_value(distance))distance=0;
++ float backward=-distance;
++ float x=view[4],y=view[5],z=view[6],w=view[7];
++ float targetX=view[0]+2*(x*z+w*y)*backward;
++ float baseY=nativeY+2*(y*z-w*x)*backward;
++ float targetZ=view[2]+(1-2*(x*x+y*y))*backward;
++ p[10]=0;
++ if(!finite_value(targetX)||!finite_value(baseY)||!finite_value(targetZ))return;
++ U64 global=*(U64*)(data+200);
++ void* organizer=global?*(void**)global:0;
++ void* root=organizer?*(void**)organizer:0;
++ if(!root||*(U64*)root!=*(U64*)(data+208))return;
++ void* course=*(void**)((unsigned char*)root+0x25b0);
++ void* ray=course?(unsigned char*)course+0x660:nullptr;
++ RayCast cast=*(RayCast*)(data+224);
++ if(!ray||!cast||*(U64*)ray!=*(U64*)(data+216)||!*(void**)((unsigned char*)ray+8))return;
++ // Probe the NEW X/Z after distance; ignore extra height when choosing the ray origin.
++ float origin[4]={targetX,(baseY>nativeY?baseY:nativeY)+2,targetZ,0},direction[4]={0,-1,0,0},plane[8]={0};
++ ((unsigned*)data)[60]++;
++ int hit=cast(ray,plane,origin,direction);
++ if(hit<0||!finite_value(plane[0])||!finite_value(plane[1])||!finite_value(plane[2])||!finite_value(plane[3])||plane[1]<0.2f||plane[1]>1.01f)return;
++ float ground=-(plane[0]*targetX+plane[2]*targetZ+plane[3])/plane[1];
++ if(!finite_value(ground)||ground>origin[1]+0.01f||ground<nativeY-50)return;
++ float minimum=ground+p[49]/plane[1]-baseY;
++ if(!finite_value(minimum))return;
++ data[193]=2;p[8]=minimum;p[58]=ground;((unsigned*)data)[61]++;
++ if(!position)return; // Read defaults/minimum without changing the native camera.
++ float applied=requested<minimum?minimum:requested;
++ view[0]=targetX;view[1]=baseY+applied;view[2]=targetZ;p[9]=applied;p[10]=distance;
++ if(applied>requested)data[193]=3;
++ // Preserve native orientation, native look-back and all unrelated fields.
++}
+diff --git a/ryty_gpu/ryty_camera.h b/ryty_gpu/ryty_camera.h
+new file mode 100644
+index 00000000..141f58e7
+--- /dev/null
++++ b/ryty_gpu/ryty_camera.h
+@@ -0,0 +1,22 @@
++#pragma once
++#include <cstdint>
++#include <string>
++#include "ryty_gpu/ryty_camera_settings.h"
++namespace Ryty::Camera {
++void DrawOverlay();
++void ToggleOverlay();
++void ResetOverlayLayout();
++void CloseOverlay();
++bool OverlayOpen();
++void PublishStick(float x, float y, bool focused);
++void RequestView(View view);
++Store& Presets();
++void InitializeRuntime();
++std::uint32_t CurrentCar();
++View CurrentView();
++std::string CarName(std::uint32_t id);
++std::string RuntimeStatus();
++std::string RuntimeDiagnostics();
++float NativeFov(View view);
++float MinimumHeight(View view);
++} // namespace Ryty::Camera
+diff --git a/ryty_gpu/ryty_camera_car_catalog.h b/ryty_gpu/ryty_camera_car_catalog.h
+new file mode 100644
+index 00000000..87913dc1
+--- /dev/null
++++ b/ryty_gpu/ryty_camera_car_catalog.h
+@@ -0,0 +1,344 @@
++// Generated from local GENERIC_CAR: stable IDs and labels, no game assets.
++struct CarEntry { unsigned id; const char* label; unsigned model; const char* name; };
++static constexpr CarEntry CarCatalog[] = {
++    {24, "_180sx_x_96", 30002, "Nissan 180SX Type X '96"},
++    {31, "camaro_z28_302_69", 220029, "Chevrolet Camaro Z28 '69"},
++    {63, "levin_gt_apex_83", 40001, "Toyota Corolla Levin 3door 1600GT APEX (AE86) '83"},
++    {82, "supra_rz_97", 40006, "Toyota SUPRA RZ '97"},
++    {135, "s800_66", 50015, "Honda S800 '66"},
++    {137, "beat_91", 50116, "Honda Beat '91"},
++    {145, "copen_activetop_02", 110019, "Daihatsu Copen Active Top '02"},
++    {187, "tuscan_speed6_00", 150010, "TVR Tuscan Speed 6 '00"},
++    {201, "roadster_89", 10104, "Mazda Eunos Roadster (NA Special Package) '89"},
++    {203, "integra_r_98", 50019, "Honda Integra Type R (DC2) '98"},
++    {204, "civic_r_98", 50018, "Honda Civic Type R (EK) '98"},
++    {205, "rx7_spiritr_a_02", 10105, "Mazda RX-7 Spirit R Type A (FD) '02"},
++    {207, "mr2_gts_97", 40113, "Toyota MR2 GT-S '97"},
++    {210, "r34_gtr_v2_nur_02", 30157, "Nissan Skyline GT-R V\u30fbspec II N\u00fcr (R34) '02"},
++    {293, "nsx_r_92", 50037, "Honda NSX Type R '92"},
++    {296, "_787b_91", 10102, "Mazda 787B '91"},
++    {301, "lancer_evo4_96", 120081, "Mitsubishi Lancer Evolution IV    GSR '96"},
++    {315, "cobra_67", 710004, "Shelby Cobra 427 '66"},
++    {334, "clio_sport_v6_00", 440017, "Renault Sport Clio V6 24V '00"},
++    {374, "rx7_gtx_90", 10106, "Mazda RX-7 GT-X (FC) '90"},
++    {379, "impreza_coupe_wrx_sti6_99", 200018, "Subaru Impreza Coupe WRX Type R STi Version VI '99"},
++    {451, "impreza_22b_98", 200040, "Subaru Impreza 22B-STi Version '98"},
++    {489, "r33_gtr_v_97", 30155, "Nissan Skyline GT-R V\u30fbspec (R33) '97"},
++    {514, "s2000_99", 50047, "Honda S2000 '99"},
++    {533, "stratos_73", 430007, "Lancia Stratos '73"},
++    {604, "_2000_gt_67", 40100, "Toyota 2000GT '67"},
++    {709, "z32_300zx_2seat_tt_89", 30153, "Nissan Fairlady Z 300ZX TwinTurbo 2seater (Z32) '89"},
++    {773, "r32_gtr_v2_94", 30156, "Nissan Skyline GT-R V\u30fbspec II (R32) '94"},
++    {810, "trueno_gt_apex_83", 40005, "Toyota Sprinter Trueno 3door 1600GT APEX (AE86) '83"},
++    {818, "corvette_coupe_63", 220048, "Chevrolet Corvette Sting Ray Sport Coupe (C2) '63"},
++    {829, "delta_hf_integrale_evo_91", 430006, "Lancia DELTA HF Integrale Evoluzione '91"},
++    {843, "supra_30gt_turbo_a_88", 40077, "Toyota SUPRA 3.0GT Turbo A '88"},
++    {954, "r92cp_92", 30158, "Nissan R92CP '92"},
++    {959, "tt_coupe_32_03", 570027, "Audi TT Coup\u00e9 3.2 quattro '03"},
++    {998, "sauber_mercedes_c9_89", 530029, "Sauber Mercedes C9 '89"},
++    {1044, "sports_800_65", 40076, "Toyota Sports 800 '65"},
++    {1067, "xjr9_race_88", 80012, "Jaguar XJR-9 '88"},
++    {1365, "r8_07", 570019, "Audi R8 4.2 FSI R tronic '07"},
++    {1370, "mini_cooper_s_06", 500004, "MINI Cooper S '05"},
++    {1373, "viper_gts_02", 510010, "Dodge Viper GTS '02"},
++    {1384, "fairlady_z_s_07", 30132, "Nissan Fairlady Z Version S (Z33) '07"},
++    {1385, "swift_sports_07", 60014, "Suzuki SWIFT Sport '07"},
++    {1399, "m3_coupe_07", 70017, "BMW M3 Coup\u00e9 '07"},
++    {1402, "viper_srt10_coupe_06", 510011, "Dodge Viper SRT10 Coupe '06"},
++    {1409, "f40_92", 2250003, "Ferrari F40 '92"},
++    {1410, "_512bb_76", 2250004, "Ferrari 512 BB '76"},
++    {1425, "ford_gt_06_t", 20018, "Ford GT LM Spec II Test Car"},
++    {1426, "ford_gt_06", 20017, "Ford GT '06"},
++    {1431, "amemiya_fd3s_rx7_xx", 130002, "RE Amemiya FD3S RX-7"},
++    {1433, "amuse_s2000_gt1_turbo_xx", 1800005, "Amuse S2000 GT1 Turbo"},
++    {1461, "s13_silvia_ks_dia_90", 30138, "Nissan Silvia K's Dia Selection (S13) '90"},
++    {1466, "xanavi_nismo_gtr_08", 30136, "Nissan XANAVI NISMO GT-R '08"},
++    {1474, "enzo_ferrari_02", 2250012, "Enzo Ferrari '02"},
++    {1481, "countach_25th_88", 2280001, "Lamborghini Countach 25th Anniversary '88"},
++    {1484, "countach_lp400_74", 2280013, "Lamborghini Countach LP400 '74"},
++    {1504, "_458_italia_09", 2250016, "Ferrari 458 Italia '09"},
++    {1507, "sls_amg_10", 530023, "Mercedes-Benz SLS AMG '10"},
++    {1510, "epson_nsx_08", 50099, "Honda EPSON NSX '08"},
++    {1516, "petronas_toms_sc430_08", 740018, "Lexus PETRONAS TOM'S SC430 '08"},
++    {1523, "_500_f_68", 240008, "Fiat 500 F '68"},
++    {1527, "_500_12_lounge_08", 240009, "Fiat 500 1.2 8V Lounge SS '08"},
++    {1528, "slr_mclaren_19wheel_09", 530021, "Mercedes-Benz SLR McLaren '09"},
++    {1536, "zonda_r_09", 800005, "Pagani Zonda R '09"},
++    {1539, "gran_turismo_s_08", 2310001, "Maserati GranTurismo S '08"},
++    {1540, "mclaren_f1_94", 770003, "McLaren F1 '94"},
++    {1542, "corvette_convertible_69", 220023, "Chevrolet Corvette Stingray Convertible (C3) '69"},
++    {1543, "challenger_rt_70", 510014, "Dodge Challenger R/T '70"},
++    {1551, "_330_p4_67", 2250013, "Ferrari 330 P4 '67"},
++    {1553, "xj13_66", 80009, "Jaguar XJ13 '66"},
++    {1563, "megane_trophy_09", 440016, "Renault Sport M\u00e9gane Trophy '11"},
++    {1565, "gt40_mk4_race_67", 20019, "Ford Mark IV Race Car '67"},
++    {1581, "gt_by_citroen_road_xx", 420013, "GT by Citro\u00ebn Road Car"},
++    {1582, "miura_p400_proto_67", 2280006, "Lamborghini Miura P400 Bertone Prototype CN.0706 '67"},
++    {1645, "tz2_1965", 100015, "Alfa Romeo GIULIA TZ2 carrozzata da ZAGATO CN.AR750106 '65"},
++    {1646, "_908_hdi_fap_peugeot_sport_10", 250017, "Peugeot 908 HDi FAP - Team Peugeot Total '10"},
++    {1671, "typ2_t1_sambabus_62", 370021, "Volkswagen Sambabus Typ 2 (T1) '62"},
++    {1722, "mp4_12c_10", 770005, "McLaren MP4-12C '10"},
++    {1729, "mustang_mach1_71", 20020, "Ford Mustang Mach 1 '71"},
++    {1746, "roadster_89_rm", 10109, "Mazda Roadster Touring Car"},
++    {1770, "aventador_lp700_4_11", 2280010, "Lamborghini Aventador LP 700-4 '11"},
++    {1778, "volkswagen_1200_66", 370025, "Volkswagen 1200 '66"},
++    {1796, "alpine_a110_1600s_68", 230003, "Alpine A110 1600S '72"},
++    {1797, "sls_amg_gt3_11", 530028, "Mercedes-Benz SLS AMG GT3 '11"},
++    {1893, "z8_01", 70026, "BMW Z8 '01"},
++    {1895, "dino_246gt_69", 2250024, "Ferrari Dino 246 GT '71"},
++    {1896, "tesla_model_s_sig_perf_12", 2360002, "Tesla Motors Model S Signature Performance '12"},
++    {1898, "one_77_11", 620009, "Aston Martin One-77 '11"},
++    {1900, "xnr_ghia_roadster_60", 260005, "Plymouth XNR Ghia Roadster '60"},
++    {1902, "z4_gt3_11", 70023, "BMW Z4 GT3 '11"},
++    {1904, "m3_gt2_11", 70025, "BMW M3 GT (BMW Motorsport) '11"},
++    {1905, "gtr_nismo_gt3_13", 30180, "Nissan GT-R NISMO GT3 N24 Schulze Motorsport '13"},
++    {1907, "x_bow_r_12", 2390001, "KTM X-BOW R '12"},
++    {1916, "corvette_c7_14", 220049, "Chevrolet Corvette Stingray (C7) '14"},
++    {1925, "gt350_65", 710007, "Shelby G.T.350 '65"},
++    {1926, "cobra_coupe_64", 710006, "Shelby Cobra Daytona Coupe '64"},
++    {1927, "quattro_s1_pikespeak_87", 570032, "Audi Sport quattro S1 Pikes Peak '87"},
++    {1931, "_250_gt_berlinetta_swb_61", 2250022, "Ferrari 250 GT Berlinetta passo corto  CN.2521 '61"},
++    {1932, "abarth_1500_biposto_bertone_52", 1400003, "Abarth 1500 Biposto Bertone B.A.T 1 '52"},
++    {1933, "mito_14_t_sport_09", 100016, "Alfa Romeo MiTo 1.4 T Sport '09"},
++    {1935, "gt40_mk1_66", 20025, "Ford GT40 Mark I '66"},
++    {1956, "viper_gts_13", 2410002, "Dodge Viper GTS '13"},
++    {1965, "r18_tdi_11", 570035, "Audi R18 TDI (Audi Sport Team Joest) '11"},
++    {1973, "abarth_500_09", 1400001, "Abarth 500 '09"},
++    {1975, "rx500_70", 10111, "Mazda RX500 '70"},
++    {1984, "mclaren_f1_gtr_lemans_95", 770006, "McLaren F1 GTR - BMW (Kokusai Kaihatsu UK Racing) '95"},
++    {1985, "firebird_transam_78", 210006, "Pontiac Firebird Trans Am '78"},
++    {1986, "r8_gordini_rally_66", 440018, "Renault R8 Gordini '66"},
++    {1987, "megane_renaultsport_11", 440019, "Renault Sport M\u00e9gane R.S. Trophy '11"},
++    {1990, "diablo_gt_00", 2280011, "Lamborghini Diablo GT '00"},
++    {2010, "_250_gto_62", 2250025, "Ferrari 250 GTO  CN.3729GT '62"},
++    {2017, "_288_gto_84", 2250021, "Ferrari GTO '84"},
++    {2018, "_365_gtb4_71", 2250023, "Ferrari 365 GTB4 '71"},
++    {2049, "veyron_16_4_13", 2290005, "Bugatti Veyron 16.4 '13"},
++    {2050, "huayra_13", 800008, "Pagani Huayra '13"},
++    {2051, "genesis_coupe_38_track_13", 830013, "Hyundai Genesis Coupe 3.8 Track '13"},
++    {2055, "mercedes_amg_vision_gt_13", 530031, "Mercedes-Benz AMG Vision Gran Turismo"},
++    {2059, "corvette_racer_concept_59", 220059, "Chevrolet Corvette Stingray Racer Concept '59"},
++    {2060, "pdi_mission_kart_125_xx", 1880031, "Gran Turismo Racing Kart 125 Shifter"},
++    {2074, "m4_14", 70033, "BMW M4 Coup\u00e9 '14"},
++    {2076, "mercedes_amg_vision_gt_race_13", 530032, "Mercedes-Benz AMG Vision Gran Turismo Racing Series"},
++    {2077, "x2014_std_14", 1880033, "Gran Turismo Red Bull X2014 Standard"},
++    {2078, "x2014_jr_14", 1880034, "Gran Turismo Red Bull X2014 Junior"},
++    {2080, "ft_1_14", 40106, "Toyota FT-1"},
++    {2087, "bmw_vision_gt_14", 70035, "BMW Vision Gran Turismo"},
++    {2095, "mitsubishi_vision_gt_14", 120086, "Mitsubishi Concept XR-PHEV EVOLUTION Vision Gran Turismo"},
++    {2098, "vw3_vision_gt_14", 370030, "Volkswagen GTI Roadster Vision Gran Turismo"},
++    {2099, "subaru_vision_gt_14", 200046, "SUBARU VIZIV GT Vision Gran Turismo"},
++    {2101, "ts030_hybrid_12", 40109, "Toyota TS030 Hybrid '12"},
++    {2103, "astonmartin_vision_gt_14", 620011, "Aston Martin DP-100 Vision Gran Turismo"},
++    {2106, "toyota_vision_gt_14", 40111, "Toyota FT-1 Vision Gran Turismo"},
++    {2107, "chaparral_vision_gt_14", 1780003, "Chevrolet Chaparral 2X Vision Gran Turismo"},
++    {2108, "srt_tr_vision_gt_35", 2410006, "Dodge SRT Tomahawk X Vision Gran Turismo"},
++    {2109, "mini_vision_gt_14", 500009, "MINI Clubman Vision Gran Turismo"},
++    {2110, "srt_lr_vision_gt_35", 2410007, "Dodge SRT Tomahawk GTS-R Vision Gran Turismo"},
++    {2111, "srt_st_vision_gt_35", 2410005, "Dodge SRT Tomahawk S Vision Gran Turismo"},
++    {2112, "alpine_vision_gt_14", 230005, "Alpine Vision Gran Turismo"},
++    {2113, "peugeot_vision_gt_14", 250022, "PEUGEOT Vision Gran Turismo"},
++    {2116, "alpine_vision_gt_14_blue", 230007, "Alpine Vision Gran Turismo Race Mode"},
++    {2117, "infiniti_vision_gt_14", 850007, "INFINITI CONCEPT Vision Gran Turismo"},
++    {2118, "mazda_lm55_vision_gt_14", 10117, "Mazda LM55 Vision Gran Turismo"},
++    {2121, "honda_vision_gt_m_14", 50117, "Honda Sports Vision Gran Turismo"},
++    {2122, "zagato_vision_gt_15", 2580001, "IsoRivolta Zagato Vision Gran Turismo"},
++    {2123, "lf_lc_gt_vision_gt_15", 740031, "LEXUS LF-LC GT \"Vision Gran Turismo\""},
++    {2124, "vw1_vision_gt_15", 370032, "Volkswagen GTI Supersport Vision Gran Turismo"},
++    {2127, "gtr_lm_nismo_15", 30199, "Nissan GT-R LM NISMO '15"},
++    {2131, "v12_vantage_gt3_12", 620012, "Aston Martin V12 Vantage GT3 '12"},
++    {2134, "bugatti_vision_gt_15", 2290007, "Bugatti Vision Gran Turismo"},
++    {2135, "hyundai_vision_gt_25", 830014, "HYUNDAI N 2025 Vision Gran Turismo"},
++    {2136, "_4c_launch_14", 100020, "Alfa Romeo 4C Launch Edition '14"},
++    {2138, "mustang_gt_premium_fastback_15", 20035, "Ford Mustang GT Premium Fastback '15"},
++    {2139, "rc_f_14", 740032, "Lexus RC F '14"},
++    {2141, "golf_gti_14", 370031, "Volkswagen Golf VII GTI '14"},
++    {2142, "nissan_vision_gt_14_tms2015", 30207, "NISSAN CONCEPT 2020 Vision Gran Turismo"},
++    {2143, "r8_lms_15", 570044, "Audi R8 LMS (Audi Sport Team WRT) '15"},
++    {2144, "s_fr_15", 40115, "TOYOTA S-FR '15"},
++    {2145, "focus_st_15", 20038, "Ford Focus ST '15"},
++    {2146, "f_type_r_coupe_14", 80015, "Jaguar F-type R Coup\u00e9 '14"},
++    {2147, "veneno_14", 2280017, "Lamborghini Veneno '14"},
++    {2148, "roadster_s_15", 10118, "Mazda Roadster S (ND) '15"},
++    {2149, "mercedes_amg_gt_s_14", 530034, "Mercedes-AMG GT S '15"},
++    {2150, "lancer_evo_final_15", 120088, "Mitsubishi Lancer Evolution Final Edition '15"},
++    {2152, "charger_srt_hellcat_15", 2410010, "Dodge Charger SRT Hellcat '15"},
++    {2153, "wrx_sti_s_14", 200047, "Subaru WRX STI Type S '14"},
++    {2154, "toyota_86_gt_15", 40117, "TOYOTA 86 GT '15"},
++    {2156, "honda_2_4_xx", 50120, "Honda Project 2&4 powered by RC213V"},
++    {2157, "v8_vantage_gt4m_xx", 620015, "Aston Martin Vantage Gr.4"},
++    {2158, "_458_italia_gt3_13", 2250031, "Ferrari 458 Italia GT3 '13"},
++    {2159, "mustang_gt_premium_gt3m_xx", 20037, "Ford Mustang Gr.3"},
++    {2160, "genesis_coupe_gt3m_xx", 830016, "Hyundai Genesis Gr.3"},
++    {2161, "gtr_gt4m_xx", 30206, "Nissan GT-R Gr.4"},
++    {2162, "laferrari_13", 2250030, "Ferrari LaFerrari '13"},
++    {2163, "genesis_coupe_gt4m_xx", 830015, "Hyundai Genesis Gr.4"},
++    {2164, "mustang_gt_premium_gt4m_xx", 20036, "Ford Mustang Gr.4"},
++    {2166, "_4c_gt4m_xx", 100023, "Alfa Romeo 4C Gr.4"},
++    {2167, "gtr_17", 30208, "Nissan GT-R Premium edition '17"},
++    {2169, "tts_coupe_14", 570043, "Audi TTS Coup\u00e9 '14"},
++    {2170, "a45_amg_4m_13", 530033, "Mercedes-Benz A 45 AMG 4MATIC '13"},
++    {2171, "huracan_lp610_4_15", 2280018, "Lamborghini Hurac\u00e1n LP 610-4 '15"},
++    {2172, "ds3_racing_11", 420016, "Citro\u00ebn DS3 Racing '11"},
++    {2173, "atenza_sedan_xd_l_15", 10121, "Mazda Atenza Sedan XD L package '15"},
++    {2174, "_650s_coupe_14", 770008, "McLaren 650S Coupe '14"},
++    {2175, "v8_vantage_s_15", 620007, "Aston Martin V8 Vantage S '15"},
++    {2176, "rcz_gt_line_15", 250024, "Peugeot RCZ GT Line '15"},
++    {2177, "huracan_gt3_15", 2280019, "Lamborghini Hurac\u00e1n GT3 '15"},
++    {2178, "s_fr_racing_16", 40118, "TOYOTA S-FR Racing Concept '16"},
++    {2179, "bugatti_vision_gt_15_lmp", 2290010, "Bugatti Vision Gran Turismo (Gr.1)"},
++    {2180, "hyundai_vision_gt_25_lmp", 830018, "HYUNDAI N 2025 Vision Gran Turismo (Gr.1)"},
++    {2181, "mazda_lm55_vision_gt_14_lmp", 10122, "Mazda LM55 Vision Gran Turismo (Gr.1)"},
++    {2182, "_650s_gt3_15", 770009, "McLaren 650S GT3 '15"},
++    {2183, "corvette_c7_gt3m_xx", 220068, "Chevrolet Corvette C7 Gr.3"},
++    {2184, "f_type_gt3m_xx", 80019, "Jaguar F-type Gr.3"},
++    {2185, "lancer_evo_final_gt3m_xx", 120089, "Mitsubishi Lancer Evolution Final Edition    Gr.3"},
++    {2186, "wrx_gt3m_xx", 200050, "Subaru WRX Gr.3"},
++    {2187, "toyota_ft1_vgt_gt3m_xx", 40116, "Toyota FT-1 Vision Gran Turismo (Gr.3)"},
++    {2188, "rs_01_gt3_15", 440027, "Renault Sport R.S.01 GT3 '16"},
++    {2190, "gt_by_citroen_gt3m_xx", 420017, "GT by Citro\u00ebn Race Car (Gr.3)"},
++    {2192, "vw3_vgt_gt3m_xx", 370033, "Volkswagen GTI Vision Gran Turismo (Gr.3)"},
++    {3183, "peugeot_vgt_gt3m_xx", 250026, "PEUGEOT Vision Gran Turismo (Gr.3)"},
++    {3185, "_4c_gt3m_xx", 100025, "Alfa Romeo 4C Gr.3"},
++    {3187, "alpine_vgt_lmp_xx", 230008, "Alpine Vision Gran Turismo 2017"},
++    {3188, "srt_tomahawk_vgt_lmp_xx", 2410011, "Dodge SRT Tomahawk Vision Gran Turismo (Gr.1)"},
++    {3192, "sls_amg_gt4m_xx", 530036, "Mercedes-Benz SLS AMG Gr.4"},
++    {3209, "m4_14_sc", 70046, "BMW M4 Safety Car"},
++    {3210, "mercedes_amg_gt_s_14_sc", 530037, "Mercedes-AMG GT Safety Car"},
++    {3214, "civic_r_15", 50123, "Honda Civic Type R (FK2) '15"},
++    {3215, "_208_gti_ps_14", 250030, "Peugeot 208 GTi by Peugeot Sport '14"},
++    {3216, "rs_01_16", 440025, "Renault Sport R.S.01 '16"},
++    {3217, "camaro_ss_16", 220070, "Chevrolet Camaro SS '16"},
++    {3218, "m6_gt3_walkenhorst_16", 70044, "BMW M6 GT3 (Walkenhorst Motorsport) '16"},
++    {3219, "nsx_17", 50122, "Honda NSX '17"},
++    {3220, "clio_rs_220_edc_trophy_15", 440024, "Renault Sport Clio R.S. 220 EDC Trophy '15"},
++    {3221, "m6_gt3_m_power_16", 70048, "BMW M6 GT3 M Power Livery '16"},
++    {3222, "toyota_86_grmn_16", 40122, "Toyota 86 GRMN '16"},
++    {3223, "viper_gt3_r_15", 510022, "Dodge Viper SRT GT3-R '15"},
++    {3224, "mercedes_amg_gt_gt3_16", 530039, "Mercedes-AMG GT3 (AMG-Team HTP-Motorsport) '16"},
++    {3225, "gtr_17_sc", 30212, "Nissan GT-R Safety Car"},
++    {3227, "lc500_17", 740035, "Lexus LC500 '17"},
++    {3228, "rc_f_gt3_proto_16", 740036, "Lexus RC F GT3 prototype (Emil Frey Racing) '16"},
++    {3229, "mustang_gt_premium_gtbm_xx", 20040, "Ford Mustang Gr.B Rally Car"},
++    {3230, "lancer_evo_final_gtbm_xx", 120092, "Mitsubishi Lancer Evolution Final Edition    Gr.B Rally Car"},
++    {3231, "scirocco_gt4m_xx", 370036, "Volkswagen Scirocco Gr.4"},
++    {3232, "wrx_gtbm_xx", 200054, "Subaru WRX Gr.B Rally Car"},
++    {3234, "genesis_coupe_gtbm_xx", 830020, "Hyundai Genesis Gr.B Rally Car"},
++    {3235, "nsx_gt3m_xx", 50125, "Honda NSX Gr.3"},
++    {3237, "atenza_sedan_gt3m_xx", 10125, "Mazda Atenza Gr.3"},
++    {3238, "rcz_gt3m_xx", 250028, "Peugeot RCZ Gr.3"},
++    {3239, "nsx_gtbm_xx", 50126, "Honda NSX Gr.B Rally Car"},
++    {3241, "gtr_nismo_gtbm_xx", 30211, "Nissan GT-R Gr.B Rally Car"},
++    {3242, "rcz_gtbm_xx", 250029, "Peugeot RCZ Gr.B Rally Car"},
++    {3245, "m4_gt4m_xx", 70047, "BMW M4 Gr.4"},
++    {3246, "veyron_16_4_gt4m_xx", 2290011, "Bugatti Veyron Gr.4"},
++    {3247, "corvette_c7_gt4m_xx", 220071, "Chevrolet Corvette C7 Gr.4"},
++    {3248, "gt_by_citroen_gt4m_xx", 420018, "GT by Citro\u00ebn Gr.4"},
++    {3249, "viper_gts_gt4m_xx", 510021, "Dodge Viper Gr.4"},
++    {3251, "nsx_gt4m_xx", 50124, "Honda NSX Gr.4"},
++    {3252, "f_type_gt4m_xx", 80021, "Jaguar F-type Gr.4"},
++    {3253, "huracan_lp610_4_gt4m_xx", 2280021, "Lamborghini Hurac\u00e1n Gr.4"},
++    {3254, "rc_f_gt4m_xx", 740038, "Lexus RC F Gr.4"},
++    {3256, "atenza_sedan_gt4m_xx", 10124, "Mazda Atenza Gr.4"},
++    {3257, "_650s_coupe_gt4m_xx", 770011, "McLaren 650S Gr.4"},
++    {3258, "lancer_evo_final_gt4m_xx", 120093, "Mitsubishi Lancer Evolution Final Edition    Gr.4"},
++    {3259, "rcz_gt4m_xx", 250032, "Peugeot RCZ Gr.4"},
++    {3260, "megane_renaultsport_gt4m_xx", 440023, "Renault Sport M\u00e9gane Gr.4"},
++    {3261, "wrx_gt4m_xx", 200051, "Subaru WRX Gr.4"},
++    {3262, "toyota_86_gt4m_xx", 40119, "TOYOTA 86 Gr.4"},
++    {3263, "_458_italia_gt4m_xx", 2250034, "Ferrari 458 Italia Gr.4"},
++    {3264, "focus_st_gtbm_xx", 20042, "Ford Focus Gr.B Rally Car"},
++    {3265, "toyota_86_gtbm_xx", 40121, "TOYOTA 86 Gr.B Rally Car"},
++    {3266, "i3_15", 70042, "BMW i3 '15"},
++    {3268, "_911_gt3_rs_16", 2460001, "Porsche 911 GT3 RS (991) '16"},
++    {3295, "toyota_86_gt_16", 40123, "TOYOTA 86 GT\"Limited\" '16"},
++    {3296, "corvette_c7_gt3m_road_xx", 220072, "Chevrolet Corvette C7 Gr.3 Road Car"},
++    {3297, "wrx_sti_man_tt_16", 200055, "Subaru WRX STI Isle of Man Time Attack Car '16"},
++    {3298, "tt_cup_16", 570049, "Audi TT Cup '16"},
++    {3299, "_4c_gt3m_road_xx", 100028, "Alfa Romeo 4C Gr.3 Road Car"},
++    {3300, "mustang_gt_premium_gt3m_road_xx", 20044, "Ford Mustang Gr.3 Road Car"},
++    {3301, "lancer_evo_final_gtbm_road_xx", 120095, "Mitsubishi Lancer Final Edition    Gr.B Road Car"},
++    {3303, "rcz_gt3m_road_xx", 250034, "Peugeot RCZ Gr.3 Road Car"},
++    {3304, "wrx_gtbm_road_xx", 200056, "Subaru WRX Gr.B Road Car"},
++    {3305, "beetle_gt3_17", 370037, "Volkswagen Beetle Gr.3"},
++    {3306, "atenza_sedan_gt3m_road_xx", 10126, "Mazda Atenza Gr.3 Road Car"},
++    {3308, "pininfarina_vision_gt_17", 2900001, "Fittipaldi EF7 Vision Gran Turismo by Pininfarina"},
++    {3309, "vulcan_16", 620018, "Aston Martin Vulcan '16"},
++    {3310, "cayman_gt4_clubsport_16", 2460003, "Porsche Cayman GT4 Clubsport '16"},
++    {3311, "_911_rsr_17", 2460002, "Porsche 911 RSR (991) '17"},
++    {3312, "ts050_hybrid_16", 40124, "Toyota TS050 - Hybrid (Toyota Gazoo Racing) '16"},
++    {3313, "_919_hybrid_16", 2460004, "Porsche 919 Hybrid (Porsche Team) '16"},
++    {3314, "audi_vision_gt_17", 570046, "Audi Vision Gran Turismo"},
++    {3315, "mclaren_vision_gt_17", 770012, "McLaren Ultimate Vision Gran Turismo"},
++    {3316, "daihatsu_vision_gt_17", 110021, "DAIHATSU COPEN RJ Vision Gran Turismo"},
++    {3331, "r18_tdi_11_wr", 570050, "Audi R18 TDI (Le Mans 2011)"},
++    {3332, "peugeot_l500r_hv_vision_gt_17", 250031, "Peugeot L500R HYbrid Vision Gran Turismo, 2017"},
++    {3333, "peugeot_l500r_hv_vision_gt_race_17", 250033, "Peugeot L750R HYbrid Vision Gran Turismo, 2017"},
++    {3334, "r18_16", 570051, "Audi R18 (Audi Sport Team Joest) '16"},
++    {3335, "mclaren_vision_gt_17_lmp", 770013, "McLaren Ultimate Vision Gran Turismo (Gr.1)"},
++    {3336, "f150_svt_raptor_11", 20033, "Ford F-150 SVT Raptor '11"},
++    {3337, "alpine_a110_prm_17", 230009, "Alpine A110 Premi\u00e8re \u00c9dition '17"},
++    {3338, "chc_67_chevy_nova_xx", 220066, "Chris Holstrom Concepts 1967 Chevy Nova"},
++    {3339, "falken_turn14_brz_17", 200049, "Subaru Falken Tire / Turn 14 Distribution BRZ '17"},
++    {3340, "rc_f_gt3_emil_17", 740039, "Lexus RC F GT3 (Emil Frey Racing) '17"},
++    {3341, "pantera_71", 1440001, "De Tomaso Pantera '71"},
++    {3342, "f1500t_a_xx", 1880040, "Gran Turismo F1500T-A"},
++    {3343, "db11_16", 620019, "Aston Martin DB11 '16"},
++    {3344, "m3_sport_evo_89", 70038, "BMW M3 Sport Evolution '89"},
++    {3345, "gtr_nismo_17", 30216, "Nissan GT-R NISMO '17"},
++    {3346, "eckert_mustang_mach_40_xx", 2530001, "Eckerts Rod & Custom Mach Forty"},
++    {3347, "f1_w08_eq_17", 530040, "Mercedes-AMG F1 W08 EQ Power+ 2017"},
++    {3348, "raybrig_nsx_concept_gt_16", 50127, "Honda RAYBRIG NSX CONCEPT-GT '16"},
++    {3349, "au_toms_rc_f_16", 740040, "Lexus au TOM'S RC F '16"},
++    {3350, "motul_autech_gtr_16", 30215, "Nissan MOTUL AUTECH GT-R '16"},
++    {3351, "audi_etron_vision_gt_18", 570052, "Audi e-tron Vision Gran Turismo"},
++    {3352, "gr_supra_racing_concept_18", 40125, "Toyota GR Supra Racing Concept '18"},
++    {3353, "clio_rs_220_edc_trophy_16", 440030, "Renault Sport Clio R.S. 220 EDC Trophy '16"},
++    {3354, "brz_s_15", 200048, "Subaru BRZ S '15"},
++    {3355, "f1_w08_eq_17_le", 530041, "Mercedes-AMG F1 W08 EQ Power+ (Color Variation) 2017"},
++    {3356, "morris_mini_cooper_s_970_65", 500010, "Mini-Cooper 'S' '65"},
++    {3357, "s660_15", 50128, "Honda S660 '15"},
++    {3358, "_911_gt3_01", 2460005, "Porsche 911 GT3 (996) '01"},
++    {3359, "_911_gt3_08", 2460008, "Porsche 911 GT3 (997) '09"},
++    {3360, "mclaren_p1_gtr_16", 770014, "McLaren P1 GTR '16"},
++    {3361, "e_type_coupe_62", 80018, "Jaguar E-type Coup\u00e9 '61"},
++    {3362, "f50_95", 2250033, "Ferrari F50 '95"},
++    {3363, "db3s_53", 620016, "Aston Martin DB3S CN.1 '53"},
++    {3364, "datsun_240z_fugu_z_xx", 30217, "Greddy Fugu Z"},
++    {3365, "_356_a_1500_gs_carrera_gt_ss_56", 2460006, "Porsche 356 A/1500 GS GT Carrera Speedster '56"},
++    {3367, "supra_rz_19", 40128, "Toyota GR Supra RZ '19"},
++    {3368, "tundra_trd_pro_19", 40127, "Toyota Tundra TRD Pro '19"},
++    {3370, "fit_hybrid_14", 50118, "Honda Fit Hybrid '14"},
++    {3371, "dallara_sf19_toyota_19", 40129, "Dallara SF19 Super Formula / Toyota '19"},
++    {3372, "dallara_sf19_honda_19", 50129, "Dallara SF19 Super Formula / Honda '19"},
++    {3373, "_962c_88", 2460007, "Porsche 962 C '88"},
++    {3374, "x2019_comp_19", 1880041, "Gran Turismo Red Bull X2019 Competition"},
++    {3376, "d_type_54", 80017, "Jaguar D-type '54"},
++    {3377, "coronet_superbee_383_70", 510019, "Dodge Super Bee '70"},
++    {3383, "demio_xd_touring_15", 10120, "Mazda Demio XD Touring '15"},
++    {3384, "gto_tt_91", 120087, "Mitsubishi GTO    Twin Turbo '91"},
++    {3385, "_911_turbo_81", 2460009, "Porsche 911 Turbo (930) '81"},
++    {3386, "mercedes_amg_vision_gt_race_13_lhc", 530045, "Mercedes-Benz AMG Vision Gran Turismo LH Edition"},
++    {3387, "camaro_zl1_1le_18", 220073, "Chevrolet Camaro ZL1 1LE Package '18"},
++    {3388, "_300_sel_68_amg_71", 530042, "Mercedes-Benz 300 SEL 6.8 AMG '71"},
++    {3389, "m3_03", 70040, "BMW M3 Coup\u00e9 '03"},
++    {3390, "taycan_turbo_s_20", 2460012, "Porsche Taycan Turbo S '19"},
++    {3392, "aventador_lp_750_4_sv_15", 2280022, "Lamborghini Aventador LP 750-4 Superveloce '15"},
++    {3394, "dbr9_gt1_10", 620013, "Aston Martin DBR9 GT1 '10"},
++    {3396, "jaguar_vision_gt_coupe_19", 80022, "Jaguar Vision Gran Turismo Coup\u00e9"},
++    {3398, "ctr3_07", 700007, "RUF CTR3 '07"},
++    {3399, "gr_supra_nur_gt4m_xx", 40131, "Toyota GR Supra (N\u00fcrburgring 24 Hours Race 2019 Livery)"},
++    {3401, "crown_athlete_g_13", 40130, "Toyota Crown Athlete G '13"},
++    {3402, "ford_gt_17", 20047, "Ford GT '17"},
++    {3403, "golf_1_gti_83", 370038, "Volkswagen Golf I GTI '83"},
++    {3404, "_911_carrera_rs_cs_95", 2460014, "Porsche 911 Carrera RS Club Sport (993) '95"},
++    {3406, "charger_srt_hellcat_15_sc", 2410012, "Dodge Charger SRT Hellcat Safety Car"},
++    {3407, "megane_renaultsport_11_sc", 440031, "Renault Sport M\u00e9gane R.S. Trophy Safety Car"},
++    {3408, "crown_athlete_g_13_sc", 40126, "Toyota Crown Athlete G Safety Car"},
++    {3418, "supra_rz_20", 40133, "Toyota GR Supra RZ '20"},
++    {3419, "rx_vision_gt3_concept_20", 10127, "MAZDA RX-VISION GT3 CONCEPT"},
++    {3451, "gr_yaris_rz_hp_20", 40132, "Toyota GR Yaris 1st Edition RZ\"High performance\" '20"},
++    {3481, "gr_86_rz_21", 40138, "Toyota GR 86 '21"},
++    {3491, "supra_racecar_xx", 40139, "Toyota GR Supra Racing Concept"},
++    {3492, "toyota_86_gt4m_xx_ovs", 40140, "TOYOTA 86 Gr.4 Race Car"},
++};
+diff --git a/ryty_gpu/ryty_camera_input.h b/ryty_gpu/ryty_camera_input.h
+new file mode 100644
+index 00000000..8e6d4fe8
+--- /dev/null
++++ b/ryty_gpu/ryty_camera_input.h
+@@ -0,0 +1,41 @@
++#pragma once
++#include <SDL3/SDL_events.h>
++#include <algorithm>
++#include <cmath>
++
++namespace Ryty::Camera {
++inline float NormalizeOrbitAxis(int raw) {
++    const float value = std::clamp((raw - 128) / 127.f, -1.f, 1.f);
++    const float magnitude = std::abs(value);
++    constexpr float deadzone = .12f;
++    if (magnitude <= deadzone) return 0;
++    return std::copysign((magnitude - deadzone) / (1.f - deadzone), value);
++}
++enum class InputRoute { Normal, InterfaceOnly, ReleaseBinding, Gamepad };
++// SDL event routing only; never suppress joystick devices, hotplug or haptic output.
++constexpr InputRoute RouteInput(bool open, Uint32 type) {
++    if (!open) return InputRoute::Normal;
++    switch (type) {
++    case SDL_EVENT_KEY_UP:
++    case SDL_EVENT_MOUSE_BUTTON_UP:
++        return InputRoute::ReleaseBinding;
++    case SDL_EVENT_KEY_DOWN:
++    case SDL_EVENT_TEXT_INPUT:
++    case SDL_EVENT_TEXT_EDITING:
++    case SDL_EVENT_MOUSE_MOTION:
++    case SDL_EVENT_MOUSE_BUTTON_DOWN:
++    case SDL_EVENT_MOUSE_WHEEL:
++        return InputRoute::InterfaceOnly;
++    case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
++    case SDL_EVENT_GAMEPAD_BUTTON_UP:
++    case SDL_EVENT_GAMEPAD_AXIS_MOTION:
++    case SDL_EVENT_GAMEPAD_TOUCHPAD_DOWN:
++    case SDL_EVENT_GAMEPAD_TOUCHPAD_UP:
++    case SDL_EVENT_GAMEPAD_TOUCHPAD_MOTION:
++    case SDL_EVENT_GAMEPAD_SENSOR_UPDATE:
++        return InputRoute::Gamepad;
++    default:
++        return InputRoute::Normal;
++    }
++}
++} // namespace Ryty::Camera
+diff --git a/ryty_gpu/ryty_camera_overlay.cpp b/ryty_gpu/ryty_camera_overlay.cpp
+new file mode 100644
+index 00000000..90bcab59
+--- /dev/null
++++ b/ryty_gpu/ryty_camera_overlay.cpp
+@@ -0,0 +1,382 @@
++#include "ryty_gpu/ryty_camera.h"
++#include "ryty_gpu/ryty_input_bridge.h"
++#include <atomic>
++#include <imgui.h>
++#include <imgui_internal.h>
++namespace ImGui::Core {
++bool IsGamepadInputCaptured();
++} // namespace ImGui::Core
++namespace Ryty::Camera {
++namespace {
++std::atomic<bool> open{}, reset_layout{};
++ImVec4 RGB(int r, int g, int b, float a = 1) {
++  return {r / 255.f, g / 255.f, b / 255.f, a};
++}
++bool EditSettings(Settings &s, View camera, int &selected, float scale) {
++  bool changed = false;
++  if (!ImGui::BeginTable("CameraColumns", 3,
++                         ImGuiTableFlags_SizingStretchSame |
++                             ImGuiTableFlags_BordersInnerV))
++    return false;
++  ImGui::TableNextRow();
++  ImGui::TableSetColumnIndex(0);
++  ImGui::TextUnformatted("Camera");
++  ImGui::SetNextItemWidth(-1);
++  if (ImGui::Combo("##Camera", &selected, Names.data(),
++                   static_cast<int>(Names.size())))
++    RequestView(static_cast<View>(selected));
++  // Do not mix the previous camera's values into a newly selected view this
++  // frame.
++  ImGui::BeginDisabled(camera != static_cast<View>(selected));
++  const float native = NativeFov(camera);
++  bool custom = s.fov != 0;
++  ImGui::BeginDisabled(!custom && native <= 0);
++  if (ImGui::Checkbox("Custom FOV", &custom)) {
++    s.fov = custom ? std::clamp(native, 30.f, 100.f) : 0;
++    changed = true;
++  }
++  ImGui::EndDisabled();
++  ImGui::SetNextItemWidth(-75 * scale);
++  if (custom)
++    changed |= ImGui::SliderFloat("FOV", &s.fov, 30, 100, "%.1f deg");
++  else {
++    float shown = native;
++    ImGui::BeginDisabled();
++    ImGui::SliderFloat("FOV", &shown, 30, 100,
++                       native > 0 ? "%.1f deg" : "Original");
++    ImGui::EndDisabled();
++  }
++  const auto limit = Limits(camera);
++  const float minimum = camera == View::Bumper
++      ? std::clamp(MinimumHeight(camera), limit.height_min, limit.height_max)
++      : limit.height_min;
++  ImGui::SetNextItemWidth(-75 * scale);
++  changed |= ImGui::SliderFloat("Height", &s.height,
++                                minimum, limit.height_max, "%+.3f m", ImGuiSliderFlags_AlwaysClamp);
++  if (camera != View::Bumper) {
++    ImGui::SetNextItemWidth(-75 * scale);
++    changed |= ImGui::SliderFloat("Distance", &s.distance, limit.distance_min,
++                                  limit.distance_max, "%+.3f m", ImGuiSliderFlags_AlwaysClamp);
++  }
++  ImGui::TableSetColumnIndex(1);
++  if (camera == View::Chase) {
++    ImGui::TextUnformatted("Orbit");
++    changed |= ImGui::Checkbox("Right stick orbit", &s.orbit);
++    ImGui::BeginDisabled(!s.orbit);
++    ImGui::SetNextItemWidth(-105 * scale);
++    changed |=
++        ImGui::SliderFloat("Sensitivity", &s.sensitivity, -15, 15, "%.2f", ImGuiSliderFlags_AlwaysClamp);
++    ImGui::SetItemTooltip("0 = default speed. Negative = slower. Positive = faster. Direction uses Invert X/Y only.");
++    ImGui::SetNextItemWidth(-105 * scale);
++    changed |=
++        ImGui::SliderFloat("Smoothness", &s.smoothing_ms, 0, 1000, "%.0f ms");
++    changed |= ImGui::Checkbox("Invert X", &s.invert_x);
++    ImGui::SameLine();
++    changed |= ImGui::Checkbox("Invert Y", &s.invert_y);
++    ImGui::EndDisabled();
++  } else {
++    ImGui::TextUnformatted("Position");
++    ImGui::TextWrapped("Height: + up / - down.");
++    if (camera != View::Bumper)
++      ImGui::TextWrapped("Distance: + forward / - backward.");
++    ImGui::TextWrapped("Zero restores the original position.");
++  }
++  ImGui::TableSetColumnIndex(2);
++  if (camera == View::Chase) {
++    ImGui::TextUnformatted("Auto Center");
++    ImGui::BeginDisabled(!s.orbit);
++    changed |= ImGui::Checkbox("Smooth return", &s.auto_return);
++    ImGui::BeginDisabled(!s.auto_return);
++    ImGui::SetNextItemWidth(-105 * scale);
++    changed |=
++        ImGui::SliderFloat("Return delay", &s.return_seconds, 0, 10, "%.1f s", ImGuiSliderFlags_AlwaysClamp);
++    ImGui::EndDisabled();
++    ImGui::EndDisabled();
++    ImGui::TextWrapped("Returns smoothly after input stops.");
++  } else {
++    ImGui::TextUnformatted("Original settings");
++    ImGui::TextWrapped(
++        "Restore Defaults returns this camera to the game's original values.");
++    if (camera != View::Cockpit)
++      ImGui::TextWrapped("Height is limited above the road.");
++  }
++  ImGui::EndDisabled();
++  ImGui::EndTable();
++  return changed;
++}
++} // namespace
++bool OverlayOpen() { return open.load(std::memory_order_relaxed); }
++void ToggleOverlay() { open.store(!OverlayOpen(), std::memory_order_relaxed); }
++void ResetOverlayLayout() {
++  reset_layout.store(true);
++  open.store(true);
++}
++void CloseOverlay() { open.store(false, std::memory_order_relaxed); }
++void DrawOverlay() {
++  static bool was_visible = false, focus = false;
++  static bool suppressing_gamepad_nav = false, saved_gamepad_nav = false;
++  static int selected = 0;
++  static View last_observed = View::Count;
++  const bool visible = OverlayOpen();
++  if (visible && !was_visible) {
++    focus = true;
++    last_observed = View::Count;
++  }
++  was_visible = visible;
++  // Camera controls use mouse/keyboard only. Preserve native gamepad navigation
++  // whenever another native window (including F3 Controllers) owns input capture.
++  auto& io = ImGui::GetIO();
++  const bool suppress = visible && !Ryty::ControllerOverlayOpen() &&
++                        !ImGui::Core::IsGamepadInputCaptured();
++  if (suppress != suppressing_gamepad_nav) {
++    if (suppress) {
++      saved_gamepad_nav = (io.ConfigFlags & ImGuiConfigFlags_NavEnableGamepad) != 0;
++      io.ConfigFlags &= ~ImGuiConfigFlags_NavEnableGamepad;
++    } else if (saved_gamepad_nav) {
++      io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
++    }
++    suppressing_gamepad_nav = suppress;
++  }
++  ImGui::GetIO().MouseDrawCursor = visible || Ryty::ControllerOverlayOpen();
++  if (!visible)
++    return;
++  auto &store = Presets();
++    auto appearance = store.ReadAppearance();
++  const auto *viewport = ImGui::GetMainViewport();
++  const auto area = viewport->WorkSize, origin = viewport->WorkPos;
++  if (area.x < 1 || area.y < 1)
++    return;
++  const float scale =
++      std::clamp(std::min(area.y / 1000.f, area.x / 1600.f), .50f, 2.4f) *
++      appearance.scale;
++  const float inherited =
++      ImGui::GetFontSize() / std::max(1.f, ImGui::GetStyle().FontSizeBase);
++  ImGui::PushFont(nullptr,
++                  appearance.font_size * scale / std::max(.01f, inherited));
++  // Values and shared font match the existing Controllers overlay; no new font
++  // atlas.
++  ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {18 * scale, 14 * scale});
++  ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, {8 * scale, 5 * scale});
++  ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {8 * scale, 6 * scale});
++  ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 6 * scale);
++  ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 3 * scale);
++  ImGui::PushStyleVar(ImGuiStyleVar_PopupRounding, 4 * scale);
++  ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1);
++  ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1);
++  ImGui::PushStyleVar(ImGuiStyleVar_PopupBorderSize, 1);
++  const auto &bg = appearance.background;
++  const auto &ac = appearance.accent;
++  const ImVec4 accent{ac[0], ac[1], ac[2], 1};
++  const std::pair<ImGuiCol, ImVec4> colors[] = {
++      {ImGuiCol_WindowBg, {bg[0], bg[1], bg[2], appearance.opacity}},
++      {ImGuiCol_PopupBg, RGB(40, 40, 42, .99f)},
++      {ImGuiCol_Border, RGB(70, 70, 74)},
++      {ImGuiCol_Text, RGB(230, 230, 230)},
++      {ImGuiCol_TextDisabled, RGB(150, 150, 150)},
++      {ImGuiCol_FrameBg, RGB(45, 45, 48)},
++      {ImGuiCol_FrameBgHovered, RGB(58, 58, 61)},
++      {ImGuiCol_FrameBgActive, RGB(75, 75, 80)},
++      {ImGuiCol_Button, RGB(58, 58, 61)},
++      {ImGuiCol_ButtonHovered, RGB(75, 75, 80)},
++      {ImGuiCol_ButtonActive, RGB(70, 70, 74)},
++      {ImGuiCol_Header, {ac[0], ac[1], ac[2], .55f}},
++      {ImGuiCol_HeaderHovered, RGB(206, 40, 52, .65f)},
++      {ImGuiCol_HeaderActive, accent},
++      {ImGuiCol_Separator, RGB(70, 70, 74)},
++      {ImGuiCol_NavCursor, RGB(206, 40, 52)},
++      {ImGuiCol_SliderGrab, accent},
++      {ImGuiCol_SliderGrabActive, RGB(206, 40, 52)},
++      {ImGuiCol_CheckMark, RGB(240, 96, 96)},
++      {ImGuiCol_Tab, RGB(45, 45, 48)},
++      {ImGuiCol_TabSelected, RGB(58, 58, 61)},
++      {ImGuiCol_TabSelectedOverline, accent},
++      {ImGuiCol_TabHovered, RGB(75, 75, 80)}};
++  for (auto [id, color] : colors)
++    ImGui::PushStyleColor(id, color);
++  const char *title = "Camera Settings###RytyCameraSettings";
++  const auto *previous = ImGui::FindWindowByName(title);
++  const auto *saved = ImGui::FindWindowSettingsByID(ImHashStr(title));
++  const bool reset = reset_layout.exchange(false) ||
++                     (previous && previous->DockId) ||
++                     (!previous && saved && saved->DockId);
++  if (reset) {
++    appearance.x = .10f;
++    appearance.y = .04f;
++    appearance.width = .80f;
++    appearance.height = .34f;
++    store.SetAppearance(appearance);
++  }
++  static ImVec2 last_area{};
++  const bool resized = area.x != last_area.x || area.y != last_area.y;
++  const ImVec2 minimum{std::min(area.x * .96f, 1050 * scale),
++                       std::min(area.y * .9f, 315 * scale)};
++  const ImVec2 size{
++      std::clamp(area.x * appearance.width, minimum.x, area.x * .98f),
++      std::clamp(area.y * appearance.height, minimum.y, area.y * .96f)};
++  ImGui::SetNextWindowDockID(0, ImGuiCond_Always);
++  if (!previous || reset || resized) {
++    ImGui::SetNextWindowSize(size, ImGuiCond_Always);
++    ImGui::SetNextWindowPos(
++        {origin.x + std::clamp(area.x * appearance.x, 0.f, area.x - size.x),
++         origin.y + std::clamp(area.y * appearance.y, 0.f, area.y - size.y)},
++        ImGuiCond_Always);
++  } else {
++    ImGui::SetNextWindowPos(
++        {std::clamp(previous->Pos.x, origin.x,
++                    origin.x + std::max(0.f, area.x - previous->Size.x)),
++         std::clamp(previous->Pos.y, origin.y,
++                    origin.y + std::max(0.f, area.y - previous->Size.y))},
++        ImGuiCond_Always);
++  }
++  last_area = area;
++  ImGui::SetNextWindowSizeConstraints(minimum, {area.x * .98f, area.y * .96f});
++  if (focus) {
++    ImGui::SetNextWindowFocus();
++    focus = false;
++  }
++  bool show = true;
++  if (ImGui::Begin(title, nullptr,
++                   ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoCollapse |
++                       ImGuiWindowFlags_NoDocking |
++                       ImGuiWindowFlags_NoSavedSettings)) {
++    const auto heading = ImGui::GetCursorScreenPos();
++    ImGui::InvisibleButton(
++        "HeaderDrag",
++        {std::max(1.f, ImGui::GetContentRegionAvail().x - 155 * scale),
++         ImGui::GetFrameHeight()});
++    if (ImGui::IsItemActive() && ImGui::IsMouseDragging(0)) {
++      const auto p = ImGui::GetWindowPos(), d = ImGui::GetIO().MouseDelta;
++      ImGui::SetWindowPos({p.x + d.x, p.y + d.y});
++    }
++    ImGui::GetWindowDrawList()->AddText({heading.x, heading.y + 5 * scale},
++                                        IM_COL32(240, 96, 96, 255),
++                                        "CAMERA SETTINGS");
++    ImGui::SameLine();
++    if (ImGui::Button("Appearance"))
++      ImGui::OpenPopup("CameraAppearance");
++    ImGui::SameLine();
++    if (ImGui::Button("X##Close"))
++      show = false;
++    if (ImGui::BeginPopup("CameraAppearance")) {
++      bool changed = ImGui::SliderFloat("Interface size", &appearance.scale,
++                                        .65f, 2, "%.2fx");
++      changed |= ImGui::SliderFloat("Font size", &appearance.font_size, 12, 32,
++                                    "%.0f px");
++      changed |=
++          ImGui::SliderFloat("Opacity", &appearance.opacity, .15f, 1, "%.2f");
++      changed |= ImGui::ColorEdit3("Window color", appearance.background.data(),
++                                   ImGuiColorEditFlags_NoInputs);
++      changed |= ImGui::ColorEdit3("Accent color", appearance.accent.data(),
++                                   ImGuiColorEditFlags_NoInputs);
++      if (ImGui::Button("Restore interface defaults")) {
++        appearance = {};
++        changed = true;
++        ResetOverlayLayout();
++      }
++      if (ImGui::Button("Reset window position"))
++        ResetOverlayLayout();
++      if (changed)
++        store.SetAppearance(appearance);
++      if (ImGui::TreeNode("Connection details")) {
++        ImGui::TextWrapped("%s", RuntimeStatus().c_str());
++        ImGui::TextWrapped("%s", RuntimeDiagnostics().c_str());
++        ImGui::TreePop();
++      }
++      ImGui::TextUnformatted("F4: open / close. Ctrl+F4: reset position.");
++      ImGui::EndPopup();
++    }
++    const auto observed = CurrentView();
++    if (observed != last_observed) {
++      if (observed != View::Count) selected = static_cast<int>(observed);
++      last_observed = observed;
++    }
++    static std::string message;
++    const auto car = CurrentCar();
++    bool custom_scope = false;
++    ImGui::BeginChild("CameraControls", {0, -55 * scale});
++    if (ImGui::BeginTabBar("camera_scopes")) {
++      if (ImGui::BeginTabItem("Global Settings")) {
++        const auto view = static_cast<View>(selected);
++        auto settings = store.ReadGlobal(view);
++        if (EditSettings(settings, view, selected, scale))
++          store.SetGlobal(view, settings);
++        ImGui::EndTabItem();
++      }
++      if (ImGui::BeginTabItem("Custom Car Presets")) {
++        custom_scope = true;
++        ImGui::TextWrapped("Vehicle: %s",
++                           car ? CarName(car).c_str()
++                               : "Waiting for a vehicle in a race");
++        ImGui::BeginDisabled(!car);
++        const auto view = static_cast<View>(selected);
++        const auto preset = store.ReadCar(car);
++        bool enabled = preset.enabled[selected];
++        if (ImGui::Checkbox("Use custom preset for this camera", &enabled)) {
++          if (enabled)
++            store.SetCar(car, view, store.ReadGlobal(view));
++          else
++            store.UseGlobal(car, view);
++        }
++        if (!enabled) {
++          ImGui::SetNextItemWidth(300 * scale);
++          if (ImGui::Combo("Camera", &selected, Names.data(),
++                           static_cast<int>(Names.size())))
++            RequestView(static_cast<View>(selected));
++          ImGui::TextWrapped("Enable a custom preset to edit; otherwise this "
++                             "camera follows Global Settings.");
++        } else {
++          auto settings = store.Effective(car, view);
++          if (EditSettings(settings, view, selected, scale))
++            store.SetCar(car, view, settings);
++        }
++        ImGui::EndDisabled();
++        ImGui::EndTabItem();
++      }
++      ImGui::EndTabBar();
++    }
++    ImGui::EndChild();
++    ImGui::Separator();
++    ImGui::BeginDisabled(custom_scope && !car);
++    ImGui::PushStyleColor(ImGuiCol_Button, accent);
++    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, RGB(206, 40, 52));
++    if (ImGui::Button("Save", {110 * scale, 0}))
++      message = store.Save(message) ? "Settings saved." : message;
++    ImGui::PopStyleColor(2);
++    ImGui::SameLine();
++    if (ImGui::Button("Restore Defaults")) {
++      store.RestoreDefaults(custom_scope ? car : 0,
++                            static_cast<View>(selected));
++      message = "Original camera restored.";
++    }
++    if (custom_scope) {
++      ImGui::SameLine();
++      if (ImGui::Button("Use Global Settings"))
++        store.UseGlobal(car, static_cast<View>(selected));
++    }
++    ImGui::EndDisabled();
++    ImGui::SameLine();
++    ImGui::TextDisabled("%s",
++                        message.empty()
++                            ? (store.Dirty() ? "Unsaved changes" : "F4  Close")
++                            : message.c_str());
++    const auto pos = ImGui::GetWindowPos(), actual = ImGui::GetWindowSize();
++    auto layout = store.ReadAppearance();
++    if (std::abs(layout.x * area.x - (pos.x - origin.x)) > .6f ||
++        std::abs(layout.y * area.y - (pos.y - origin.y)) > .6f ||
++        std::abs(layout.width * area.x - actual.x) > .6f ||
++        std::abs(layout.height * area.y - actual.y) > .6f) {
++      layout.x = (pos.x - origin.x) / area.x;
++      layout.y = (pos.y - origin.y) / area.y;
++      layout.width = actual.x / area.x;
++      layout.height = actual.y / area.y;
++      store.SetAppearance(layout);
++    }
++  }
++  ImGui::End();
++  ImGui::PopStyleColor(static_cast<int>(std::size(colors)));
++  ImGui::PopStyleVar(9);
++  ImGui::PopFont();
++  if (!show)
++    CloseOverlay();
++}
++} // namespace Ryty::Camera
+diff --git a/ryty_gpu/ryty_camera_runtime.cpp b/ryty_gpu/ryty_camera_runtime.cpp
+new file mode 100644
+index 00000000..a62e7872
+--- /dev/null
++++ b/ryty_gpu/ryty_camera_runtime.cpp
+@@ -0,0 +1,369 @@
++#include "ryty_gpu/ryty_camera.h"
++#include <windows.h>
++#include <bcrypt.h>
++#include <array>
++#include <atomic>
++#include <chrono>
++#include <cstring>
++#include <fstream>
++#include <iomanip>
++#include <sstream>
++#include <vector>
++
++namespace Ryty::Camera {
++namespace {
++#include "ryty_camera_car_catalog.h"
++#include "camera_math/orbit_ground_apply.inc"
++#include "camera_math/roof_apply.inc"
++using Clock = std::chrono::steady_clock;
++std::uint64_t Milliseconds() {
++    return std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now().time_since_epoch()).count();
++}
++std::atomic<std::uint32_t> current_car{};
++std::atomic<std::uint64_t> car_updated{};
++std::atomic<std::uint64_t> camera_frames{};
++std::atomic<std::uint32_t> observed_car_id{};
++std::atomic<std::uint64_t> native_samples{};
++std::atomic<View> current_view{View::Count};
++std::atomic<std::uint64_t> view_updated{};
++// Set only on the game's camera thread, from the native prepare-view context.
++thread_local void* active_control{};
++thread_local void* active_camera{};
++thread_local std::uint64_t active_updated{};
++std::mutex identity_mutex;
++std::uint32_t candidate_car{};
++unsigned candidate_count{};
++std::mutex input_mutex;
++struct Stick { float x{}, y{}; bool focused{}; std::uint64_t updated{}; } stick;
++std::mutex runtime_mutex;
++std::string status = "Camera integration is starting.";
++std::uintptr_t image{};
++std::atomic<bool> runtime_ready{};
++std::mutex request_mutex;
++std::atomic<bool> request_pending{};
++struct ViewRequest { int view = -1; std::uint32_t car{}; std::uint64_t timestamp{}; } request;
++struct Hook {
++    std::uintptr_t slot, original;
++    std::atomic<float> native_fov{}, minimum{-5};
++    std::mutex mutex;
++    alignas(16) std::array<unsigned char, 256> data{};
++    std::uint32_t car{};
++    std::uint64_t last_frame{};
++};
++std::array<Hook, 4> hooks{{{0x2878ab8, 0x86b030}, {0x2878918, 0x8688e0},
++                         {0x28789e8, 0x869620}, {0x2878848, 0x8683f0}}};
++// These final-view methods use five integer/pointer arguments (SysV RDI,RSI,RDX,RCX,R8).
++// The original common method at RVA 0x8a6320 reads the fifth argument before building the view.
++using ViewFunction = std::uintptr_t(__attribute__((sysv_abi)) *)(void*, void*, void*, float*, std::uintptr_t);
++bool Readable(const void* address, std::size_t bytes) {
++    MEMORY_BASIC_INFORMATION info{};
++    if (!address || !VirtualQuery(address, &info, sizeof(info)) || info.State != MEM_COMMIT ||
++        (info.Protect & (PAGE_NOACCESS | PAGE_GUARD))) return false;
++    const auto at = reinterpret_cast<std::uintptr_t>(address);
++    return bytes <= info.RegionSize && at >= reinterpret_cast<std::uintptr_t>(info.BaseAddress) &&
++        at - reinterpret_cast<std::uintptr_t>(info.BaseAddress) <= info.RegionSize - bytes;
++}
++unsigned char* Pointer(const void* p) {
++    return Readable(p, 8) ? *reinterpret_cast<unsigned char* const*>(p) : nullptr;
++}
++void PublishIdentity(std::uint32_t id) {
++    const bool known = std::any_of(std::begin(CarCatalog), std::end(CarCatalog),
++                                  [id](const auto& entry) { return entry.id == id; });
++    std::lock_guard lock(identity_mutex);
++    if (!known) { current_car.store(0); candidate_car = 0; candidate_count = 0; return; }
++    if (id != candidate_car) { candidate_car = id; candidate_count = 1; current_car.store(0); }
++    else if (candidate_count < 3) ++candidate_count;
++    if (candidate_count >= 3) { current_car.store(id); car_updated.store(Milliseconds()); }
++}
++std::uintptr_t NativeMethod(void* object, unsigned offset) {
++    auto* table = Pointer(object);
++    if (!Readable(table, offset + 8)) return 0;
++    const auto fn = *reinterpret_cast<const std::uintptr_t*>(table + offset);
++    return fn >= image + 0x10000 && fn < image + 0x1d00000 ? fn : 0;
++}
++void ObserveContext(void* camera, float* view, void* context) {
++    // BaseCamera::prepare (8a5560) uses context+8 as IRaceStatus and
++    // view+bc as the viewed car index. The context is a stack structure:
++    // 85d75d/85d765 writes Impl+48 to context+28. Impl+98 is the owner
++    // back-pointer (85ca30). Neither address comes from a script global.
++    auto* ctx = static_cast<unsigned char*>(context);
++    if (!Readable(ctx, 0x30) || !Readable(view, 0xe0)) return;
++    const auto member = *reinterpret_cast<const std::uintptr_t*>(ctx + 0x28);
++    auto* impl = member >= 0x48 ? reinterpret_cast<unsigned char*>(member - 0x48) : nullptr;
++    auto* control = Readable(impl, 0xa0) ? *reinterpret_cast<unsigned char**>(impl + 0x98) : nullptr;
++    if (!Readable(control, 16) || *reinterpret_cast<std::uintptr_t*>(control) != image + 0x2877ae8 ||
++        *reinterpret_cast<unsigned char**>(control + 8) != impl) return;
++    if (*reinterpret_cast<int*>(reinterpret_cast<unsigned char*>(view) + 0xc4) != 0) return;
++    active_control = control; active_camera = camera; active_updated = Milliseconds();
++    auto* race = *reinterpret_cast<unsigned char**>(ctx + 8);
++    const int index = *reinterpret_cast<int*>(reinterpret_cast<unsigned char*>(view) + 0xbc);
++    auto* race_table = Pointer(race);
++    if (!Readable(race_table, 0x60)) { PublishIdentity(0); return; }
++    const auto get_status = *reinterpret_cast<std::uintptr_t*>(race_table + 0x58);
++    const auto get_count = *reinterpret_cast<std::uintptr_t*>(race_table + 0x28);
++    using Count = int(__attribute__((sysv_abi)) *)(void*);
++    using Status = void*(__attribute__((sysv_abi)) *)(void*, int);
++    using Code = std::uint32_t(__attribute__((sysv_abi)) *)(void*);
++    if (get_status < image + 0x10000 || get_status >= image + 0x1d00000 ||
++        get_count < image + 0x10000 || get_count >= image + 0x1d00000 ||
++        index < 0 || index >= 128) { PublishIdentity(0); return; }
++    const auto count = reinterpret_cast<Count>(get_count)(race);
++    if (count <= index || count > 128) { PublishIdentity(0); return; }
++    auto* car = reinterpret_cast<Status>(get_status)(race, index);
++    const auto get_code = NativeMethod(car, 0xd8);
++    if (!get_code) { PublishIdentity(0); return; }
++    const auto id = reinterpret_cast<Code>(get_code)(car);
++    ++native_samples; observed_car_id.store(id);
++    PublishIdentity(id);
++}
++using PrepareFunction = std::uintptr_t(__attribute__((sysv_abi)) *)(void*, float*, void*, void*, float);
++std::uintptr_t __attribute__((sysv_abi)) PrepareView(void* camera, float* view, void* context, void* input, float dt) {
++    const auto result = reinterpret_cast<PrepareFunction>(image + 0x8a5560)(camera, view, context, input, dt);
++    if (result) ObserveContext(camera, view, context);
++    return result;
++}
++bool TerrainAvailable() {
++    auto global = reinterpret_cast<void***>(image + 0x2bf5e48);
++    if (!Readable(global, 8) || !Readable(*global, 8) || !Readable(**global, 0x25b8)) return false;
++    auto* root = reinterpret_cast<unsigned char*>(**global);
++    if (*reinterpret_cast<std::uintptr_t*>(root) != image + 0x2854348) return false;
++    auto* course = *reinterpret_cast<unsigned char**>(root + 0x25b0);
++    return Readable(course, 0x670) && *reinterpret_cast<std::uintptr_t*>(course + 0x660) == image + 0x2896278;
++}
++void ProcessViewRequest() {
++    if (!request_pending.load(std::memory_order_acquire)) return;
++    ViewRequest pending;
++    { std::lock_guard lock(request_mutex); pending = request; request.view = -1; request_pending.store(false, std::memory_order_relaxed); }
++    if (pending.view < 0 || pending.view >= 4 || !runtime_ready ||
++        (pending.car && CurrentCar() != pending.car) || Milliseconds() - pending.timestamp > 2000) return;
++    // Use the owner observed in this camera thread, not the general script reference.
++    auto ptr = Pointer;
++    auto* control = static_cast<unsigned char*>(active_control);
++    if (Milliseconds() - active_updated > 250) return;
++    if (!Readable(control, 16) || *reinterpret_cast<std::uintptr_t*>(control) != image + 0x2877ae8) return;
++    auto* implementation = ptr(control + 8);
++    auto* data = Readable(implementation, 0xe8) ? ptr(implementation + 0xe0) : nullptr;
++    if (!Readable(data, 16) || reinterpret_cast<std::uintptr_t>(ptr(data)) != image + 0x28785f8) return;
++    auto* data_impl = ptr(data + 8);
++    auto* switcher = Readable(data_impl, 0x48) ? ptr(data_impl + 0x40) : nullptr;
++    // +40 points to plain per-window state records (stride 0x88), not a polymorphic object.
++    if (!Readable(switcher, 0x88)) return;
++    // Scenario names and view types are defined in camera_util.ad's onboard_list.
++    constexpr const char* scenarios[] = {"incar", "chase", "driver", "bonnet"};
++    using NameCode = std::uint64_t(__attribute__((sysv_abi)) *)(const char*);
++    using Select = void(__attribute__((sysv_abi)) *)(void*, int, std::uint64_t, bool);
++    const auto code = reinterpret_cast<NameCode>(image + 0x866320)(scenarios[pending.view]);
++    // Validate a matching scenario before calling the native selector; no guessed indices.
++    auto* list = ptr(switcher + 0x30);
++    auto* begin = Readable(list, 0x18) ? ptr(list + 8) : nullptr;
++    auto* end = Readable(list, 0x18) ? ptr(list + 0x10) : nullptr;
++    const auto first = reinterpret_cast<std::uintptr_t>(begin), last = reinterpret_cast<std::uintptr_t>(end);
++    if (!first || last < first || last - first > 0x10000 || (last - first) % 32 || !Readable(begin, last - first)) return;
++    bool found = false;
++    for (auto at = first; at < last; at += 32) if (*reinterpret_cast<std::uint64_t*>(at) == code) found = true;
++    if (found) reinterpret_cast<Select>(image + 0x8657b0)(switcher, 0, code, true);
++}
++void ResetData(Hook& hook) {
++    hook.data.fill(0);
++    auto* b = hook.data.data(); auto* p = reinterpret_cast<float*>(b);
++    p[11] = p[13] = p[17] = p[19] = 1; p[49] = 0.45f;
++    *reinterpret_cast<std::uintptr_t*>(b + 200) = image + 0x2bf5e48;
++    *reinterpret_cast<std::uintptr_t*>(b + 208) = image + 0x2854348;
++    *reinterpret_cast<std::uintptr_t*>(b + 216) = image + 0x2896278;
++    *reinterpret_cast<std::uintptr_t*>(b + 224) = image + 0xa91990;
++    *reinterpret_cast<QueryClock*>(b + 128) = reinterpret_cast<QueryClock>(&QueryPerformanceCounter);
++    QueryPerformanceFrequency(reinterpret_cast<LARGE_INTEGER*>(b + 136));
++    hook.minimum.store(-5, std::memory_order_relaxed);
++}
++void Offset(float* view, float height, float forward) {
++    const float x = view[4], y = view[5], z = view[6], w = view[7], backward = -forward;
++    view[0] += 2 * (x*z + w*y) * backward;
++    view[1] += 2 * (y*z - w*x) * backward + height;
++    view[2] += (1 - 2 * (x*x + y*y)) * backward;
++}
++template<View camera>
++std::uintptr_t __attribute__((sysv_abi)) CameraView(void* a, void* b, void* c, float* view, std::uintptr_t flags) {
++    constexpr unsigned index = static_cast<unsigned>(camera);
++    auto& hook = hooks[index];
++    const auto car = CurrentCar();
++    const auto settings = Presets().Effective(car, camera);
++    const bool valid = Readable(view, 0xe0);
++    std::array<float, 4> anchor{};
++    std::array<unsigned char, 8> look_back{};
++    if (valid) std::memcpy(anchor.data(), view, 16);
++    if constexpr (camera == View::Chase) {
++        if (valid && settings.orbit) {
++            // Suppress only this chase invocation's native look-back, then restore its flags.
++            std::memcpy(look_back.data(), reinterpret_cast<unsigned char*>(view) + 0xd8, 8);
++            std::memset(reinterpret_cast<unsigned char*>(view) + 0xd8, 0, 8);
++        }
++    }
++    const auto result = reinterpret_cast<ViewFunction>(image + hook.original)(a, b, c, view, flags);
++    if constexpr (camera == View::Chase) {
++        if (valid && settings.orbit) std::memcpy(reinterpret_cast<unsigned char*>(view) + 0xd8, look_back.data(), 8);
++    }
++    if (!valid) return result;
++    if (a == active_camera && Milliseconds() - active_updated <= 250) {
++        current_view.store(camera, std::memory_order_relaxed);
++        view_updated.store(Milliseconds(), std::memory_order_release);
++    }
++    ++camera_frames;
++    // The native onboard callback establishes that there is an active camera. Identity is
++    // needed only for per-car presets, not for global edits or camera selection. Delay the
++    // selector until this callback has finished and released the camera state lock.
++    struct DispatchRequest { void* object; ~DispatchRequest() { if (object == active_camera) ProcessViewRequest(); } } dispatch{a};
++    if (std::isfinite(view[22]) && view[22] > 0 && view[22] < 180) hook.native_fov.store(view[22]);
++    if (settings.fov != 0) view[22] = settings.fov;
++    if constexpr (camera == View::Cockpit) {
++        Offset(view, settings.height, settings.distance);
++    } else {
++        std::lock_guard lock(hook.mutex);
++        if constexpr (camera == View::Bumper || camera == View::Roof) {
++            // Default views pass through without terrain work while the UI is closed.
++            // Opening the UI still refreshes the live minimum-height slider limit.
++            if (settings.height == 0 && settings.distance == 0 && !OverlayOpen()) return result;
++        }
++        if constexpr (camera == View::Chase) {
++            // With no position/orbit override the original chase view must pass through
++            // unchanged. Avoid a terrain query or correction of the native camera.
++            if (!settings.orbit && settings.height == 0 && settings.distance == 0) {
++                if (hook.data[100]) ResetData(hook);
++                return result;
++            }
++        }
++        const auto now = Milliseconds();
++        if (hook.car != car || now - hook.last_frame > 250) { ResetData(hook); hook.car = car; }
++        hook.last_frame = now;
++        auto* data = hook.data.data(); auto* p = reinterpret_cast<float*>(data);
++        data[0] = 0; // FOV is applied separately; keep native FOV observation independent.
++        data[12] = settings.height != 0 || settings.distance != 0;
++        p[4] = settings.height; p[5] = camera == View::Bumper ? 0 : settings.distance;
++        if constexpr (camera == View::Chase) {
++            float native[8]; std::memcpy(native, view, sizeof(native));
++            data[192] = 1;
++            if (!TerrainAvailable()) return result;
++            Offset(view, settings.height, settings.distance);
++            data[40] = data[65] = data[100] = settings.orbit;
++            Stick input;
++            { std::lock_guard input_lock(input_mutex); input = stick; }
++            p[26] = input.x; p[27] = input.y; p[28] = OrbitDegreesPerSecond(settings.sensitivity);
++            p[29] = settings.smoothing_ms; p[30] = settings.return_seconds;
++            data[124] = settings.auto_return; data[125] = settings.invert_x; data[126] = settings.invert_y;
++            data[127] = input.focused && now - input.updated < 200;
++            QueryPerformanceCounter(reinterpret_cast<LARGE_INTEGER*>(data + 176));
++            // Disabling orbit also resets previous angles, so enabling it again starts behind the car.
++            if (!settings.orbit) { p[38] = p[39] = p[40] = p[41] = p[42] = 0; *reinterpret_cast<i64*>(data + 144) = 0; }
++            orbit_apply(view, data, anchor.data(), native);
++        } else {
++            if (!TerrainAvailable()) return result;
++            roof_apply(view, data);
++            if (data[193] >= 2 && std::isfinite(p[8])) hook.minimum.store(p[8]);
++        }
++    }
++    return result;
++}
++std::filesystem::path GamePath() {
++    std::wstring file(32768, L'\0');
++    DWORD length = GetModuleFileNameW(nullptr, file.data(), static_cast<DWORD>(file.size()));
++    if (!length || length >= file.size()) throw std::runtime_error("Cannot locate the game executable.");
++    file.resize(length); return std::filesystem::path(file);
++}
++std::string ExecutableHash(const std::filesystem::path& path) {
++    BCRYPT_ALG_HANDLE algorithm{}; BCRYPT_HASH_HANDLE hash{};
++    if (BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0) < 0) return {};
++    if (BCryptCreateHash(algorithm, &hash, nullptr, 0, nullptr, 0, 0) < 0) { BCryptCloseAlgorithmProvider(algorithm, 0); return {}; }
++    std::ifstream input(path, std::ios::binary); std::array<unsigned char, 65536> buffer{};
++    bool good = input.is_open();
++    while (good && input) {
++        input.read(reinterpret_cast<char*>(buffer.data()), buffer.size());
++        if (input.gcount() && BCryptHashData(hash, buffer.data(), static_cast<ULONG>(input.gcount()), 0) < 0) good = false;
++    }
++    good = good && !input.bad();
++    unsigned char digest[32]{}; good &= BCryptFinishHash(hash, digest, sizeof(digest), 0) >= 0;
++    BCryptDestroyHash(hash); BCryptCloseAlgorithmProvider(algorithm, 0);
++    if (!good) return {};
++    std::ostringstream out; out << std::hex << std::setfill('0');
++    for (auto byte : digest) out << std::setw(2) << unsigned(byte);
++    return out.str();
++}
++}
++Store& Presets() { static Store store(GamePath().parent_path() / L"user" / L"camera_presets.json"); return store; }
++void RequestView(View view) {
++    std::lock_guard lock(request_mutex); request = {static_cast<int>(view), CurrentCar(), Milliseconds()};
++    request_pending.store(true, std::memory_order_release);
++}
++std::uint32_t CurrentCar() { return Milliseconds() - car_updated.load() <= 1500 ? current_car.load() : 0; }
++View CurrentView() {
++    return Milliseconds() - view_updated.load(std::memory_order_acquire) <= 1500
++        ? current_view.load(std::memory_order_relaxed) : View::Count;
++}
++std::string CarName(std::uint32_t id) {
++    for (const auto& entry : CarCatalog) if (entry.id == id) return std::string(entry.name) + " (ID " + std::to_string(id) + ")";
++    return "Unknown vehicle";
++}
++void PublishStick(float x, float y, bool focused) {
++    std::lock_guard lock(input_mutex); stick = {x, y, focused, Milliseconds()};
++}
++float NativeFov(View view) { return hooks[static_cast<unsigned>(view)].native_fov.load(); }
++float MinimumHeight(View view) { return hooks[static_cast<unsigned>(view)].minimum.load(); }
++std::string RuntimeStatus() { std::lock_guard lock(runtime_mutex); return status; }
++std::string RuntimeDiagnostics() {
++    return "Camera callbacks: " + std::to_string(camera_frames.load()) +
++        " | Native vehicle samples: " + std::to_string(native_samples.load()) +
++        " | Raw ID: " + std::to_string(observed_car_id.load());
++}
++void InitializeRuntime() {
++    static std::once_flag once;
++    std::call_once(once, [] {
++        std::lock_guard lock(runtime_mutex);
++        try {
++            std::string error;
++            const bool loaded = Presets().Load(error);
++            if (ExecutableHash(GamePath()) != "0ce4473880d70102375f05f679828ddf91466acffd1d7ff24ab7901e5597b525") {
++                status = "Unsupported game executable. Camera overrides were not installed."; return;
++            }
++            image = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
++            constexpr ViewFunction functions[] = {&CameraView<View::Cockpit>, &CameraView<View::Chase>, &CameraView<View::Bumper>, &CameraView<View::Roof>};
++            struct Patch { std::uintptr_t slot, original; void* replacement; };
++            std::array<Patch, 8> patches{};
++            for (unsigned i = 0; i < hooks.size(); ++i) {
++                ResetData(hooks[i]);
++                patches[i] = {hooks[i].slot, hooks[i].original, reinterpret_cast<void*>(functions[i])};
++                patches[i + 4] = {hooks[i].slot - 0x50, 0x8a5560, reinterpret_cast<void*>(&PrepareView)};
++            }
++            // Preflight final-view and prepare-view methods before changing any pointer.
++            for (auto& hook : patches) {
++                auto** slot = reinterpret_cast<void**>(image + hook.slot);
++                const unsigned char prologue[]{0x55, 0x48, 0x89, 0xe5};
++                if (!Readable(slot, 8) || reinterpret_cast<std::uintptr_t>(*slot) != image + hook.original ||
++                    !Readable(reinterpret_cast<void*>(image + hook.original), 4) ||
++                    std::memcmp(reinterpret_cast<void*>(image + hook.original), prologue, 4)) {
++                    status = "Camera hook conflict. Close external camera test tools and restart the game."; return;
++                }
++            }
++            unsigned installed = 0;
++            for (; installed < patches.size(); ++installed) {
++                auto& hook = patches[installed];
++                auto* slot = reinterpret_cast<void**>(image + hook.slot); DWORD protection{};
++                if (!VirtualProtect(slot, 8, PAGE_READWRITE, &protection)) break;
++                auto expected = reinterpret_cast<void*>(image + hook.original);
++                auto observed = InterlockedCompareExchangePointer(slot, hook.replacement, expected);
++                DWORD ignored{}; VirtualProtect(slot, 8, protection, &ignored);
++                if (observed != expected) break;
++            }
++            if (installed != patches.size()) {
++                for (unsigned i = 0; i < installed; ++i) {
++                    auto* slot = reinterpret_cast<void**>(image + patches[i].slot); DWORD protection{};
++                    if (VirtualProtect(slot, 8, PAGE_READWRITE, &protection)) {
++                        InterlockedCompareExchangePointer(slot, reinterpret_cast<void*>(image + patches[i].original), patches[i].replacement);
++                        DWORD ignored{}; VirtualProtect(slot, 8, protection, &ignored);
++                    }
++                }
++                status = "Could not install all camera hooks. Camera integration is unavailable."; return;
++            }
++            status = loaded ? "Camera controls ready." : "Camera controls ready. Presets could not be loaded: " + error;
++            runtime_ready.store(true);
++        } catch (const std::exception& e) { status = e.what(); }
++    });
++}
++} // namespace Ryty::Camera
+diff --git a/ryty_gpu/ryty_camera_settings.cpp b/ryty_gpu/ryty_camera_settings.cpp
+new file mode 100644
+index 00000000..4350b3d0
+--- /dev/null
++++ b/ryty_gpu/ryty_camera_settings.cpp
+@@ -0,0 +1,181 @@
++#include "ryty_gpu/ryty_camera_settings.h"
++#include <fstream>
++#ifdef _WIN32
++#define WIN32_LEAN_AND_MEAN
++#define NOMINMAX
++#include <windows.h>
++#endif
++
++namespace Ryty::Camera {
++namespace {
++float Bound(float x, float lo, float hi, float fallback = 0) {
++    return std::isfinite(x) ? std::clamp(x, lo, hi) : fallback;
++}
++nlohmann::json EncodeSettings(const Settings& v) {
++    return {{"fov", v.fov}, {"height", v.height}, {"distance", v.distance},
++            {"orbit", v.orbit}, {"auto_return", v.auto_return}, {"invert_x", v.invert_x},
++            {"invert_y", v.invert_y}, {"sensitivity", v.sensitivity},
++            {"smoothing_ms", v.smoothing_ms}, {"return_seconds", v.return_seconds}};
++}
++Settings ReadSettings(const nlohmann::json& j, View view, bool legacy_sensitivity) {
++    if (!j.is_object()) throw std::runtime_error("Camera settings must be an object.");
++    Settings s;
++    const auto number = [&](const char* key, float& v) {
++        if (j.contains(key)) { if (!j[key].is_number()) throw std::runtime_error("Invalid numeric setting."); v = j[key].get<float>(); }
++    };
++    const auto flag = [&](const char* key, bool& v) {
++        if (j.contains(key)) { if (!j[key].is_boolean()) throw std::runtime_error("Invalid switch setting."); v = j[key].get<bool>(); }
++    };
++    number("fov", s.fov); number("height", s.height); number("distance", s.distance);
++    number("sensitivity", s.sensitivity); number("smoothing_ms", s.smoothing_ms);
++    number("return_seconds", s.return_seconds);
++    flag("orbit", s.orbit); flag("auto_return", s.auto_return);
++    flag("invert_x", s.invert_x); flag("invert_y", s.invert_y);
++    if (legacy_sensitivity && s.sensitivity == 1.f) s.sensitivity = 0;
++    return Sanitize(s, view);
++}
++}
++Settings Sanitize(Settings v) {
++    v.fov = v.fov == 0 ? 0 : Bound(v.fov, 30, 100);
++    v.height = Bound(v.height, -5, 5); v.distance = Bound(v.distance, -5, 5);
++    v.sensitivity = Bound(v.sensitivity, -15, 15, 0);
++    v.smoothing_ms = Bound(v.smoothing_ms, 0, 1000, 100);
++    v.return_seconds = Bound(v.return_seconds, 0, 10, 2);
++    return v;
++}
++Settings Sanitize(Settings v, View view) {
++    v = Sanitize(v);
++    const auto limit = Limits(view);
++    v.height = Bound(v.height, limit.height_min, limit.height_max);
++    v.distance = Bound(v.distance, limit.distance_min, limit.distance_max);
++    return v;
++}
++nlohmann::json Encode(const Document& d) {
++    nlohmann::json j{{"version", 1}, {"sensitivity_scale", 2}, {"global", nlohmann::json::object()}, {"cars", nlohmann::json::object()}};
++    const auto& a = d.appearance;
++    j["appearance"] = {{"theme_version", 2}, {"scale", a.scale}, {"font_size", a.font_size}, {"opacity", a.opacity}, {"background", a.background}, {"accent", a.accent},
++        {"x", a.x}, {"y", a.y}, {"width", a.width}, {"height", a.height}};
++    for (unsigned i = 0; i < Keys.size(); ++i) j["global"][Keys[i]] = EncodeSettings(d.global[i]);
++    for (const auto& [id, car] : d.cars) {
++        auto& c = j["cars"][std::to_string(id)]; c = nlohmann::json::object();
++        for (unsigned i = 0; i < Keys.size(); ++i) if (car.enabled[i]) c[Keys[i]] = EncodeSettings(car.views[i]);
++    }
++    return j;
++}
++bool Decode(const nlohmann::json& j, Document& result, std::string& error) {
++    try {
++        if (!j.is_object() || j.value("version", 0) != 1) throw std::runtime_error("Unsupported camera preset version.");
++        const int sensitivity_scale = j.value("sensitivity_scale", 1);
++        if (sensitivity_scale != 1 && sensitivity_scale != 2) throw std::runtime_error("Unsupported sensitivity scale.");
++        Document next;
++        if (j.contains("appearance")) {
++            const auto& a = j["appearance"];
++            if (!a.is_object()) throw std::runtime_error("Invalid appearance settings.");
++            auto& v = next.appearance;
++            v.scale = Bound(a.value("scale", v.scale), 0.65f, 2.0f, 1);
++            v.font_size = Bound(a.value("font_size", v.font_size), 12, 32, 17);
++            v.opacity = Bound(a.value("opacity", v.opacity), 0.15f, 1, 0.94f);
++            v.background = a.value("background", v.background); v.accent = a.value("accent", v.accent);
++            v.x = Bound(a.value("x", v.x), 0, 1, 0.10f); v.y = Bound(a.value("y", v.y), 0, 1, 0.04f);
++            v.width = Bound(a.value("width", v.width), 0.2f, 1, 0.80f);
++            v.height = Bound(a.value("height", v.height), 0.15f, 1, 0.34f);
++            for (auto& c : v.background) c = Bound(c, 0, 1);
++            for (auto& c : v.accent) c = Bound(c, 0, 1);
++            // Migrate the first prototype's exact default palette, preserving deliberate custom colors.
++            const auto same_color = [](float x, float y) { return std::abs(x - y) < 0.00001f; };
++            if (a.value("theme_version", 0) < 2 && same_color(v.background[0], .055f) &&
++                same_color(v.background[1], .06f) && same_color(v.background[2], .075f) &&
++                same_color(v.accent[0], .9f) && same_color(v.accent[1], .12f) && same_color(v.accent[2], .19f)) {
++                const Document::Appearance defaults;
++                v.background = defaults.background; v.accent = defaults.accent;
++                if (same_color(v.opacity, .94f)) v.opacity = defaults.opacity;
++            }
++        }
++        if (j.contains("global")) {
++            if (!j["global"].is_object()) throw std::runtime_error("Invalid global settings.");
++            for (unsigned i = 0; i < Keys.size(); ++i) if (j["global"].contains(Keys[i])) next.global[i] = ReadSettings(j["global"][Keys[i]], static_cast<View>(i), sensitivity_scale == 1);
++        }
++        if (j.contains("cars")) {
++            if (!j["cars"].is_object()) throw std::runtime_error("Invalid car presets.");
++            for (const auto& [key, car] : j["cars"].items()) {
++                if (key.empty() || key.size() > 10 || key.find_first_not_of("0123456789") != std::string::npos || !car.is_object()) throw std::runtime_error("Invalid car ID.");
++                auto id = std::stoull(key);
++                if (id == 0 || id > UINT32_MAX || key != std::to_string(id)) throw std::runtime_error("Invalid car ID.");
++                CarPreset entry;
++                for (unsigned i = 0; i < Keys.size(); ++i) if (car.contains(Keys[i])) { entry.views[i] = ReadSettings(car[Keys[i]], static_cast<View>(i), sensitivity_scale == 1); entry.enabled[i] = true; }
++                next.cars.emplace(static_cast<std::uint32_t>(id), entry);
++            }
++        }
++        result = std::move(next); error.clear(); return true;
++    } catch (const std::exception& e) { error = e.what(); return false; }
++}
++Document Store::Read() const { std::lock_guard lock(mutex); return document; }
++Document::Appearance Store::ReadAppearance() const { std::lock_guard lock(mutex); return document.appearance; }
++Settings Store::ReadGlobal(View view) const {
++    std::lock_guard lock(mutex); const auto i = static_cast<unsigned>(view);
++    return i < Names.size() ? document.global[i] : Settings{};
++}
++CarPreset Store::ReadCar(std::uint32_t car) const {
++    std::lock_guard lock(mutex); const auto it = document.cars.find(car);
++    return it == document.cars.end() ? CarPreset{} : it->second;
++}
++Settings Store::Effective(std::uint32_t car, View view) const {
++    std::lock_guard lock(mutex); auto i = static_cast<unsigned>(view);
++    if (i >= Names.size()) return {};
++    auto it = document.cars.find(car);
++    return it != document.cars.end() && it->second.enabled[i] ? it->second.views[i] : document.global[i];
++}
++void Store::SetGlobal(View view, Settings v) {
++    auto i = static_cast<unsigned>(view); if (i >= Names.size()) return;
++    std::lock_guard lock(mutex); document.global[i] = Sanitize(v, view); ++revision;
++}
++void Store::SetAppearance(Document::Appearance a) {
++    a.scale = Bound(a.scale, 0.65f, 2, 1); a.font_size = Bound(a.font_size, 12, 32, 17);
++    a.opacity = Bound(a.opacity, 0.15f, 1, 0.94f);
++    for (auto& c : a.background) c = Bound(c, 0, 1);
++    for (auto& c : a.accent) c = Bound(c, 0, 1);
++    a.x = Bound(a.x, 0, 1, 0.10f); a.y = Bound(a.y, 0, 1, 0.04f);
++    a.width = Bound(a.width, 0.2f, 1, 0.80f); a.height = Bound(a.height, 0.15f, 1, 0.34f);
++    std::lock_guard lock(mutex); document.appearance = a; ++revision;
++}
++void Store::SetCar(std::uint32_t car, View view, Settings v) {
++    auto i = static_cast<unsigned>(view); if (!car || i >= Names.size()) return;
++    std::lock_guard lock(mutex); auto& c = document.cars[car]; c.enabled[i] = true; c.views[i] = Sanitize(v, view); ++revision;
++}
++void Store::UseGlobal(std::uint32_t car, View view) {
++    auto i = static_cast<unsigned>(view); if (i >= Names.size()) return;
++    std::lock_guard lock(mutex); auto it = document.cars.find(car);
++    if (it == document.cars.end()) return;
++    it->second.enabled[i] = false;
++    if (std::none_of(it->second.enabled.begin(), it->second.enabled.end(), [](bool v) { return v; })) document.cars.erase(it);
++    ++revision;
++}
++void Store::RestoreDefaults(std::uint32_t car, View view) { if (car) SetCar(car, view, {}); else SetGlobal(view, {}); }
++bool Store::Dirty() const { std::lock_guard lock(mutex); return revision != saved_revision; }
++bool Store::Load(std::string& error) {
++    try {
++        if (!std::filesystem::exists(path)) { error.clear(); return true; }
++        std::ifstream in(path); if (!in) throw std::runtime_error("Cannot read camera presets.");
++        Document next; auto json = nlohmann::json::parse(in);
++        if (!Decode(json, next, error)) return false;
++        std::lock_guard lock(mutex); document = std::move(next); ++revision; saved_revision = revision;
++        error.clear(); return true;
++    } catch (const std::exception& e) { error = e.what(); return false; }
++}
++bool Store::Save(std::string& error) {
++    try {
++        Document snapshot; std::uint64_t version;
++        { std::lock_guard lock(mutex); snapshot = document; version = revision; }
++        if (!path.parent_path().empty()) std::filesystem::create_directories(path.parent_path());
++        auto temporary = path; temporary += ".tmp";
++        { std::ofstream out(temporary, std::ios::binary | std::ios::trunc); out.exceptions(std::ios::badbit | std::ios::failbit); out << Encode(snapshot).dump(2) << '\n'; out.flush(); out.close(); }
++#ifdef _WIN32
++        if (!MoveFileExW(temporary.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) throw std::runtime_error("Cannot replace camera preset file.");
++#else
++        std::filesystem::rename(temporary, path);
++#endif
++        { std::lock_guard lock(mutex); saved_revision = version; }
++        error.clear(); return true;
++    } catch (const std::exception& e) { error = e.what(); return false; }
++}
++} // namespace Ryty::Camera
+diff --git a/ryty_gpu/ryty_camera_settings.h b/ryty_gpu/ryty_camera_settings.h
+new file mode 100644
+index 00000000..551575d2
+--- /dev/null
++++ b/ryty_gpu/ryty_camera_settings.h
+@@ -0,0 +1,83 @@
++#pragma once
++#include <algorithm>
++#include <array>
++#include <cmath>
++#include <cstdint>
++#include <filesystem>
++#include <map>
++#include <mutex>
++#include <string>
++#include <nlohmann/json.hpp>
++
++namespace Ryty::Camera {
++enum class View : unsigned { Cockpit, Chase, Bumper, Roof, Count };
++inline constexpr std::array<const char*, 4> Names{"Cockpit", "Chase", "Bumper", "Roof"};
++// Serialized keys remain stable for existing camera presets.
++inline constexpr std::array<const char*, 4> Keys{"Cockpit", "Chase", "Bumper", "Roof"};
++struct PositionLimits { float height_min, height_max, distance_min, distance_max; };
++constexpr PositionLimits Limits(View view) {
++    switch (view) {
++    case View::Cockpit: return {-.6f, .6f, -.6f, .6f};
++    case View::Chase: return {-1.f, 1.f, -3.f, 3.f};
++    case View::Bumper: return {-5.f, .55f, 0.f, 0.f};
++    case View::Roof: return {-.35f, .35f, -1.f, 1.f};
++    default: return {};
++    }
++}
++struct Settings {
++    // Zero means the original, car-specific FOV. Never invent a default angle.
++    float fov = 0, height = 0, distance = 0;
++    bool orbit = false, auto_return = true, invert_x = false, invert_y = false;
++    float sensitivity = 0, smoothing_ms = 100, return_seconds = 2;
++    bool operator==(const Settings&) const = default;
++};
++inline float OrbitDegreesPerSecond(float sensitivity) {
++    const float value = std::isfinite(sensitivity) ? std::clamp(sensitivity, -15.f, 15.f) : 0.f;
++    return 120.f * (value < 0 ? 1.f + value / 20.f : 1.f + value / 15.f);
++}
++struct CarPreset {
++    std::array<bool, 4> enabled{};
++    std::array<Settings, 4> views{};
++    bool operator==(const CarPreset&) const = default;
++};
++struct Document {
++    struct Appearance {
++        float scale = 1, font_size = 17, opacity = 0.97f;
++        std::array<float, 3> background{30/255.0f, 30/255.0f, 30/255.0f};
++        std::array<float, 3> accent{178/255.0f, 24/255.0f, 36/255.0f};
++        // Relative to the usable viewport; independent of resolution and DPI.
++        float x = 0.10f, y = 0.04f, width = 0.80f, height = 0.34f;
++        bool operator==(const Appearance&) const = default;
++    } appearance;
++    std::array<Settings, 4> global{};
++    std::map<std::uint32_t, CarPreset> cars;
++    bool operator==(const Document&) const = default;
++};
++Settings Sanitize(Settings value);
++Settings Sanitize(Settings value, View view);
++nlohmann::json Encode(const Document& document);
++bool Decode(const nlohmann::json& json, Document& result, std::string& error);
++// A single mutex protects document publication between the UI and guest camera callbacks.
++class Store {
++public:
++    explicit Store(std::filesystem::path file) : path(std::move(file)) {}
++    bool Load(std::string& error);
++    bool Save(std::string& error);
++    Document Read() const;
++    Document::Appearance ReadAppearance() const;
++    Settings ReadGlobal(View view) const;
++    CarPreset ReadCar(std::uint32_t car) const;
++    Settings Effective(std::uint32_t car, View view) const;
++    void SetGlobal(View view, Settings settings);
++    void SetAppearance(Document::Appearance appearance);
++    void SetCar(std::uint32_t car, View view, Settings settings);
++    void UseGlobal(std::uint32_t car, View view);
++    void RestoreDefaults(std::uint32_t car, View view);
++    bool Dirty() const;
++private:
++    std::filesystem::path path;
++    mutable std::mutex mutex;
++    Document document;
++    std::uint64_t revision = 0, saved_revision = 0;
++};
++} // namespace Ryty::Camera
+diff --git a/ryty_gpu/ryty_entry.cpp b/ryty_gpu/ryty_entry.cpp
+index ce88f1a2..26b40f2d 100644
+--- a/ryty_gpu/ryty_entry.cpp
++++ b/ryty_gpu/ryty_entry.cpp
+@@ -31,6 +31,7 @@
+ #include "ryty_gpu/ryty_framegen.h"
+ #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
+ #include "ryty_gpu/ryty_input_bridge.h"
++#include "ryty_gpu/ryty_camera.h"
+ #include "ryty_gpu/ryty_library.h"
+ #include "ryty_gpu/native/gts_hooks.h"
+ #include "ryty_gpu/native/image_registry.h"
+@@ -232,6 +233,7 @@ void DrawCompileNotice() {
+ 
+ void DrawFpsCounter() {
+     Ryty::DrawControllerOverlay();
++    Ryty::Camera::DrawOverlay();
+     DrawPrecompileProgress();
+     if (!Vulkan::GetPrecompileProgress().active) {
+         DrawCompileNotice();
+@@ -377,6 +379,9 @@ void StartHeapReport() {
+ 
+ void Ryty::RytyLibraryInitialize() {
+     InitializeCommon("shadgt_ryty.log");
++    // Camera file I/O, executable validation and hook setup belong to library startup,
++    // before the game runs camera callbacks, never to the per-frame overlay draw.
++    Camera::InitializeRuntime();
+     LOG_INFO(Lib_GnmDriver, "Ryty: starting shadGT renderer");
+     // shadGT's main() loads the player list (user/users.json, created with defaults when
+     // missing); a gamepad is only assigned to a player that exists ("User 1 not found").
+diff --git a/ryty_gpu/ryty_input_bridge.cpp b/ryty_gpu/ryty_input_bridge.cpp
+index 523ecbbf..3428aefc 100644
+--- a/ryty_gpu/ryty_input_bridge.cpp
++++ b/ryty_gpu/ryty_input_bridge.cpp
+@@ -29,6 +29,8 @@
+ #include "input/input_handler.h"
+ #include "video_core/renderdoc.h"
+ #include "ryty_gpu/ryty_input_bridge.h"
++#include "ryty_gpu/ryty_camera.h"
++#include "ryty_gpu/ryty_camera_input.h"
+ 
+ namespace {
+ 
+@@ -348,6 +350,11 @@ void ForwardInput() {
+             }
+             controller.SetTriggerFeedback(left, right, left_rumble, right_rumble);
+             const auto state = controller.ReadState();
++            if (slot == 0) {
++                DWORD foreground_pid{};
++                GetWindowThreadProcessId(GetForegroundWindow(), &foreground_pid);
++                Ryty::Camera::PublishStick(Ryty::Camera::NormalizeOrbitAxis(ClampAxis(state.axes[2])), Ryty::Camera::NormalizeOrbitAxis(ClampAxis(state.axes[3])), foreground_pid == GetCurrentProcessId());
++            }
+             RytyPadInputState input{};
+             input.buttons = static_cast<std::uint32_t>(state.buttonsState);
+             input.sticks = {ClampAxis(state.axes[0]), ClampAxis(state.axes[1]),
+diff --git a/src/sdl_window.cpp b/src/sdl_window.cpp
+index 649cd466..07e573bd 100644
+--- a/src/sdl_window.cpp
++++ b/src/sdl_window.cpp
+@@ -28,6 +28,10 @@
+ #include "input/input_handler.h"
+ #include "input/input_mouse.h"
+ #include "sdl_window.h"
++#ifdef RYTY_GPU
++#include "ryty_gpu/ryty_camera.h"
++#include "ryty_gpu/ryty_camera_input.h"
++#endif
+ #include "video_core/renderdoc.h"
+ 
+ #ifdef __APPLE__
+@@ -230,6 +234,43 @@ void WindowSDL::WaitEvent() {
+         return;
+     }
+ 
++#ifdef RYTY_GPU
++    if ((event.type == SDL_EVENT_KEY_DOWN || event.type == SDL_EVENT_KEY_UP) &&
++        event.key.scancode == SDL_SCANCODE_F4) {
++        if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat) {
++            const bool was_open = Ryty::Camera::OverlayOpen();
++            if (event.key.mod & SDL_KMOD_CTRL) Ryty::Camera::ResetOverlayLayout();
++            else Ryty::Camera::ToggleOverlay();
++            if (!was_open && Ryty::Camera::OverlayOpen()) {
++                // Release keyboard/mouse bindings held before opening, preserving
++                // all physical controller inputs in the binding system.
++                int count{};
++                const auto* keys = SDL_GetKeyboardState(&count);
++                for (int key = 0; key < count; ++key) if (keys[key]) {
++                    SDL_Event up{}; up.type = SDL_EVENT_KEY_UP;
++                    up.key.scancode = static_cast<SDL_Scancode>(key);
++                    up.key.key = SDL_GetKeyFromScancode(up.key.scancode, SDL_GetModState(), true);
++                    OnKeyboardMouseInput(&up);
++                }
++                const auto buttons = SDL_GetMouseState(nullptr, nullptr);
++                for (int button = 1; button <= 5; ++button) if (buttons & SDL_BUTTON_MASK(button)) {
++                    SDL_Event up{}; up.type = SDL_EVENT_MOUSE_BUTTON_UP;
++                    up.button.button = static_cast<Uint8>(button);
++                    OnKeyboardMouseInput(&up);
++                }
++            }
++        }
++        return;
++    }
++    if (event.type == SDL_EVENT_WINDOW_FOCUS_LOST) Ryty::Camera::CloseOverlay();
++    const auto route = Ryty::Camera::RouteInput(Ryty::Camera::OverlayOpen(), event.type);
++    if (route != Ryty::Camera::InputRoute::Normal) {
++        ImGui::Core::ProcessEvent(&event);
++        if (route == Ryty::Camera::InputRoute::ReleaseBinding) OnKeyboardMouseInput(&event);
++        else if (route == Ryty::Camera::InputRoute::Gamepad) OnGamepadEvent(&event);
++        return;
++    }
++#endif
+     if (Libraries::Mouse::PushSDLEvent(event) || Libraries::Keyboard::PushSDLEvent(event)) {
+         return;
+     }

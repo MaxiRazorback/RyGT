@@ -138,6 +138,22 @@ every GPU. 0058 reverts it; 0059 (FIX-188) brings its Intel Arc changes back beh
 `Instance::IsIntel()` (vendor 0x8086), so every other GPU runs what it ran before 0042-intel-arc.
 `ryty-gpu` and `linux-proton` have every patch through 0059 (commit `1d13c88d`).
 
+## Camera Manager
+
+`shadGT-patches/0065-in-game-camera-manager.patch` adds the in-game Camera Manager
+for Windows. It is a plain Git diff against shadGT
+`1d13c88d2e57bc63ce1586fe0b8f3342b6afdd19` on `ryty-gpu`; apply it with `git apply`
+on that checkout, then build the existing `ryty_gpu` target. Its native renderer
+and shader sources are unchanged. This patch follows the existing RyGT convention
+of carrying shadGT additions here; the shadGT source tree is not vendored into RyGT.
+
+The patch includes the dedicated camera sources, build integration and the host
+startup, overlay and input connections. It does not include compiled modules.
+Existing build options are retained; the camera target additionally links Windows
+`bcrypt` for executable validation.
+
+For controls, ranges and presets, see [Camera Manager](../docs/user/CAMERA_MANAGER.md).
+For the standalone Windows tests, see [camera-manager-tests](camera-manager-tests/README.md).
 ## Temporal FSR 3.1 and Intel XeSS (0063-0064)
 
 Patches 0063 and 0064 apply after 0062 (shadGT `ryty-gpu` at `1d13c88d` plus 0020, 0062 and
