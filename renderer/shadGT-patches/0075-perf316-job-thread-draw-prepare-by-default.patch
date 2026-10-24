@@ -1,0 +1,100 @@
+From c5986a460301c5df0167d0835a08caad3caa07c3 Mon Sep 17 00:00:00 2001
+From: MaxiRazorback <344630105+MaxiRazorback@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 03:08:06 -0300
+Subject: [PATCH] PERF-316: job threads prepare draws by default with the
+ native renderer
+
+OPT-010/012 measured on a Ryzen 5 5500 + RX 7600 in a Time Attack: 39.9 ->
+44.6 fps, 97.5% of draws prepared, decode 7.0 -> 5.6 ms a submission.
+RYGT_NATIVE_PREPARE=0 turns it off; it follows the launcher's renderer choice
+instead of needing RYGT_NATIVE=1.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ryty_gpu/native/shadow.cpp                    | 20 +++++++++----------
+ .../renderer_vulkan/vk_rasterizer_native.cpp  |  9 +++++++--
+ 2 files changed, 17 insertions(+), 12 deletions(-)
+
+diff --git a/ryty_gpu/native/shadow.cpp b/ryty_gpu/native/shadow.cpp
+index c55f271f..f82d9642 100644
+--- a/ryty_gpu/native/shadow.cpp
++++ b/ryty_gpu/native/shadow.cpp
+@@ -46,12 +46,12 @@ const bool g_compare = [] {
+     return env && env[0] == '1';
+ }();
+ // OPT-010: native mode prepares each draw's bindings on the job's thread (no comparisons).
+-const bool g_prepare = [] {
+-    const char* env = std::getenv("RYGT_NATIVE_PREPARE");
+-    const char* native = std::getenv("RYGT_NATIVE");
+-    return env && env[0] == '1' && native && native[0] == '1';
+-}();
+-const bool g_enabled = g_compare || g_prepare;
++// PERF-316: on whenever the native renderer is (launcher or RYGT_NATIVE); RYGT_NATIVE_PREPARE=0
++// turns it off. Decided at first use: the game's settings are not readable at load time.
++bool PrepareOn() {
++    static const bool on = Vulkan::NativeRenderer::PrepareEnabled();
++    return on;
++}
+ 
+ // The state compared at each draw (dword indices into Regs::reg_array): the graphics stages' SH
+ // registers (programs, user data; compute registers from 0x2E00 are kept apart by the command
+@@ -570,7 +570,7 @@ public:
+         std::shared_ptr<const void> pipeline_keepalive;
+         const char* miss = nullptr;
+         bool looked_up = false;
+-        if ((g_lookups || g_prepare) && state != nullptr && liverpool &&
++        if ((g_lookups || PrepareOn()) && state != nullptr && liverpool &&
+             liverpool->GetRasterizer()) {
+             // The walk's registers are the thread's draw state while the lookup runs.
+             state->cb_extent = extents.cb;
+@@ -581,7 +581,7 @@ public:
+             const Vulkan::GraphicsPipeline* found =
+                 rasterizer->LookupJobPipeline(pipeline_keepalive, &miss);
+             pipeline = found;
+-            if (found && g_prepare) {
++            if (found && PrepareOn()) {
+                 // OPT-010: the draw's bindings, worked out here for the recorder.
+                 if (auto* native = rasterizer->Native()) {
+                     const auto& infos = Vulkan::PipelineCache::JobInfos();
+@@ -859,7 +859,7 @@ std::atomic<bool> g_reporter_started{false};
+ } // namespace
+ 
+ bool ShadowEnabled() {
+-    return g_enabled;
++    return g_compare || PrepareOn();
+ }
+ 
+ bool ShadowComparing() {
+@@ -1053,7 +1053,7 @@ void ShadowJobDecode() {
+ }
+ 
+ void ShadowSubmitBase(const Regs& regs) {
+-    if (g_prepare && !g_reporter_started.exchange(true)) {
++    if (PrepareOn() && !g_reporter_started.exchange(true)) {
+         std::thread{ReporterLoop}.detach(); // OPT-010: the job walks' costs
+     }
+     ++g_epoch;
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp b/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp
+index 4bc5e35f..77b5bd1c 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp
+@@ -3645,9 +3645,14 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
+ }
+ 
+ bool NativeRenderer::PrepareEnabled() {
++    // PERF-316: on with the native renderer (+12% fps in a Time Attack on a Ryzen 5 5500 and
++    // RX 7600: the recorder records draws game job threads worked out). RYGT_NATIVE_PREPARE=0 or
++    // =1 overrides it.
+     static const bool enabled = [] {
+-        const char* env = std::getenv("RYGT_NATIVE_PREPARE");
+-        return env && env[0] == '1';
++        if (const char* env = std::getenv("RYGT_NATIVE_PREPARE"); env && *env) {
++            return env[0] == '1' && NativeModeRequested();
++        }
++        return NativeModeRequested();
+     }();
+     return enabled;
+ }
+-- 
+2.56.0.windows.2
+

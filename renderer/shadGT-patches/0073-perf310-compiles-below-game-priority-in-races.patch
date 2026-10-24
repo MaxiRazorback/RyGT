@@ -1,0 +1,79 @@
+From e404a51edf680e0ccc4e7d294179dff29da05e5d Mon Sep 17 00:00:00 2001
+From: MaxiRazorback <344630105+MaxiRazorback@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 01:01:41 -0300
+Subject: [PATCH] PERF-310: compiles run below the game's priority in
+ races
+
+On CPUs without efficiency cores, a burst of new shaders took 3-4 threads
+from GT Sport's job threads and the recorder (race 30 -> 12-17 fps).
+RYGT_COMPILE_PRIORITY=normal keeps them level.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../renderer_vulkan/vk_pipeline_cache.cpp     | 29 ++++++++++++++++++-
+ 1 file changed, 28 insertions(+), 1 deletion(-)
+
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index ec2d34aa..d888eb30 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -79,6 +79,27 @@ bool CompilationInProgress() {
+            g_shader_translations_running.load(std::memory_order_relaxed) != 0;
+ }
+ 
++#ifdef RYTY_GPU
++bool RytyGtsInRace(); // FIX-110, ryty_game_patch.cpp
++#endif
++
++// PERF-310: in a race, shader translations and pipeline builds run below the game's priority.
++// On CPUs without efficiency cores PERF-097 keeps nothing apart: a burst of new shaders on a
++// 6-core Ryzen took 3-4 threads from GT Sport's 12 job threads and the recorder, and the race
++// fell from 30 to 12-17 fps until it was done. Draws are skipped while their pipeline builds
++// (PERF-076), so the compiles only take longer. RYGT_COMPILE_PRIORITY=normal keeps them level.
++static bool CompileBelowGame() {
++#ifdef RYTY_GPU
++    static const bool enabled = [] {
++        const char* env = std::getenv("RYGT_COMPILE_PRIORITY");
++        return !(env && std::string_view{env} == "normal");
++    }();
++    return enabled && RytyGtsInRace();
++#else
++    return false;
++#endif
++}
++
+ static void ReportShaderAllocationFailure(Shader::HwStage stage, u64 hash, VAddr base,
+                                            size_t words, const char* phase) {
+     static thread_local u64 failures = 0;
+@@ -126,6 +147,7 @@ private:
+     void Run(std::stop_token stop, u32 index) {
+         Common::SetCurrentThreadName(fmt::format("shadGT:ShaderTranslate{}", index).c_str());
+         Common::PreferEfficiencyCores(); // PERF-097
++        bool below_game = false;
+         while (!stop.stop_requested()) {
+             std::shared_ptr<TranslateJob> job;
+             {
+@@ -137,6 +159,11 @@ private:
+                 job = std::move(queue.front());
+                 queue.pop_front();
+             }
++            if (const bool low = CompileBelowGame(); low != below_game) { // PERF-310
++                below_game = low;
++                Common::SetCurrentThreadPriority(low ? Common::ThreadPriority::Low
++                                                     : Common::ThreadPriority::Normal);
++            }
+             try {
+                 // Release temporary IR allocations after each job, including failed jobs.
+                 Shader::Pools pools;
+@@ -394,7 +421,7 @@ private:
+                     Common::PreferEfficiencyCores();
+                 }
+             }
+-            const bool low = !boosted && (background || backlog);
++            const bool low = !boosted && (background || backlog || CompileBelowGame());
+             if (low != low_priority) {
+                 low_priority = low;
+                 Common::SetCurrentThreadPriority(low_priority ? Common::ThreadPriority::Low
+-- 
+2.56.0.windows.2
+
