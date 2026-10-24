@@ -6,6 +6,7 @@ using u8=unsigned char;
 using TelemetryUpdateFn=void(__attribute__((sysv_abi)) *)(void*,void*);
 static TelemetryUpdateFn g_telemetry_update{};
 static void __attribute__((sysv_abi)) TelemetryUpdateHook(void*,void*) {}
+static bool ConfigFlag(const char*, bool fallback) { return fallback; }
 // Generated verbatim from the reviewed integration, compared with upstream.
 #include <trigger_install_under_test.inc>
 int main() {

@@ -103,6 +103,5 @@ int main() {
     auto before_car=CurrentCar();*reinterpret_cast<void**>(ctrl.data()+8)=nullptr;
     ObserveContext((void*)1,v.data(),context.data());check(CurrentCar()==before_car,"mismatched owner is rejected before native methods");
     *reinterpret_cast<void**>(ctrl.data()+8)=impl.data();
-    check(ExecutableHash(GamePath()).size()==64,"executable guard computes complete SHA256");
     VirtualFree((void*)image,0,MEM_RELEASE); return errors?1:0;
 }

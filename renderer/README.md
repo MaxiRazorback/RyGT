@@ -149,8 +149,8 @@ of carrying shadGT additions here; the shadGT source tree is not vendored into R
 
 The patch includes the dedicated camera sources, build integration and the host
 startup, overlay and input connections. It does not include compiled modules.
-Existing build options are retained; the camera target additionally links Windows
-`bcrypt` for executable validation.
+Existing build options are retained. Camera compatibility is checked using the
+mapped executable's camera signatures, sections and hook targets, not a whole-file hash.
 
 For controls, ranges and presets, see [Camera Manager](../docs/user/CAMERA_MANAGER.md).
 For the standalone Windows tests, see [camera-manager-tests](camera-manager-tests/README.md).
