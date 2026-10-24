@@ -289,3 +289,31 @@ The combined Release renderer built successfully and all 2,654 local import
 bindings resolved. Temporary allocation inventories, memory readers, capture
 helpers, experimental pool/trimming changes, diagnostic shaders, and compiled
 artifacts are excluded from both patches.
+
+Patch 0071 applies after 0070. Native fill-pattern buffers previously accumulated
+for every distinct fill value, and superseded buffers stayed alive indefinitely.
+Cache recent patterns within 64 MiB, keeping a single larger pattern only when
+that request requires it. Evicted and replaced buffers follow the existing RHI
+fence retirement so recorded GPU copies can finish safely.
+
+Read-only mirrors unused for more than 600 presented frames are also reclaimed
+through the existing binding invalidation, watch ownership, and GPU retirement
+paths. GPU-written regions and retained lighting/shadow images are unaffected.
+
+The pattern-cache regression covers exact budget boundaries, recent-key reuse,
+replacement, 1,000 changing values, oversized requests, and recovery below budget.
+The mirror regression covers idle boundaries and preservation of active mirrors.
+Four matched on-track loads in one Native process completed with correct rendering
+and performance: adapter VRAM was 3,839 MiB initially and 3,877 MiB on the fourth
+load, without the reported roughly 100 MiB increase on each reload. Fill-pattern
+storage settled at 50.9 MiB; the earlier unbounded run held 427.4 MiB plus 17.8 MiB
+of superseded buffers. Adapter readings include other GPU users and are not a
+measurement of game-only VRAM. Other allocation categories and unrelated rendering
+or device-lost failures remain separate investigations.
+
+The production-only Release renderer built successfully, all 2,655 checked local
+import bindings resolved, and patches 0069-0071 applied in sequence to the clean
+staging baseline.
+
+Only the production cache/lifetime changes are included. Curve traces, allocation
+inventories, capture helpers, diagnostic flags, and compiled artifacts are excluded.
