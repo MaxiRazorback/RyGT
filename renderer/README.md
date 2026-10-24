@@ -317,3 +317,24 @@ staging baseline.
 
 Only the production cache/lifetime changes are included. Curve traces, allocation
 inventories, capture helpers, diagnostic flags, and compiled artifacts are excluded.
+
+## Shader store version (0072)
+
+Patch 0072 (FIX-213) applies after 0071. Stored shader translations
+(`<RyGT folder>\shaders\<serial>-direct-sets`) load unchecked, so after an update
+that changes how shaders are translated, the store kept the old translations and
+drew with them. On an RX 7600 (driver 26.8.1) the update to PR #88 drew a magenta
+car and red scenery until the folder was deleted by hand, as 0060's note already
+asks for.
+
+The store now carries a version (`store-version.txt` inside it). A store without
+the current version is set aside as `<store>.outdated` and starts again, and the
+launcher's shader pack stamp (`shaders-pack.txt`) is removed with it, so the next
+Play prepares the shader pack into the new store. The first Play after the update
+translates the shaders again, which takes a few minutes once. Raise `StoreVersion`
+in `cache_storage.cpp` whenever a change makes stored translations wrong.
+
+On the RX 7600, deleting the store by hand made the colours right again; this patch
+does that step automatically. It was compiled with the Release flags; the automatic
+set-aside has not yet been run in the game. Only `cache_storage.cpp` changes; it is
+the same at shadGT `1d13c88d` and after patches 0020 and 0059-0071.

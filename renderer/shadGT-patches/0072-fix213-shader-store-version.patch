@@ -1,0 +1,78 @@
+From c0a5c099a5aa9f77d62287d0a1f59561e774557f Mon Sep 17 00:00:00 2001
+From: MaxiRazorback <344630105+MaxiRazorback@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 12:55:56 -0300
+Subject: [PATCH] FIX-213: the shader store has a version
+
+Stored translations load unchecked, so after an update that changes how
+shaders are translated the store kept the old translations and drew with
+them: a magenta car and red scenery on an RX 7600 after updating to PR #88,
+until the store folder was deleted by hand. A store without the current
+version is set aside as <store>.outdated and starts again; the launcher's
+shader pack stamp goes with it, so the next Play prepares the pack into the
+new store.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/video_core/cache_storage.cpp | 36 ++++++++++++++++++++++++++++++++
+ 1 file changed, 36 insertions(+)
+
+diff --git a/src/video_core/cache_storage.cpp b/src/video_core/cache_storage.cpp
+index 79439458..d5e2f879 100644
+--- a/src/video_core/cache_storage.cpp
++++ b/src/video_core/cache_storage.cpp
+@@ -2,6 +2,7 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include <cstdlib>
++#include <fstream>
+ #include "common/elf_info.h"
+ #include "common/io_file.h"
+ #include "common/polyfill_thread.h"
+@@ -118,9 +119,44 @@ void DataBase::Open() {
+             // SHD-002: stage descriptor sets: translations of their own.
+             cache_path += "-direct-sets";
+         }
++        // FIX-213: stored translations load unchecked, so after an update that changes how
++        // shaders are translated, the store kept the old translations and drew with them (a
++        // magenta car and red scenery on an RX 7600 after updating to PR #88, until the folder
++        // was deleted by hand). The store now carries a version: a store without this one is
++        // set aside as <store>.outdated and starts again, and the launcher's shader pack stamp
++        // goes with it, so the next Play prepares the pack into the new store. Raise the
++        // version whenever a change makes stored translations wrong.
++        static constexpr std::string_view StoreVersion = "RyGT shader store 1";
++        const auto version_path = cache_path / "store-version.txt";
++        std::error_code ec;
++        if (std::filesystem::exists(cache_path, ec)) {
++            std::string version;
++            if (std::ifstream file{version_path}; file) {
++                std::getline(file, version);
++            }
++            if (version != StoreVersion) {
++                auto outdated = cache_path;
++                outdated += ".outdated";
++                std::filesystem::remove_all(outdated, ec);
++                std::filesystem::rename(cache_path, outdated, ec);
++                if (ec) {
++                    LOG_ERROR(Render, "FIX-213: could not set aside the outdated shader store {}: "
++                              "{}", cache_path.string(), ec.message());
++                } else {
++                    std::filesystem::remove(GetUserPath(PathType::CacheDir) / "shaders-pack.txt",
++                                            ec);
++                    LOG_WARNING(Render, "FIX-213: shader store of another version ('{}') set "
++                                "aside as {}; shaders are translated again",
++                                version, outdated.string());
++                }
++            }
++        }
+         if (!std::filesystem::exists(cache_path)) {
+             std::filesystem::create_directories(cache_path);
+         }
++        if (!std::filesystem::exists(version_path, ec)) {
++            std::ofstream{version_path} << StoreVersion << '\n';
++        }
+     }
+ 
+     io_worker = std::jthread{ProcessIO};
+-- 
+2.56.0.windows.2
+
