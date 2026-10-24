@@ -338,3 +338,35 @@ On the RX 7600, deleting the store by hand made the colours right again; this pa
 does that step automatically. It was compiled with the Release flags; the automatic
 set-aside has not yet been run in the game. Only `cache_storage.cpp` changes; it is
 the same at shadGT `1d13c88d` and after patches 0020 and 0059-0071.
+
+## Background optimization (0073-0075)
+
+Patches 0073-0075 apply after 0072, in order (they do not depend on it). They
+were measured on a Ryzen 5 5500 (6 cores, 12 threads, no efficiency cores) with an
+RX 7600 (driver 26.8.1), in a Time Attack at Dragon Trail (`permanent_01`), using the
+renderer's own logs (PERF-031, PERF-047, NAT-100).
+
+- 0073 (PERF-310): in a race, shader translation and pipeline builds run below the
+  game's priority. On CPUs without efficiency cores PERF-097 keeps nothing apart: a
+  burst of 500-1,200 new pipelines took 3-4 threads from GT Sport's twelve job threads
+  and the recorder, and the race fell to 12-17 fps until it was done. Draws are skipped
+  while their pipeline builds (PERF-076), so compiles only take longer. Measured in two
+  races: before, 35 two-second windows with such a burst averaged 15.8 fps; after, the
+  one window with a burst ran at 41 fps.
+  `RYGT_COMPILE_PRIORITY=normal` keeps them level.
+- 0074 (PERF-314): native write-backs (NAT-112) reuse each picture's re-tiling
+  buffers. Each tiled write-back created three buffers (linear, tiled, tiling
+  parameters) about 2,600 times a second; the picture's size and tiling never change
+  and every write-back is recorded on one queue, ordered by its barriers (the last one
+  now also covers the next write-back's transfer writes). Write-back time on the
+  recorder: about 700 -> 470 ms per 10 s.
+- 0075 (PERF-316): with the native renderer, game job threads prepare draws (OPT-010/012)
+  by default instead of only with `RYGT_NATIVE_PREPARE=1` and `RYGT_NATIVE=1`; it follows
+  the launcher's renderer choice. 97.5% of draws were prepared, decoding a submission went
+  from 7.0 to 5.6 ms, and the Time Attack from 39.9 to 44.6 fps (43.5 in a second run).
+  `RYGT_NATIVE_PREPARE=0` turns it off.
+
+None of the three is specific to AMD GPUs; 0073 matters most on CPUs without
+efficiency cores, and 0075 applies wherever the native renderer is used. The four
+changed sources were compiled with the Release flags against the patched tree. The
+figures above come from the RX 7600 PC; other CPUs and GPUs were not measured.
