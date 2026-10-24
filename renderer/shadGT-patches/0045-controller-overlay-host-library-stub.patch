@@ -1,0 +1,13 @@
+diff --git a/ryty_gpu/ryty_hle_stubs.cpp b/ryty_gpu/ryty_hle_stubs.cpp
+index 96ac85d..96321cb 100644
+--- a/ryty_gpu/ryty_hle_stubs.cpp
++++ b/ryty_gpu/ryty_hle_stubs.cpp
+@@ -9,3 +9,8 @@
+ #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
+ 
+ Frontend::WindowSDL::~WindowSDL() = default;
++
++namespace Ryty {
++// Only the renderer owns and displays the controller overlay.
++void ToggleControllerOverlay() {}
++}

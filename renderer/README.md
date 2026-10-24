@@ -215,3 +215,105 @@ while the same renderer paths with the extensions still enabled in the driver re
 at the RDNA 3 driver in that mode rather than the renderer; RX 400/500 run AMD's separate legacy
 driver, so only a real card can confirm them. The buffer cache's 4 GB sparse arena pages exceed
 the 2 GB `maxBufferSize` every Radeon reports; RDNA 3's driver accepts them.
+
+## Native resource lifetime and reflection fixes (0066)
+
+Apply `0066-native-resource-lifetime-and-reflection-fixes.patch` after the current
+0020 and 0062-0065 patches on shadGT `ryty-gpu` at
+`1d13c88d2e57bc63ce1586fe0b8f3342b6afdd19`. The lighting-storage, compute-fence
+completion and render-target identity fixes (0054-0056) must also be present.
+When applying the Camera Manager after the upscaler patches, retain both the
+`ryty_camera.h` and `ryty_upscaler_status.h` includes in `ryty_entry.cpp`.
+The older local experimental 0047-0059 patch variants are not prerequisites.
+
+This patch retains GPU-only lighting and depth images within a 512 MiB budget,
+releases page watches only after their final native resource owner retires,
+and invalidates failed host imports after guest mapping changes. It bounds
+image/sparse allocations, protects queued pipeline and translated-fetch lifetimes,
+and batches page protection while refreshing only the buffer ranges being used.
+Menu buffer snapshots and bounded scalar prefixes improve menu performance;
+races retain the direct path to avoid geometry corruption. Image downloads use
+GPU-local tiling before copying back, and overlapping texture uploads preserve
+GPU-written region data.
+
+Normalized native fragment cube sampling uses cube-array views and reconstructed
+directions for filtering across face edges. Vertex/compute sampling and unsupported
+cube operations retain their existing paths. Translation cache versions invalidate
+only the affected shader categories. Vertex-fetch conversions now agree with their
+specialization keys. The window title identifies the active renderer.
+
+The Release renderer built successfully and all 2,609 packaged import bindings
+resolved. Resource-watch cleanup passed 4,097 ownership/overlap cases. Runtime
+checks confirmed restored distant shadows, normal sparks, correct track and
+showroom reflections, and improved menu performance. Intermittent menu-icon
+corruption and other captured defects remain under investigation. Temporary GPU
+timers, road/floor/curve traces, diagnostic shaders, capture helpers, and compiled
+binaries are not included in this patch.
+
+Patch 0067 applies after 0066. It orders native region-refresh transfer writes
+before a texture upload or untiling dispatch reads the same buffer. The upload
+callback can record these writes after the upload pass's initial barrier; without
+the dependency, menu icons can receive stale bytes. A delayed-transfer regression
+and six upload/overlap cases pass, the Release build and 2,609 import checks pass,
+and the runtime menu icons stayed correct after a track-to-menu transition.
+
+Patch 0068 applies after 0067. Depth-writing draws wait for both shader translation
+and graphics pipeline creation instead of being skipped during asynchronous
+compilation. A shadow map baked only during loading must receive every caster
+draw; retaining an incomplete map cannot restore the missing shadows. Other
+draws retain the existing asynchronous policy. Newly encountered depth-writing
+pipelines can cause compilation pauses.
+
+The Release renderer built successfully and all 2,654 checked local import
+bindings resolved. A fresh-process first Tokyo track load showed the previously
+missing distant tree shadows with correct rendering. No temporary shadow traces,
+instrumented shaders, capture helpers, or build artifacts are included.
+
+Patch 0069 applies after 0068. Native keeps at most sixteen completed 8 MiB upload
+chunks (128 MiB), rather than retaining the peak reached during loading. Chunks
+still in flight remain untouched; excess completed buffers use the existing
+GPU-safe retirement path. This bounds reusable upload memory, not total VRAM.
+After track-to-menu testing, the live free cache measured 96-104 MiB versus an
+earlier uncapped 568 MiB sample. Rendering and performance remained correct;
+dedicated-VRAM savings have not been quantified.
+
+Patch 0070 applies after 0069 and refines 0068. Only depth-only passes receive its
+mandatory shader-translation and graphics-pipeline waits. Ordinary color draws
+can write depth too; forcing all of them to wait stalled menu cursor updates and
+audio during compilation. Existing asynchronous policies and shader-memory-write
+protection remain in place. Runtime testing confirmed responsive cursor/audio
+while new menu shaders compiled and correct distant shadows on the first Tokyo
+track load.
+
+The combined Release renderer built successfully and all 2,654 local import
+bindings resolved. Temporary allocation inventories, memory readers, capture
+helpers, experimental pool/trimming changes, diagnostic shaders, and compiled
+artifacts are excluded from both patches.
+
+Patch 0071 applies after 0070. Native fill-pattern buffers previously accumulated
+for every distinct fill value, and superseded buffers stayed alive indefinitely.
+Cache recent patterns within 64 MiB, keeping a single larger pattern only when
+that request requires it. Evicted and replaced buffers follow the existing RHI
+fence retirement so recorded GPU copies can finish safely.
+
+Read-only mirrors unused for more than 600 presented frames are also reclaimed
+through the existing binding invalidation, watch ownership, and GPU retirement
+paths. GPU-written regions and retained lighting/shadow images are unaffected.
+
+The pattern-cache regression covers exact budget boundaries, recent-key reuse,
+replacement, 1,000 changing values, oversized requests, and recovery below budget.
+The mirror regression covers idle boundaries and preservation of active mirrors.
+Four matched on-track loads in one Native process completed with correct rendering
+and performance: adapter VRAM was 3,839 MiB initially and 3,877 MiB on the fourth
+load, without the reported roughly 100 MiB increase on each reload. Fill-pattern
+storage settled at 50.9 MiB; the earlier unbounded run held 427.4 MiB plus 17.8 MiB
+of superseded buffers. Adapter readings include other GPU users and are not a
+measurement of game-only VRAM. Other allocation categories and unrelated rendering
+or device-lost failures remain separate investigations.
+
+The production-only Release renderer built successfully, all 2,655 checked local
+import bindings resolved, and patches 0069-0071 applied in sequence to the clean
+staging baseline.
+
+Only the production cache/lifetime changes are included. Curve traces, allocation
+inventories, capture helpers, diagnostic flags, and compiled artifacts are excluded.
