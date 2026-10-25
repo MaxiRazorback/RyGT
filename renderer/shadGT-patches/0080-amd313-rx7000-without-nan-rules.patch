@@ -1,0 +1,152 @@
+From f7227b949a6d377c12610988fca37032586db6cd Mon Sep 17 00:00:00 2001
+From: MaxiRazorback <344630105+MaxiRazorback@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 00:43:20 -0300
+Subject: [PATCH 80/80] AMD-313: RX 7000 cards leave FIX-215/216 out (purple
+ car)
+
+With FIX-215/216 (NaN rules for MED3/MIN3/MAX3 on AMD's trinary path), freshly translated shaders
+drew the purple car again on an RX 7600; with SHADGT_AMD_NAN_RULES=0 the car was right. RX 7000
+cards (AMD proprietary driver, model "Radeon RX 7...") now leave the rules out and use shader
+store 5, so stores translated with them are set aside. RX 9000 cards keep store 4 and the rules,
+other GPUs store 3. SHADGT_AMD_NAN_RULES=0/1 overrides for any GPU.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../spirv/emit_spirv_floating_point.cpp        |  9 +++++++++
+ src/shader_recompiler/profile.h                |  2 ++
+ src/video_core/cache_storage.cpp               | 18 ++++++++++++++----
+ src/video_core/renderer_vulkan/vk_instance.cpp | 12 ++++++++----
+ src/video_core/renderer_vulkan/vk_instance.h   |  2 +-
+ .../renderer_vulkan/vk_pipeline_cache.cpp      |  8 ++++++++
+ 6 files changed, 42 insertions(+), 9 deletions(-)
+
+diff --git a/src/shader_recompiler/backend/spirv/emit_spirv_floating_point.cpp b/src/shader_recompiler/backend/spirv/emit_spirv_floating_point.cpp
+index a71dca27..4d4e3b8d 100644
+--- a/src/shader_recompiler/backend/spirv/emit_spirv_floating_point.cpp
++++ b/src/shader_recompiler/backend/spirv/emit_spirv_floating_point.cpp
+@@ -63,14 +63,23 @@ Id EmitFPMin64(EmitContext& ctx, Id a, Id b) {
+ // yellow glows and banded skies, as NaNs in GT Sport's bloom and exposure do. The driver still
+ // compiles the pair into one min3/max3 instruction.
+ Id EmitFPMinTri32(EmitContext& ctx, Id a, Id b, Id c) {
++    if (ctx.profile.supports_trinary_minmax && !ctx.profile.amd_nan_rules) { // AMD-313
++        return ctx.OpFMin3AMD(ctx.F32[1], a, b, c);
++    }
+     return ctx.OpNMin(ctx.F32[1], a, ctx.OpNMin(ctx.F32[1], b, c));
+ }
+ 
+ Id EmitFPMaxTri32(EmitContext& ctx, Id a, Id b, Id c) {
++    if (ctx.profile.supports_trinary_minmax && !ctx.profile.amd_nan_rules) { // AMD-313
++        return ctx.OpFMax3AMD(ctx.F32[1], a, b, c);
++    }
+     return ctx.OpNMax(ctx.F32[1], a, ctx.OpNMax(ctx.F32[1], b, c));
+ }
+ 
+ Id EmitFPMedTri32(EmitContext& ctx, Id a, Id b, Id c) {
++    if (ctx.profile.supports_trinary_minmax && !ctx.profile.amd_nan_rules) { // AMD-313
++        return ctx.OpFMid3AMD(ctx.F32[1], a, b, c);
++    }
+     if (ctx.profile.supports_trinary_minmax) {
+         // FIX-215: GCN MED3 with a quiet NaN returns the minimum of the numeric operands.
+         // SPV_AMD_shader_trinary_minmax leaves FMid3AMD with a NaN operand undefined; GT Sport's
+diff --git a/src/shader_recompiler/profile.h b/src/shader_recompiler/profile.h
+index 565f2baa..90f22c6b 100644
+--- a/src/shader_recompiler/profile.h
++++ b/src/shader_recompiler/profile.h
+@@ -50,6 +50,8 @@ struct Profile {
+     /// AMD-311: which of the six vertex orders per-vertex reads use with AMD's explicit vertex
+     /// parameter extension (index into AmdVertexOrders in spirv_emit_context.cpp; 0 as before).
+     u32 amd_vertex_order{};
++    /// AMD-313: FIX-215/216's NaN rules for MED3/MIN3/MAX3 on AMD's trinary path (default on).
++    bool amd_nan_rules{true};
+     bool has_broken_spirv_clamp{};
+     bool lower_left_origin_mode{};
+     bool needs_manual_interpolation{};
+diff --git a/src/video_core/cache_storage.cpp b/src/video_core/cache_storage.cpp
+index 283bad66..f014d995 100644
+--- a/src/video_core/cache_storage.cpp
++++ b/src/video_core/cache_storage.cpp
+@@ -131,12 +131,22 @@ void DataBase::Open() {
+         // Brands Hatch as streaks with a store made earlier and right once it was translated
+         // again. Other GPUs (the RX 7000 series) keep store 3, so their store stays in use.
+         const char* order_env = std::getenv("SHADGT_AMD_VERTEX_ORDER");
+-        const bool rdna4 = Vulkan::GetStoreGpuFamily() == Vulkan::StoreGpuFamily::AmdRdna4;
++        // AMD-313: RX 7000 cards leave FIX-215/216 out (purple car); their store 5 sets aside
++        // stores translated with them.
++        const auto family = Vulkan::GetStoreGpuFamily();
+         const std::string StoreVersion =
+-            std::string{rdna4 ? "RyGT shader store 4 (FIX-215/216 NaN on AMD, AMD-311 vertex order)"
+-                              : "RyGT shader store 3 (FIX-215/216 MED3, MIN3, MAX3 NaN on AMD)"} +
++            std::string{family == Vulkan::StoreGpuFamily::AmdRdna4
++                            ? "RyGT shader store 4 (FIX-215/216 NaN on AMD, AMD-311 vertex order)"
++                        : family == Vulkan::StoreGpuFamily::AmdRdna3
++                            ? "RyGT shader store 5 (RX 7000: FIX-215/216 off, AMD-313)"
++                            : "RyGT shader store 3 (FIX-215/216 MED3, MIN3, MAX3 NaN on AMD)"} +
+             (order_env && *order_env ? fmt::format(", SHADGT_AMD_VERTEX_ORDER={}", order_env[0])
+-                                     : std::string{});
++                                     : std::string{}) +
++            [] {
++                const char* env = std::getenv("SHADGT_AMD_NAN_RULES"); // AMD-313
++                return env && *env ? fmt::format(", SHADGT_AMD_NAN_RULES={}", env[0])
++                                   : std::string{};
++            }();
+         const auto version_path = cache_path / "store-version.txt";
+         std::error_code ec;
+         if (std::filesystem::exists(cache_path, ec)) {
+diff --git a/src/video_core/renderer_vulkan/vk_instance.cpp b/src/video_core/renderer_vulkan/vk_instance.cpp
+index ed2bf875..6b97341b 100644
+--- a/src/video_core/renderer_vulkan/vk_instance.cpp
++++ b/src/video_core/renderer_vulkan/vk_instance.cpp
+@@ -929,10 +929,14 @@ void Instance::CollectDeviceParameters() {
+ 
+     LOG_INFO(Render_Vulkan, "GPU_Vendor: {}", vendor_name);
+     LOG_INFO(Render_Vulkan, "GPU_Model: {}", model_name);
+-    // AMD-312: Radeon RX 9000 cards (RDNA4) get a shader store of their own version.
+-    if (driver_id == vk::DriverId::eAmdProprietary &&
+-        model_name.find("Radeon RX 9") != std::string::npos) {
+-        g_store_gpu_family = StoreGpuFamily::AmdRdna4;
++    // AMD-312: Radeon RX 9000 cards (RDNA4) and RX 7000 cards (RDNA3) get shader stores of
++    // their own versions; RX 7000 cards also leave FIX-215/216 out (AMD-313).
++    if (driver_id == vk::DriverId::eAmdProprietary) {
++        if (model_name.find("Radeon RX 9") != std::string::npos) {
++            g_store_gpu_family = StoreGpuFamily::AmdRdna4;
++        } else if (model_name.find("Radeon RX 7") != std::string::npos) {
++            g_store_gpu_family = StoreGpuFamily::AmdRdna3;
++        }
+     }
+     LOG_INFO(Render_Vulkan, "GPU_Integrated: {}", IsIntegrated() ? "Yes" : "No");
+     LOG_INFO(Render_Vulkan, "GPU_Vulkan_Driver: {}", driver_name);
+diff --git a/src/video_core/renderer_vulkan/vk_instance.h b/src/video_core/renderer_vulkan/vk_instance.h
+index 91a59fdb..464bf385 100644
+--- a/src/video_core/renderer_vulkan/vk_instance.h
++++ b/src/video_core/renderer_vulkan/vk_instance.h
+@@ -602,7 +602,7 @@ private:
+ };
+ 
+ /// AMD-312: which shader store version the selected GPU uses (see cache_storage.cpp).
+-enum class StoreGpuFamily { Other, AmdRdna4 };
++enum class StoreGpuFamily { Other, AmdRdna3, AmdRdna4 };
+ StoreGpuFamily GetStoreGpuFamily();
+ 
+ } // namespace Vulkan
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index fed80fbc..cec9941d 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -812,6 +812,14 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
+         .supports_fragment_shader_barycentric = instance_.IsFragmentShaderBarycentricSupported(),
+         .supports_shader_subgroup_clock = instance_.IsShaderSubgroupClockSupported(),
+         .amd_vertex_order = instance_.GetAmdVertexOrder(), // AMD-311
++        // AMD-313: FIX-215/216 drew the purple car again on an RX 7600 (fresh store), so RX 7000
++        // cards leave them out; SHADGT_AMD_NAN_RULES=0/1 overrides for any GPU.
++        .amd_nan_rules = [] {
++            if (const char* env = std::getenv("SHADGT_AMD_NAN_RULES"); env && *env) {
++                return env[0] != '0';
++            }
++            return GetStoreGpuFamily() != StoreGpuFamily::AmdRdna3;
++        }(),
+         .needs_manual_interpolation = instance.IsFragmentShaderBarycentricSupported() &&
+                                       instance.GetDriverID() == vk::DriverId::eNvidiaProprietary,
+         .needs_lds_barriers = instance.GetDriverID() == vk::DriverId::eNvidiaProprietary ||
+-- 
+2.56.0.windows.2
+

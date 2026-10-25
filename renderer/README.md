@@ -370,3 +370,24 @@ None of the three is specific to AMD GPUs; 0073 matters most on CPUs without
 efficiency cores, and 0075 applies wherever the native renderer is used. The four
 changed sources were compiled with the Release flags against the patched tree. The
 figures above come from the RX 7600 PC; other CPUs and GPUs were not measured.
+
+## AMD 9000 fix and automatic shader store version (0076-0080)
+
+Patches 0076-0080 apply after 0075, in order.
+
+- 0076 (FIX-215): MED3 with a quiet NaN on AMD's trinary path (`FMid3AMD`, which leaves a NaN
+  operand undefined) returns the minimum of the numeric operands, as GCN does.
+- 0077 (FIX-216): MIN3/MAX3 use `NMin`/`NMax` instead of `FMin3AMD`/`FMax3AMD`, so a NaN
+  operand is ignored as on GCN.
+- 0078 (AMD-311): `SHADGT_AMD_VERTEX_ORDER=0..5` picks which vertex `InterpolateAtVertexAMD`
+  reads for each barycentric weight of per-vertex inputs. 0 (the order an RX 7600 uses) unless set;
+  for checking other AMD GPUs.
+- 0079 (AMD-312): the GPU is detected (AMD proprietary driver and model name) and the shader
+  store version follows it. Radeon RX 9000 cards (RDNA4) use their own store version.
+- 0080 (AMD-313): Radeon RX 7000 cards (RDNA3) leave 0076/0077 out and use a store version of
+  their own; `SHADGT_AMD_NAN_RULES=0/1` overrides for any GPU.
+
+Tested by users of the local test builds: on an RX 9060 XT the road at Brands Hatch was drawn as
+streaks with a store translated by an earlier build and correctly once the store was translated
+again with these patches. On an RX 7600, freshly translated shaders with 0076/0077 drew the car
+purple again; with them off (0080) the car was right. Other GPUs were not tested.

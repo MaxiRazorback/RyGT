@@ -1,0 +1,60 @@
+From 9aef4644efa72d5de50174ee0f5dd3369b46fb9b Mon Sep 17 00:00:00 2001
+From: MaxiRazorback <344630105+MaxiRazorback@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 17:46:26 -0300
+Subject: [PATCH 77/80] FIX-216: MIN3 and MAX3 ignore NaN operands on AMD GPUs
+ too
+
+With VK_AMD_shader_trinary_minmax the translator emitted FMin3AMD/FMax3AMD, which leave a NaN
+operand undefined, while the generic path (NMin/NMax) ignores it as GCN does. Glow and
+banded-sky captures from a tester (PurpleCar + shader_fixes renderer, before FIX-215) look like
+NaNs reaching GT Sport's bloom and exposure. MIN3/MAX3 now use NMin/NMax on every GPU, like
+FIX-215 did for MED3. Shader store version 3.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../backend/spirv/emit_spirv_floating_point.cpp        | 10 ++++------
+ src/video_core/cache_storage.cpp                       |  2 +-
+ 2 files changed, 5 insertions(+), 7 deletions(-)
+
+diff --git a/src/shader_recompiler/backend/spirv/emit_spirv_floating_point.cpp b/src/shader_recompiler/backend/spirv/emit_spirv_floating_point.cpp
+index da0b3583..a71dca27 100644
+--- a/src/shader_recompiler/backend/spirv/emit_spirv_floating_point.cpp
++++ b/src/shader_recompiler/backend/spirv/emit_spirv_floating_point.cpp
+@@ -58,17 +58,15 @@ Id EmitFPMin64(EmitContext& ctx, Id a, Id b) {
+     return ctx.OpNMin(ctx.F64[1], a, b);
+ }
+ 
++// FIX-216: MIN3 and MAX3 use NMin/NMax on every GPU: a NaN operand is ignored, as on GCN.
++// FMin3AMD/FMax3AMD (AMD GPUs) leave a NaN operand undefined; a tester's Radeon showed red and
++// yellow glows and banded skies, as NaNs in GT Sport's bloom and exposure do. The driver still
++// compiles the pair into one min3/max3 instruction.
+ Id EmitFPMinTri32(EmitContext& ctx, Id a, Id b, Id c) {
+-    if (ctx.profile.supports_trinary_minmax) {
+-        return ctx.OpFMin3AMD(ctx.F32[1], a, b, c);
+-    }
+     return ctx.OpNMin(ctx.F32[1], a, ctx.OpNMin(ctx.F32[1], b, c));
+ }
+ 
+ Id EmitFPMaxTri32(EmitContext& ctx, Id a, Id b, Id c) {
+-    if (ctx.profile.supports_trinary_minmax) {
+-        return ctx.OpFMax3AMD(ctx.F32[1], a, b, c);
+-    }
+     return ctx.OpNMax(ctx.F32[1], a, ctx.OpNMax(ctx.F32[1], b, c));
+ }
+ 
+diff --git a/src/video_core/cache_storage.cpp b/src/video_core/cache_storage.cpp
+index bd0618bd..287c0f66 100644
+--- a/src/video_core/cache_storage.cpp
++++ b/src/video_core/cache_storage.cpp
+@@ -126,7 +126,7 @@ void DataBase::Open() {
+         // set aside as <store>.outdated and starts again, and the launcher's shader pack stamp
+         // goes with it, so the next Play prepares the pack into the new store. Raise the
+         // version whenever a change makes stored translations wrong.
+-        static constexpr std::string_view StoreVersion = "RyGT shader store 2 (FIX-215 MED3 NaN on AMD)";
++        static constexpr std::string_view StoreVersion = "RyGT shader store 3 (FIX-215/216 MED3, MIN3, MAX3 NaN on AMD)";
+         const auto version_path = cache_path / "store-version.txt";
+         std::error_code ec;
+         if (std::filesystem::exists(cache_path, ec)) {
+-- 
+2.56.0.windows.2
+

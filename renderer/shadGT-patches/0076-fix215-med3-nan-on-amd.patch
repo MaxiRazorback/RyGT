@@ -1,0 +1,56 @@
+From db147847ce9815db17bd80af1a46b42571588979 Mon Sep 17 00:00:00 2001
+From: MaxiRazorback <344630105+MaxiRazorback@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 16:44:34 -0300
+Subject: [PATCH 76/80] FIX-215: MED3 quiet-NaN rule on AMD GPUs too
+
+shader_fixes 0074 made MED3 with a quiet NaN return the minimum of the numeric operands, but
+only in the generic min/max path. On AMD GPUs the translator emits FMid3AMD
+(VK_AMD_shader_trinary_minmax) and returned before that rule, so Radeons kept the white car
+materials and the bloom. FMid3AMD with a NaN operand is undefined by the extension, so the NaN
+case is now selected explicitly there as well. The shader store version is raised so stored
+translations from before are set aside and translated again.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../backend/spirv/emit_spirv_floating_point.cpp       | 11 ++++++++++-
+ src/video_core/cache_storage.cpp                      |  2 +-
+ 2 files changed, 11 insertions(+), 2 deletions(-)
+
+diff --git a/src/shader_recompiler/backend/spirv/emit_spirv_floating_point.cpp b/src/shader_recompiler/backend/spirv/emit_spirv_floating_point.cpp
+index d95c2306..da0b3583 100644
+--- a/src/shader_recompiler/backend/spirv/emit_spirv_floating_point.cpp
++++ b/src/shader_recompiler/backend/spirv/emit_spirv_floating_point.cpp
+@@ -74,7 +74,16 @@ Id EmitFPMaxTri32(EmitContext& ctx, Id a, Id b, Id c) {
+ 
+ Id EmitFPMedTri32(EmitContext& ctx, Id a, Id b, Id c) {
+     if (ctx.profile.supports_trinary_minmax) {
+-        return ctx.OpFMid3AMD(ctx.F32[1], a, b, c);
++        // FIX-215: GCN MED3 with a quiet NaN returns the minimum of the numeric operands.
++        // SPV_AMD_shader_trinary_minmax leaves FMid3AMD with a NaN operand undefined; GT Sport's
++        // (65000, NaN, 0) HDR clamp then drew white car materials and too much bloom on Radeons,
++        // so the NaN case is selected explicitly.
++        const Id any_nan{ctx.OpLogicalOr(ctx.U1[1], ctx.OpIsNan(ctx.U1[1], a),
++            ctx.OpLogicalOr(ctx.U1[1], ctx.OpIsNan(ctx.U1[1], b), ctx.OpIsNan(ctx.U1[1], c)))};
++        const Id nan_result{
++            ctx.OpNMin(ctx.F32[1], ctx.OpNMin(ctx.F32[1], a, b), c)};
++        return ctx.OpSelect(ctx.F32[1], any_nan, nan_result,
++                            ctx.OpFMid3AMD(ctx.F32[1], a, b, c));
+     }
+     const Id mmx{ctx.OpNMin(ctx.F32[1], ctx.OpNMax(ctx.F32[1], a, b), c)};
+     return ctx.OpNMax(ctx.F32[1], ctx.OpNMin(ctx.F32[1], a, b), mmx);
+diff --git a/src/video_core/cache_storage.cpp b/src/video_core/cache_storage.cpp
+index d5e2f879..bd0618bd 100644
+--- a/src/video_core/cache_storage.cpp
++++ b/src/video_core/cache_storage.cpp
+@@ -126,7 +126,7 @@ void DataBase::Open() {
+         // set aside as <store>.outdated and starts again, and the launcher's shader pack stamp
+         // goes with it, so the next Play prepares the pack into the new store. Raise the
+         // version whenever a change makes stored translations wrong.
+-        static constexpr std::string_view StoreVersion = "RyGT shader store 1";
++        static constexpr std::string_view StoreVersion = "RyGT shader store 2 (FIX-215 MED3 NaN on AMD)";
+         const auto version_path = cache_path / "store-version.txt";
+         std::error_code ec;
+         if (std::filesystem::exists(cache_path, ec)) {
+-- 
+2.56.0.windows.2
+

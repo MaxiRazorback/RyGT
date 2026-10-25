@@ -1,0 +1,80 @@
+From 5c05ed2860c4312b83cca59c3a202b8bbf1339c2 Mon Sep 17 00:00:00 2001
+From: MaxiRazorback <344630105+MaxiRazorback@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 00:01:51 -0300
+Subject: [PATCH 79/80] AMD-312: Radeon RX 9000 cards use shader store 4, other
+ GPUs keep store 3
+
+An RX 9060 XT drew the road at Brands Hatch as streaks with a store made by an earlier build and right once its shaders were translated again (store 4). The GPU is now detected (AMD proprietary driver, model 'Radeon RX 9...'): RDNA4 cards use store 4, other GPUs, the RX 7000 series among them, keep store 3 and the store they already have. All other fixes are the same for both.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/video_core/cache_storage.cpp               |  7 ++++++-
+ src/video_core/renderer_vulkan/vk_instance.cpp | 11 +++++++++++
+ src/video_core/renderer_vulkan/vk_instance.h   |  4 ++++
+ 3 files changed, 21 insertions(+), 1 deletion(-)
+
+diff --git a/src/video_core/cache_storage.cpp b/src/video_core/cache_storage.cpp
+index 43847bcb..283bad66 100644
+--- a/src/video_core/cache_storage.cpp
++++ b/src/video_core/cache_storage.cpp
+@@ -127,9 +127,14 @@ void DataBase::Open() {
+         // goes with it, so the next Play prepares the pack into the new store. Raise the
+         // version whenever a change makes stored translations wrong.
+         // AMD-311: each vertex order of AMD's per-vertex reads has a store of its own version.
++        // AMD-312: Radeon RX 9000 cards (RDNA4) use store 4: an RX 9060 XT drew the road at
++        // Brands Hatch as streaks with a store made earlier and right once it was translated
++        // again. Other GPUs (the RX 7000 series) keep store 3, so their store stays in use.
+         const char* order_env = std::getenv("SHADGT_AMD_VERTEX_ORDER");
++        const bool rdna4 = Vulkan::GetStoreGpuFamily() == Vulkan::StoreGpuFamily::AmdRdna4;
+         const std::string StoreVersion =
+-            std::string{"RyGT shader store 4 (FIX-215/216 NaN on AMD, AMD-311 vertex order)"} +
++            std::string{rdna4 ? "RyGT shader store 4 (FIX-215/216 NaN on AMD, AMD-311 vertex order)"
++                              : "RyGT shader store 3 (FIX-215/216 MED3, MIN3, MAX3 NaN on AMD)"} +
+             (order_env && *order_env ? fmt::format(", SHADGT_AMD_VERTEX_ORDER={}", order_env[0])
+                                      : std::string{});
+         const auto version_path = cache_path / "store-version.txt";
+diff --git a/src/video_core/renderer_vulkan/vk_instance.cpp b/src/video_core/renderer_vulkan/vk_instance.cpp
+index ecb49fd2..ed2bf875 100644
+--- a/src/video_core/renderer_vulkan/vk_instance.cpp
++++ b/src/video_core/renderer_vulkan/vk_instance.cpp
+@@ -28,6 +28,12 @@
+ 
+ namespace Vulkan {
+ 
++static StoreGpuFamily g_store_gpu_family{StoreGpuFamily::Other}; // AMD-312
++
++StoreGpuFamily GetStoreGpuFamily() {
++    return g_store_gpu_family;
++}
++
+ namespace {
+ 
+ std::vector<vk::PhysicalDevice> EnumeratePhysicalDevices(vk::UniqueInstance& instance) {
+@@ -923,6 +929,11 @@ void Instance::CollectDeviceParameters() {
+ 
+     LOG_INFO(Render_Vulkan, "GPU_Vendor: {}", vendor_name);
+     LOG_INFO(Render_Vulkan, "GPU_Model: {}", model_name);
++    // AMD-312: Radeon RX 9000 cards (RDNA4) get a shader store of their own version.
++    if (driver_id == vk::DriverId::eAmdProprietary &&
++        model_name.find("Radeon RX 9") != std::string::npos) {
++        g_store_gpu_family = StoreGpuFamily::AmdRdna4;
++    }
+     LOG_INFO(Render_Vulkan, "GPU_Integrated: {}", IsIntegrated() ? "Yes" : "No");
+     LOG_INFO(Render_Vulkan, "GPU_Vulkan_Driver: {}", driver_name);
+     LOG_INFO(Render_Vulkan, "GPU_Vulkan_Version: {}", api_version);
+diff --git a/src/video_core/renderer_vulkan/vk_instance.h b/src/video_core/renderer_vulkan/vk_instance.h
+index 2899c007..91a59fdb 100644
+--- a/src/video_core/renderer_vulkan/vk_instance.h
++++ b/src/video_core/renderer_vulkan/vk_instance.h
+@@ -601,4 +601,8 @@ private:
+     std::vector<size_t> valid_heaps;
+ };
+ 
++/// AMD-312: which shader store version the selected GPU uses (see cache_storage.cpp).
++enum class StoreGpuFamily { Other, AmdRdna4 };
++StoreGpuFamily GetStoreGpuFamily();
++
+ } // namespace Vulkan
+-- 
+2.56.0.windows.2
+

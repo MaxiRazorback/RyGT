@@ -1,0 +1,157 @@
+From 4976180cf62dca2cbbd27544d5a6d0a75b681cf7 Mon Sep 17 00:00:00 2001
+From: MaxiRazorback <344630105+MaxiRazorback@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 20:09:28 -0300
+Subject: [PATCH 78/80] AMD-311: switch for the vertex order of AMD per-vertex
+ reads
+
+GT Sport blends per-vertex inputs (terrain, kerbs, road) as p0 + i*(p1-p0) + j*(p2-p0), with
+p0..p2 from InterpolateAtVertexAMD(0..2) and i, j from BaryCoordSmoothAMD (FIX-191).
+VK_AMD_shader_explicit_vertex_parameter does not define which vertex each barycentric weight
+belongs to. The RX 7600 matches order 0; an RX 9060 XT drew the road at Brands Hatch, like an
+RX 6600 XT its hills, as triangles smeared in different directions.
+
+SHADGT_AMD_VERTEX_ORDER=0..5 picks one of the six orders (vertex k of the weights reads
+InterpolateAtVertexAMD(order[k])). 0, as before, unless set; each order has a shader store
+version of its own. Store version 4.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../backend/spirv/spirv_emit_context.cpp      | 19 +++++++++++++------
+ src/shader_recompiler/profile.h               |  3 +++
+ src/video_core/cache_storage.cpp              |  7 ++++++-
+ .../renderer_vulkan/vk_instance.cpp           |  8 ++++++++
+ src/video_core/renderer_vulkan/vk_instance.h  |  6 ++++++
+ .../renderer_vulkan/vk_pipeline_cache.cpp     |  1 +
+ 6 files changed, 37 insertions(+), 7 deletions(-)
+
+diff --git a/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp b/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
+index 210ed298..802884d9 100644
+--- a/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
++++ b/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
+@@ -298,10 +298,19 @@ void EmitContext::DefineBufferProperties() {
+     }
+ }
+ 
++// AMD-311: VK_AMD_shader_explicit_vertex_parameter leaves to the driver which vertex
++// InterpolateAtVertexAMD(k) returns for the barycentric weights (1 - i - j, i, j) of
++// BaryCoordSmoothAMD. GT Sport blends per-vertex inputs with those weights (FIX-191); the RX 7600
++// numbers them in order 0, while an RX 6600 XT drew its hills and an RX 9060 XT its road as
++// triangles smeared in different directions. Vertex k of the weights reads vertex order[k].
++static constexpr std::array<std::array<u32, 3>, 6> AmdVertexOrders{{
++    {0, 1, 2}, {1, 2, 0}, {2, 0, 1}, {0, 2, 1}, {2, 1, 0}, {1, 0, 2}}};
++
+ void EmitContext::DefineAmdPerVertexAttribs() {
+     if (!profile.supports_amd_shader_explicit_vertex_parameter) {
+         return;
+     }
++    const auto& order = AmdVertexOrders[profile.amd_vertex_order % AmdVertexOrders.size()];
+     for (s32 i = 0; i < runtime_info.hw.fs.num_inputs; i++) {
+         const auto& input = runtime_info.hw.fs.inputs[i];
+         if (input.IsDefault() || !info.loads.GetAny(IR::Attribute::Param0 + i) ||
+@@ -310,12 +319,10 @@ void EmitContext::DefineAmdPerVertexAttribs() {
+         }
+         auto& param = input_params[i];
+         const Id pointer = param.id;
+-        param.id_array[0] =
+-            OpInterpolateAtVertexAMD(F32[param.num_components], pointer, ConstU32(0U));
+-        param.id_array[1] =
+-            OpInterpolateAtVertexAMD(F32[param.num_components], pointer, ConstU32(1U));
+-        param.id_array[2] =
+-            OpInterpolateAtVertexAMD(F32[param.num_components], pointer, ConstU32(2U));
++        for (u32 k = 0; k < 3; ++k) {
++            param.id_array[k] =
++                OpInterpolateAtVertexAMD(F32[param.num_components], pointer, ConstU32(order[k]));
++        }
+         param.is_loaded = true;
+     }
+ }
+diff --git a/src/shader_recompiler/profile.h b/src/shader_recompiler/profile.h
+index 2c028a0d..565f2baa 100644
+--- a/src/shader_recompiler/profile.h
++++ b/src/shader_recompiler/profile.h
+@@ -47,6 +47,9 @@ struct Profile {
+     bool supports_amd_shader_explicit_vertex_parameter{};
+     bool supports_fragment_shader_barycentric{};
+     bool supports_shader_subgroup_clock{};
++    /// AMD-311: which of the six vertex orders per-vertex reads use with AMD's explicit vertex
++    /// parameter extension (index into AmdVertexOrders in spirv_emit_context.cpp; 0 as before).
++    u32 amd_vertex_order{};
+     bool has_broken_spirv_clamp{};
+     bool lower_left_origin_mode{};
+     bool needs_manual_interpolation{};
+diff --git a/src/video_core/cache_storage.cpp b/src/video_core/cache_storage.cpp
+index 287c0f66..43847bcb 100644
+--- a/src/video_core/cache_storage.cpp
++++ b/src/video_core/cache_storage.cpp
+@@ -126,7 +126,12 @@ void DataBase::Open() {
+         // set aside as <store>.outdated and starts again, and the launcher's shader pack stamp
+         // goes with it, so the next Play prepares the pack into the new store. Raise the
+         // version whenever a change makes stored translations wrong.
+-        static constexpr std::string_view StoreVersion = "RyGT shader store 3 (FIX-215/216 MED3, MIN3, MAX3 NaN on AMD)";
++        // AMD-311: each vertex order of AMD's per-vertex reads has a store of its own version.
++        const char* order_env = std::getenv("SHADGT_AMD_VERTEX_ORDER");
++        const std::string StoreVersion =
++            std::string{"RyGT shader store 4 (FIX-215/216 NaN on AMD, AMD-311 vertex order)"} +
++            (order_env && *order_env ? fmt::format(", SHADGT_AMD_VERTEX_ORDER={}", order_env[0])
++                                     : std::string{});
+         const auto version_path = cache_path / "store-version.txt";
+         std::error_code ec;
+         if (std::filesystem::exists(cache_path, ec)) {
+diff --git a/src/video_core/renderer_vulkan/vk_instance.cpp b/src/video_core/renderer_vulkan/vk_instance.cpp
+index 20e0e3a5..ecb49fd2 100644
+--- a/src/video_core/renderer_vulkan/vk_instance.cpp
++++ b/src/video_core/renderer_vulkan/vk_instance.cpp
+@@ -434,6 +434,14 @@ bool Instance::CreateDevice() {
+         LOG_INFO(Render_Vulkan, "- primitiveTopologyPatchListRestart: {}",
+                  list_restart_features.primitiveTopologyPatchListRestart);
+     }
++    // AMD-311: SHADGT_AMD_VERTEX_ORDER=0..5 picks the vertex order of AMD's per-vertex reads
++    // (see spirv_emit_context.cpp); 0, the order an RX 7600 uses, unless set.
++    if (const char* order_env = std::getenv("SHADGT_AMD_VERTEX_ORDER");
++        order_env && order_env[0] >= '0' && order_env[0] <= '5') {
++        amd_vertex_order = u32(order_env[0] - '0');
++    }
++    LOG_INFO(Render_Vulkan, "AMD-311: vertex order of AMD per-vertex reads: {}",
++             amd_vertex_order);
+     amd_shader_explicit_vertex_parameter =
+         add_extension(VK_AMD_SHADER_EXPLICIT_VERTEX_PARAMETER_EXTENSION_NAME);
+     if (!amd_shader_explicit_vertex_parameter) {
+diff --git a/src/video_core/renderer_vulkan/vk_instance.h b/src/video_core/renderer_vulkan/vk_instance.h
+index e54651fa..2899c007 100644
+--- a/src/video_core/renderer_vulkan/vk_instance.h
++++ b/src/video_core/renderer_vulkan/vk_instance.h
+@@ -198,6 +198,11 @@ public:
+         return amd_shader_explicit_vertex_parameter;
+     }
+ 
++    /// AMD-311: the vertex order per-vertex reads use with AMD's explicit vertex parameter.
++    u32 GetAmdVertexOrder() const {
++        return amd_vertex_order;
++    }
++
+     /// Returns true when VK_EXT_primitive_topology_list_restart is supported for regular lists.
+     bool IsListRestartSupported() const {
+         return list_restart && list_restart_features.primitiveTopologyListRestart;
+@@ -564,6 +569,7 @@ private:
+     bool custom_border_color{};
+     bool fragment_shader_barycentric{};
+     bool amd_shader_explicit_vertex_parameter{};
++    u32 amd_vertex_order{}; ///< AMD-311
+     bool device_fault{}; // DIAG-206
+     bool depth_clip_control{};
+     bool depth_clip_enable{};
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index d888eb30..fed80fbc 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -811,6 +811,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
+             instance_.IsAmdShaderExplicitVertexParameterSupported(),
+         .supports_fragment_shader_barycentric = instance_.IsFragmentShaderBarycentricSupported(),
+         .supports_shader_subgroup_clock = instance_.IsShaderSubgroupClockSupported(),
++        .amd_vertex_order = instance_.GetAmdVertexOrder(), // AMD-311
+         .needs_manual_interpolation = instance.IsFragmentShaderBarycentricSupported() &&
+                                       instance.GetDriverID() == vk::DriverId::eNvidiaProprietary,
+         .needs_lds_barriers = instance.GetDriverID() == vk::DriverId::eNvidiaProprietary ||
+-- 
+2.56.0.windows.2
+
