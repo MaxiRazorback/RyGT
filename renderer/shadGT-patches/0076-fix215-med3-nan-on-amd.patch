@@ -1,56 +1,100 @@
-From db147847ce9815db17bd80af1a46b42571588979 Mon Sep 17 00:00:00 2001
-From: MaxiRazorback <344630105+MaxiRazorback@users.noreply.github.com>
-Date: Sat, 24 Oct 2026 16:44:34 -0300
-Subject: [PATCH 76/80] FIX-215: MED3 quiet-NaN rule on AMD GPUs too
+## Summary
 
-shader_fixes 0074 made MED3 with a quiet NaN return the minimum of the numeric operands, but
-only in the generic min/max path. On AMD GPUs the translator emits FMid3AMD
-(VK_AMD_shader_trinary_minmax) and returned before that rule, so Radeons kept the white car
-materials and the bloom. FMid3AMD with a NaN operand is undefined by the extension, so the NaN
-case is now selected explicitly there as well. The shader store version is raised so stored
-translations from before are set aside and translated again.
+Renderer patches **0076–0080**, applied after 0075. They fix two AMD-only rendering problems, and the shader store version now follows the GPU automatically:
 
-Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+- **Radeon RX 9000 series (RDNA4):** roads, kerbs and terrain were drawn as streaks.
+- **Radeon RX 7000 series (RDNA3):** the car was drawn purple/magenta again.
+
+Each GPU family keeps a shader store with its own version. When a fix changes how shaders are translated for one family, that family translates its shaders once, and the other families' stores are left alone.
+
+| Patch | ID | Change | GPUs affected |
+|---|---|---|---|
+| 0076 | FIX-215 | MED3 with a quiet NaN on AMD's trinary path returns the minimum of the numeric operands, as GCN does | AMD, except RX 7000 (see 0080) |
+| 0077 | FIX-216 | MIN3/MAX3 use `OpNMin`/`OpNMax` instead of `FMin3AMD`/`FMax3AMD`, so a NaN operand is ignored | AMD, except RX 7000 (see 0080) |
+| 0078 | AMD-311 | `SHADGT_AMD_VERTEX_ORDER=0..5` switch for the vertex order of AMD per-vertex reads | None by default (diagnostic) |
+| 0079 | AMD-312 | The GPU is detected at device creation; RX 9000 cards use a shader store version of their own | RX 9000 |
+| 0080 | AMD-313 | RX 7000 cards leave 0076/0077 out and use a store version of their own; `SHADGT_AMD_NAN_RULES=0/1` overrides | RX 7000 |
+
 ---
- .../backend/spirv/emit_spirv_floating_point.cpp       | 11 ++++++++++-
- src/video_core/cache_storage.cpp                      |  2 +-
- 2 files changed, 11 insertions(+), 2 deletions(-)
 
-diff --git a/src/shader_recompiler/backend/spirv/emit_spirv_floating_point.cpp b/src/shader_recompiler/backend/spirv/emit_spirv_floating_point.cpp
-index d95c2306..da0b3583 100644
---- a/src/shader_recompiler/backend/spirv/emit_spirv_floating_point.cpp
-+++ b/src/shader_recompiler/backend/spirv/emit_spirv_floating_point.cpp
-@@ -74,7 +74,16 @@ Id EmitFPMaxTri32(EmitContext& ctx, Id a, Id b, Id c) {
- 
- Id EmitFPMedTri32(EmitContext& ctx, Id a, Id b, Id c) {
-     if (ctx.profile.supports_trinary_minmax) {
--        return ctx.OpFMid3AMD(ctx.F32[1], a, b, c);
-+        // FIX-215: GCN MED3 with a quiet NaN returns the minimum of the numeric operands.
-+        // SPV_AMD_shader_trinary_minmax leaves FMid3AMD with a NaN operand undefined; GT Sport's
-+        // (65000, NaN, 0) HDR clamp then drew white car materials and too much bloom on Radeons,
-+        // so the NaN case is selected explicitly.
-+        const Id any_nan{ctx.OpLogicalOr(ctx.U1[1], ctx.OpIsNan(ctx.U1[1], a),
-+            ctx.OpLogicalOr(ctx.U1[1], ctx.OpIsNan(ctx.U1[1], b), ctx.OpIsNan(ctx.U1[1], c)))};
-+        const Id nan_result{
-+            ctx.OpNMin(ctx.F32[1], ctx.OpNMin(ctx.F32[1], a, b), c)};
-+        return ctx.OpSelect(ctx.F32[1], any_nan, nan_result,
-+                            ctx.OpFMid3AMD(ctx.F32[1], a, b, c));
-     }
-     const Id mmx{ctx.OpNMin(ctx.F32[1], ctx.OpNMax(ctx.F32[1], a, b), c)};
-     return ctx.OpNMax(ctx.F32[1], ctx.OpNMin(ctx.F32[1], a, b), mmx);
-diff --git a/src/video_core/cache_storage.cpp b/src/video_core/cache_storage.cpp
-index d5e2f879..bd0618bd 100644
---- a/src/video_core/cache_storage.cpp
-+++ b/src/video_core/cache_storage.cpp
-@@ -126,7 +126,7 @@ void DataBase::Open() {
-         // set aside as <store>.outdated and starts again, and the launcher's shader pack stamp
-         // goes with it, so the next Play prepares the pack into the new store. Raise the
-         // version whenever a change makes stored translations wrong.
--        static constexpr std::string_view StoreVersion = "RyGT shader store 1";
-+        static constexpr std::string_view StoreVersion = "RyGT shader store 2 (FIX-215 MED3 NaN on AMD)";
-         const auto version_path = cache_path / "store-version.txt";
-         std::error_code ec;
-         if (std::filesystem::exists(cache_path, ec)) {
+## Background
+
+### Translated shaders are stored
+
+The renderer stores GT Sport's shaders after translating them to SPIR-V, in `shaders\<serial>-direct-sets`, and loads them on later sessions without checking them. FIX-213 (0072) gave the store a version: a store whose `store-version.txt` doesn't match is set aside as `<store>.outdated`, and the shaders are translated again.
+
+Before this PR there was one version string for every GPU. Raising it for one GPU family's fix made every user translate everything again, and leaving it alone left stale translations in place.
+
+### NaN handling of the three-operand min/max/median (0076, 0077)
+
+GCN's `V_MED3_F32`, `V_MIN3_F32` and `V_MAX3_F32` ignore a quiet-NaN operand: MED3 returns the minimum of the numeric operands, and MIN3/MAX3 return the result of the others. On AMD GPUs the translator emitted `FMid3AMD` / `FMin3AMD` / `FMax3AMD` from `SPV_AMD_shader_trinary_minmax`, which leave a NaN operand undefined.
+
+GT Sport clamps HDR colours with `MED3(65000, x, 0)`. When `x` is NaN, a result other than GCN's can turn an invalid material colour into 65000, which shows as white car materials and too much bloom.
+- **0076:** the AMD MED3 path selects the GCN result explicitly when an operand is NaN, and keeps `FMid3AMD` otherwise.
+- **0077:** MIN3/MAX3 use `OpNMin`/`OpNMax` pairs, which ignore NaN by definition. The driver can still combine each pair into one `v_min3`/`v_max3`; this wasn't checked in the compiled code.
+
+### Why RX 7000 cards leave 0076/0077 out (0080)
+
+On an **RX 7600** (driver 26.10.1, LLPC), freshly translated shaders with 0076/0077 drew the car **purple** again. With the same build and `SHADGT_AMD_NAN_RULES=0` (0076/0077 off), the car was right. Both runs started from an empty shader store, so stale translations weren't involved.
+
+RX 7000 cards (AMD proprietary driver, model name `Radeon RX 7…`) therefore keep the plain `FMid3AMD`/`FMin3AMD`/`FMax3AMD` path, which drew correctly on that card before. They use store version 5, so any RX 7000 store translated with 0076/0077 is set aside once.
+
+### RX 9000 road streaks and the store version (0079)
+
+On an **RX 9060 XT** (driver 2.0.416), the road and kerbs at Brands Hatch were drawn as streaks smeared in different directions, using a store translated by an earlier build. After the store was translated again by this build, the road and kerbs were correct. Version 4 makes RX 9000 cards translate their shaders once automatically, without touching other GPUs' stores.
+
+### Vertex order switch (0078)
+
+GT Sport blends per-vertex inputs (terrain, kerbs, road) as `p0 + i·(p1 − p0) + j·(p2 − p0)` (FIX-191). `p0..p2` come from `InterpolateAtVertexAMD(0..2)` and `i, j` from `BaryCoordSmoothAMD`. `VK_AMD_shader_explicit_vertex_parameter` doesn't define which vertex each weight belongs to.
+
+While investigating the RX 9000 streaks, 0078 adds `SHADGT_AMD_VERTEX_ORDER=0..5`, which picks one of the six orders. The default 0 is unchanged and was correct on both the RX 7600 and, once its shaders were translated again, the RX 9060 XT. The switch stays as a diagnostic for other AMD GPUs, and each order has a store version of its own.
+
+---
+
+## Store versions after this PR
+
+| GPU | Store version string (start) | 0076/0077 |
+|---|---|---|
+| AMD Radeon RX 9000 | `RyGT shader store 4 …` | on |
+| AMD Radeon RX 7000 | `RyGT shader store 5 (RX 7000 …)` | off |
+| Other GPUs | `RyGT shader store 3 …` | on |
+
+`SHADGT_AMD_VERTEX_ORDER` and `SHADGT_AMD_NAN_RULES`, when set, are added to the version string, so switching them never reuses translations made with a different setting.
+
+## User-visible effect
+
+- **First Play after updating:** each GPU family translates its shaders once, which takes a few minutes. The splash screen and first race take longer that time.
+- **Leftover store:** `shaders\<serial>-direct-sets.outdated` can be deleted afterwards.
+- **Settings:** no launcher, config or performance changes.
+
+## Scope
+
+Source files changed by 0076–0080, all in the renderer:
+- `src/shader_recompiler/backend/spirv/emit_spirv_floating_point.cpp`: MED3/MIN3/MAX3
+- `src/shader_recompiler/backend/spirv/spirv_emit_context.cpp`: vertex order
+- `src/shader_recompiler/profile.h`: `amd_vertex_order`, `amd_nan_rules`
+- `src/video_core/renderer_vulkan/vk_instance.cpp/.h`: GPU family detection, vertex-order switch
+- `src/video_core/renderer_vulkan/vk_pipeline_cache.cpp`: profile fields
+- `src/video_core/cache_storage.cpp`: store version per GPU family
+
+**Not included:** xacidr4inx's `shader_fixes` patches. 0076 was written to apply without them; it changes only the AMD branch of MED3 and leaves the generic path as upstream has it.
+
+## Testing
+
+- **Build:** the patched tree (upstream `development` + 0076–0080) builds with the x64-Clang-Release preset (clang-cl).
+- **RX 7600** (driver 26.10.1), fresh shader store:
+  - Car colour correct with this PR's default (0076/0077 off on RX 7000).
+  - Purple with `SHADGT_AMD_NAN_RULES=1` (0076/0077 on).
+- **RX 9060 XT** (driver 2.0.416): road and kerbs at Brands Hatch drawn correctly after the store was translated again. Streaked before, with a store from an earlier build.
+- **Not tested:** RX 6000 series, NVIDIA and Intel. On those, 0076/0077 apply as written and the store version string changes from FIX-213's, so their shaders are translated once.
+
+## Notes for review
+
+- **Family detection** uses the Vulkan device name (`Radeon RX 9…`, `Radeon RX 7…`) on `VK_DRIVER_ID_AMD_PROPRIETARY`. Matching on PCI device IDs would be more exact if preferred.
+- **Why 0076/0077 break RX 7000** isn't known yet. The likely place to look is how LLPC handles the extra `OpIsNan`/`OpSelect` in shaders where an operand can't actually be NaN. Leaving them out on RX 7000 restores the previous, correct output there.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
 -- 
 2.56.0.windows.2
 
